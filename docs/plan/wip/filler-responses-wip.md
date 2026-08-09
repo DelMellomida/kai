@@ -1,7 +1,7 @@
 # Filler responses — WIP notes
 
 **Status: tests green, NOT verified on hardware. Do not treat the robot as good.**
-Last touched 2026-08-09. Companion to `docs/filler-responses.md`, which describes the design as
+Last touched 2026-08-09. Companion to `filler-responses.md`, which describes the design as
 intended; this file describes where the work actually stands.
 
 The feature is wired in and was deployed to the robot once. That run exposed two real bugs plus

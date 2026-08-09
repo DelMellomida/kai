@@ -517,8 +517,8 @@ class TestSpeak(unittest.TestCase):
 
     def test_spoken_text_is_delivery_shaped_but_the_ui_text_is_not(self):
         # The shaping (ai/delivery) exists because the voice model cannot be improved on this board —
-        # see docs/expressive-voice-plan.md. It must reach Piper and stop there: the dashboard shows
-        # what the LLM actually said, exactly as with the emoji stripping above.
+        # see docs/plan/completed/expressive-voice-plan.md. It must reach Piper and stop there: the
+        # dashboard shows what the LLM actually said, exactly as with the emoji stripping above.
         va = make_assistant()
         reply = "The DEVCON program runs all year long but the internships open in March."
         with patch("ai.voice_assistant.tts.enabled", return_value=True), \

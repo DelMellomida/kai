@@ -5,7 +5,7 @@ Run this ON THE JETSON. It answers the two questions that decide a voice swap an
 answered anywhere else:
 
   1. Does it fit?    Peak RSS of the synth process, measured — not the vendor's claim. The budget is
-                     ~2.0-2.3 GB free with the camera and Ollama up (README, Memory Budget), and the
+                     ~2.0-2.3 GB free with the camera and Ollama up (docs/memory-budget.md), and the
                      synth spike lands on top of whatever else the turn is doing.
   2. Is it fast?     Real-time factor (synth seconds per audio second) AND absolute latency. RTF is
                      the number people quote; the one Kai actually feels is "seconds of dead air

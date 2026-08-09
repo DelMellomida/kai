@@ -28,13 +28,13 @@ failed** (was 858 passed, 1 failed).
 
 Two files, because the problem is two problems.
 
-- **[`requirements.txt`](../requirements.txt)** — all 16 third-party packages, one per line,
+- **[`requirements.txt`](../../../requirements.txt)** — all 16 third-party packages, one per line,
   annotated with which source file imports it. Verified by grepping every `import` in the tree,
   not from memory. It opens with a loud warning **not** to `pip3 install -r` it on the live robot:
   the Jetson's torch is hand-built with CUDA and a PyPI reinstall would silently swap in a
   CPU-only wheel. It also records the three things pip cannot install — the ch341 kernel module,
   the I2S/PulseAudio routing, and PyGObject/GStreamer for `import gi`.
-- **[`scripts/freeze_requirements.sh`](../scripts/freeze_requirements.sh)** — run **on the robot**
+- **[`scripts/freeze_requirements.sh`](../../../scripts/freeze_requirements.sh)** — run **on the robot**
   to produce `requirements.lock.txt` from `pip freeze`, with Jetson-built wheels (torch,
   torchvision, onnxruntime-gpu, tensorrt, nvidia-*) flagged `[JETSON-BUILT] do not reinstall`.
   Read-only: installs nothing, upgrades nothing, safe mid-demo.
@@ -137,7 +137,7 @@ The gate is currently decorative but the failure mode is benign: gemma2:2b ignor
 block and stays in persona. Changing what reaches the LLM on every single turn, before a demo,
 to fix a cosmetic problem, is a bad trade. So the measurement was built instead of the fix:
 
-**[`scripts/rag_eval.py`](../scripts/rag_eval.py)** re-runs the same 16-query split, prints the
+**[`scripts/rag_eval.py`](../../../scripts/rag_eval.py)** re-runs the same 16-query split, prints the
 best score and whether a documents block was carried for each, reports whether the two sets are
 separable at all, and sweeps candidate cutoffs showing what each would cost in on-topic recall.
 Read-only against the existing index — no settings, no servos, no Ollama, no audio.
@@ -266,7 +266,7 @@ consistency, but it was not a live contradiction; only the chapter count was.
 
 ### The restart, and what it cost
 
-`rag.load_index()` runs once at startup ([face_track.py:509](../face_track.py#L509)) with no
+`rag.load_index()` runs once at startup ([face_track.py:509](../../../face_track.py#L509)) with no
 reload path, so the reindex needed a process restart. `kill -9` → supervisor saw rc=137 after
 7896 s and restarted after the 5 s floor, exactly as designed.
 

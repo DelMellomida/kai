@@ -290,6 +290,6 @@ TOP_K = 3
 #
 # P2 is therefore REDUCED, not closed: half the off-topic queries still carry a documents block,
 # and the survivors ("Kumusta ka na?" at 0.637) sit above every cutoff that leaves the on-topic
-# set intact. Closing it still needs a non-score signal — see docs/resolution-plan.md — so do not
-# chase the remaining half by raising this number further.
+# set intact. Closing it still needs a non-score signal — see docs/plan/wip/resolution-plan.md —
+# so do not chase the remaining half by raising this number further.
 SIMILARITY_THRESHOLD = 0.55

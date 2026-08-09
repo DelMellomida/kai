@@ -256,7 +256,7 @@ OLLAMA_KEEP_ALIVE = -1     # must be a JSON number, not a string — Ollama trea
 # available: the llama runner terminates on load. Changing this forces one model reload, so do
 # it while face_track.py is stopped rather than mid-conversation.
 # The whole 8 GB shared-memory budget this number lives inside — what is resident, what is left,
-# and why the reload needs the camera down — is written up in README.md § Memory Budget. Read it
+# and why the reload needs the camera down — is written up in docs/memory-budget.md. Read it
 # before changing this line or the model.
 OLLAMA_NUM_CTX   = 2048
 
@@ -387,7 +387,7 @@ TTS_PACTL_TIMEOUT_S = 5.0
 # ── Delivery shaping (ai/delivery.py) ───────────────────────────────────────────
 # Applied to the SPOKEN text only, on the way to Piper. Read ai/delivery.py's module docstring
 # before touching these — in short: 29 voices across 7 engine families were measured on this box
-# (docs/expressive-voice-plan.md) and the flat-tone complaint survived all of them, because every
+# (docs/plan/completed/expressive-voice-plan.md) and the flat-tone complaint survived all of them, because every
 # TTS model that fits beside Ollama here was trained on read-aloud audiobook corpora. The remaining
 # lever is DELIVERY, not timbre: breaths, non-uniform pacing, a conversational opening.
 #

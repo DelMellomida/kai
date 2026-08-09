@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Measure retrieval against a fixed on-topic / off-topic split. Read-only.
 
-This exists because of docs/known-issues.md P2: SIMILARITY_THRESHOLD never fires. Measured over
-16 queries, on-topic best-chunk scores landed at 0.572-0.843 and off-topic at 0.541-0.686 — the
+This exists because of docs/plan/wip/known-issues.md P2: SIMILARITY_THRESHOLD never fires. Measured
+over 16 queries, on-topic best-chunk scores landed at 0.572-0.843 and off-topic at 0.541-0.686 — the
 two ranges OVERLAP, so no global cutoff separates them, and 0.45 sits below both. Every turn
 therefore retrieves 3 chunks and carries a documents block, including "what's the weather like
 today?".
@@ -31,8 +31,8 @@ from ai import rag                                                  # noqa: E402
 from config.rag import SIMILARITY_THRESHOLD, SOURCE_BOOST, TOP_K    # noqa: E402
 
 # The 16-query split from the P2 measurement. Keep these EXACT if you are comparing to the numbers
-# recorded in docs/known-issues.md — changing the queries changes the baseline and the comparison
-# becomes meaningless. Add new ones at the end instead.
+# recorded in docs/plan/wip/known-issues.md — changing the queries changes the baseline and the
+# comparison becomes meaningless. Add new ones at the end instead.
 ON_TOPIC = [
     "what is DEVCON?",
     "when did DEVCON start?",
@@ -125,7 +125,7 @@ def main() -> int:
     else:
         print(f"OVERLAPPING by {hi_off - lo_on:.3f} — NO global cutoff separates these two sets. "
               f"Raising SIMILARITY_THRESHOLD trades real answers for silence; it does not fix P2. "
-              f"A fix has to use a signal other than the score (see docs/resolution-plan.md).")
+              f"A fix has to use a signal other than the score (see docs/plan/wip/resolution-plan.md).")
 
     print("\n── threshold sweep (what each cutoff would cost) ──")
     print(f"{'cutoff':>7}  {'on-topic kept':>14}  {'off-topic rejected':>19}")

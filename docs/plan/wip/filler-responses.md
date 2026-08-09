@@ -241,7 +241,7 @@ Prewarming is 56 Piper runs instead of 4, but **not in one burst and not all at 
 four core lines go first and fast; the 52 bank lines then warm one at a time on the same thread,
 each gated on nothing else speaking, over minutes rather than seconds. The burst version is what
 put a second Piper on the CPU beside a live reply, made `tts.stop()` kill the wrong process, and
-cost a turn 24.6 s to first audio — see `docs/filler-responses-wip.md`.
+cost a turn 24.6 s to first audio — see `filler-responses-wip.md`.
 
 So the bank is *not* fully warm for the first minutes after boot, and that is expected. **A line
 with no WAV is silent, never synthesised on demand**: selection only ever draws from warm keys, and

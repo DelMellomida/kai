@@ -3,7 +3,7 @@
 Called by ai/voice_assistant._speak on the SPOKEN text only, after tts.clean_for_speech and before
 tts.clamp_for_speech. The dashboard/UI text is never touched, exactly like the emoji stripping.
 
-WHY THIS EXISTS, and why it is not a voice swap. docs/expressive-voice-plan.md records the
+WHY THIS EXISTS, and why it is not a voice swap. docs/plan/completed/expressive-voice-plan.md records the
 measurement: 29 voices across 7 engine families were benchmarked on this Jetson and rejected the same
 way, the shipping voice already measures 11.0 semitones of intonation range (human conversational is
 6-12), and the only model class that actually models expression is ~0.5B, which OOMs on load beside
@@ -32,8 +32,8 @@ process, so the same text would shape differently after a restart.
 
 TAGALOG: the conjunction and opener lists are English (see config/voice.py). A Tagalog reply simply
 matches nothing and passes through unshaped, which is the intended degradation — Kai reads Tagalog in
-an English-accented voice already (see the voice note in README), and inventing Tagalog discourse
-markers is a bigger claim than this module should make.
+an English-accented voice already (the voice is en_US — see config/voice.py TTS_VOICE_MODEL), and
+inventing Tagalog discourse markers is a bigger claim than this module should make.
 
 VERIFYING A CHANGE TO THE WORD/PUNCTUATION LISTS: espeak-ng (Piper's phonemizer) voices some strings
 in ways you cannot hear from reading them — config/thinking.py records "Hmmmm..." coming back as

@@ -14,8 +14,8 @@
 # download competes for bandwidth and the unpack for CPU, so not during a demo.
 #
 # Disk: ~1.1 GB unpacked for the full set. The partition has four known ext4 errors
-# (docs/known-issues.md), so check `df -h .` if an unpack fails oddly rather than assuming a bad
-# download.
+# (docs/plan/wip/known-issues.md), so check `df -h .` if an unpack fails oddly rather than assuming
+# a bad download.
 
 set -euo pipefail
 

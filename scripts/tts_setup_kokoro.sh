@@ -16,8 +16,9 @@
 # whole CPython + onnxruntime import on EVERY reply (`python3 -m piper`). The standalone binary has
 # no interpreter to start, which is the half of the latency that is pure overhead rather than model.
 #
-# Disk: ~480 MB unpacked. That partition already has four known ext4 errors (see docs/known-issues),
-# so check `df -h .` if the unpack fails oddly rather than assuming a bad download.
+# Disk: ~480 MB unpacked. That partition already has four known ext4 errors
+# (see docs/plan/wip/known-issues.md), so check `df -h .` if the unpack fails oddly rather than
+# assuming a bad download.
 
 set -euo pipefail
 

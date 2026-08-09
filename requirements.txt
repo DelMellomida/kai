@@ -59,6 +59,6 @@ flask                # face_track.py — web/ dashboard on WEB_PORT
 # 1. ch341 kernel module for the Arduino's CH340 USB chip — NOT in the tegra kernel.
 #    Prebuilt at servo-test/ch341_build/ch341.ko; servo/servo.py loads it on demand.
 # 2. I2S / PulseAudio routing for the mic and speaker — see scripts/autostart.sh.
-# 3. Ollama with gemma2:2b pulled, `keep_alive=-1`. See the memory budget in README.md before
-#    changing the model or OLLAMA_NUM_CTX.
+# 3. Ollama with gemma2:2b pulled, `keep_alive=-1`. See docs/memory-budget.md before changing
+#    the model or OLLAMA_NUM_CTX.
 # 4. `loginctl enable-linger devconph` so the @reboot cron job's session survives logout.
