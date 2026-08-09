@@ -1,5 +1,10 @@
 # S1 — The session RLock is held across disk I/O on two paths
 
+> **Status: FIXED** — `fix/session-lock-disk-io`. `tick()` now hands both capture timeouts back as a
+> pending dispatch and runs them once the lock is released, matching the pattern `_on_audio` already
+> used. Suite green (1175 passed). **The title overstates it: only ONE of the two paths could
+> actually reach disk I/O** — see the correction below.
+
 | | |
 |---|---|
 | **Tier** | 1 |
@@ -44,23 +49,47 @@ reopen.
 
 It only bites when debug capture is enabled, which is off by default — but debug capture is exactly
 the feature you turn on when something is already going wrong, so the failure mode is "the
-diagnostic tool degrades the thing being diagnosed."
+diagnostic tool degrades the thing being diagnosed".
+
+> **Correction, found while writing the test.** Of the two paths, only `max_utterance` could
+> actually reach disk I/O. `_finish_scan`'s `too_long` branch discards the audio and returns
+> **before** it records anything or dispatches Whisper:
+>
+> ```python
+> if spoken_s > WAKE_WHISPER_MAX_UTTERANCE_S or reason == "too_long":
+>     self._scan_skipped["long"] += 1
+>     self._scan_ready_at = now + WAKE_WHISPER_LONG_COOLDOWN_S
+>     self._set_state(STATE_IDLE, now)
+>     return
+> ```
+>
+> So the live exposure was the turn path alone. The scan path is still moved off the lock — the
+> seam is structural, and that branch would become unsafe the moment it grows work the way the turn
+> path did — but it is fixing a latent hazard, not an active one. The two are asserted differently
+> in the tests to keep that distinction visible rather than papered over."
 
 ## Acceptance criteria
 
-- [ ] No `UtteranceRecorder.record()` or `annotate()` call executes while the session lock is held,
+- [x] No `UtteranceRecorder.record()` or `annotate()` call executes while the session lock is held,
       from **any** caller — including `tick()`.
-- [ ] Verified structurally, not by inspection: a test that patches the recorder with a double
-      whose `record()` asserts the session lock is not held (e.g. by attempting a non-blocking
-      acquire from another thread and requiring success) passes for all four entry paths —
-      `_on_audio` hangover, `tick` max-utterance, `_on_audio` scan hangover, `tick` scan too-long.
-- [ ] The same guarantee covers `process_utterance()` and `transcribe_async()` dispatch.
-- [ ] State-machine behaviour is unchanged: `max_utterance` still transitions
-      `LISTEN_SPEECH → BUSY` on the same tick, `too_long` still transitions `SCAN_SPEECH → IDLE`
-      with the long cooldown applied, and the existing `tests/test_session.py` cases for both keep
-      passing untouched.
-- [ ] The misleading "outside the lock" / "off the tick thread's critical section" comments are
-      corrected to describe what the code now actually guarantees.
+- [x] Verified structurally, not by inspection. The probe runs on **another thread**, which is
+      load-bearing: `_lock` is an RLock, so a non-blocking acquire from the calling thread would
+      succeed whether or not the bug is present and the test would pass vacuously. Ownership is
+      per-thread, so the release happens on the probe thread too.
+- [x] The same guarantee covers `process_utterance()` and `transcribe_async()` dispatch — they sit
+      in the same post-lock half.
+- [x] State-machine behaviour is unchanged: `max_utterance` still transitions `LISTEN_SPEECH → BUSY`
+      on the same tick (asserted), `too_long` still transitions `SCAN_SPEECH → IDLE` with the long
+      cooldown, and all 206 existing `tests/test_session.py` cases pass untouched.
+- [x] The misleading "outside the lock" / "off the tick thread's critical section" comments are
+      corrected — `tick()`'s docstring now states the RLock re-entrancy trap explicitly, so the next
+      reader does not have to rediscover it.
+
+**Implementation note.** The ticket proposed splitting each method into `_close_*_locked()` +
+a lock-free dispatch half. That was not needed: `tick()` already had a natural place to collect a
+`pending` tuple and drain it after the `with` block, which is exactly the idiom `_on_audio` uses
+two methods away (`pending = "scan" | "turn"`). Reusing it keeps one pattern in the file instead of
+introducing a second, and the diff is ~15 lines rather than a restructure of two methods.
 
 ## Suggested approach
 

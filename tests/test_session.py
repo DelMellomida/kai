@@ -1,6 +1,8 @@
 import json
 import random
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -209,6 +211,34 @@ class FakePresence:
         if self.raise_on_call:
             raise RuntimeError("camera thread died")
         return self.visible, self.since, self.is_fresh
+
+
+def _lock_probing_recorder(session, held):
+    """A recorder double whose record() reports whether the session lock was held when it ran.
+
+    The probe runs on ANOTHER thread on purpose: session._lock is an RLock, so acquiring it from
+    the calling thread would succeed whether or not the bug is present and the test would pass
+    vacuously. Acquire and release both happen on the probe thread — RLock ownership is per-thread,
+    so releasing from anywhere else raises.
+    """
+    def _record(*_args, **_kwargs):
+        got = []
+
+        def _probe():
+            acquired = session._lock.acquire(blocking=False)
+            got.append(acquired)
+            if acquired:
+                session._lock.release()
+
+        probe = threading.Thread(target=_probe)
+        probe.start()
+        probe.join(timeout=2.0)
+        held.append(not (got and got[0]))
+        return "clip"
+
+    return SimpleNamespace(record=_record, annotate=lambda *a, **k: None,
+                           status=lambda: {"enabled": False, "written": 0, "skipped": 0,
+                                           "mb": 0.0, "error": ""})
 
 
 class SessionCase(unittest.TestCase):
@@ -724,6 +754,65 @@ class TestUtterance(SessionCase):
         s.tick(at + 1 + MAX_UTTERANCE_S)
         self.assertEqual(s.state, STATE_BUSY)
         self.assertEqual(len(self.voice.turns), 1)
+
+    def test_max_utterance_dispatches_without_holding_the_session_lock(self):
+        """S1. The lock is an RLock, so a nested `with` inside a method called from tick() is
+        re-entrant — which meant the code _finish_utterance places *after* its own block, on the
+        stated grounds that a WAV write must not land on the tick thread's critical section, was
+        still inside tick()'s. UtteranceRecorder.record() writes up to CAPTURE_HARD_CAP_S of audio,
+        and the audio worker needs this same lock ~30 times a second for the VAD.
+
+        Checked from ANOTHER thread on purpose: an RLock is re-entrant, so acquiring it from this
+        one would succeed whether or not the bug is present, and the test would pass vacuously."""
+        s = self.make()
+        at = self.wake(s, T0)
+        s._gate = self.fake_gate()
+        s._gate.update.return_value = "onset"
+        s._gate.speech_duration.return_value = MAX_UTTERANCE_S
+        s._on_audio(np.ones(320, dtype="int16"), at + 1)
+
+        held = []
+        s._recorder = _lock_probing_recorder(s, held)
+        s.tick(at + 1 + MAX_UTTERANCE_S)
+
+        self.assertEqual(s.state, STATE_BUSY, "the turn must still be forced")
+        self.assertEqual(held, [False], "the WAV write ran while tick() held the session lock")
+
+    def test_scan_too_long_dispatches_without_holding_the_session_lock(self):
+        """The same seam on the wake-scan path.
+
+        Weaker than the turn case above, and deliberately asserted differently. _finish_scan's
+        `too_long` branch discards the audio and returns BEFORE it records anything or dispatches
+        Whisper, so this path never actually reached disk I/O — the ticket overstated it. What is
+        asserted here is the structural property: tick() hands the dispatch out with the lock
+        released, so the branch stays safe if it ever grows work the way the turn path has."""
+        s = self.make(wake_kind="utterance")
+        s._gate = self.fake_gate()
+        s._gate.update.return_value = "onset"
+        s._voice.scan_ready = True
+        s._on_audio(np.ones(320, dtype="int16"), T0 + 1)
+        self.assertEqual(s.state, STATE_SCAN_SPEECH)
+
+        held = []
+
+        def _probe_finish(now, reason):
+            got = []
+
+            def _probe():
+                acquired = s._lock.acquire(blocking=False)
+                got.append(acquired)
+                if acquired:
+                    s._lock.release()
+
+            probe = threading.Thread(target=_probe)
+            probe.start()
+            probe.join(timeout=2.0)
+            held.append(not (got and got[0]))
+
+        s._finish_scan = _probe_finish
+        s.tick(T0 + 1 + WAKE_WHISPER_MAX_UTTERANCE_S + 1)
+
+        self.assertEqual(held, [False], "_finish_scan ran while tick() held the session lock")
 
     def test_rejected_turn_returns_to_listening(self):
         s = self.make()

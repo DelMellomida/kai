@@ -1185,7 +1185,18 @@ class ConversationSession:
                 print(f"[session] ERROR in tick: {exc}", flush=True)
 
     def tick(self, now: float) -> None:
-        """Advance every timer. `now` is passed in so tests drive a fake clock with no sleeping."""
+        """Advance every timer. `now` is passed in so tests drive a fake clock with no sleeping.
+
+        The two capture timeouts below do NOT finish their utterance inline. `self._lock` is an
+        RLock, so a nested `with` inside a method called from here is re-entrant — which means the
+        code those methods carefully place *after* their own `with` block, on the stated grounds
+        that "recording inside the lock would put a WAV write on the tick thread", was still inside
+        THIS one. UtteranceRecorder.record() writes up to CAPTURE_HARD_CAP_S of audio, and the audio
+        worker needs this same lock ~30 times a second for the VAD. So the timeout paths hand back a
+        pending dispatch and it runs once the lock is released, which is exactly what _on_audio
+        already does with its own `pending`.
+        """
+        pending: tuple[str, str] | None = None
         with self._lock:
             if self._presence is not None:
                 try:
@@ -1238,14 +1249,11 @@ class ConversationSession:
             elif state == STATE_LISTEN_SPEECH:
                 if not self._manual_end and elapsed >= MAX_UTTERANCE_S:
                     self._log("max utterance reached")
-                    # Re-enters the lock (RLock), and calls process_utterance while we hold it. Safe:
-                    # the turn worker's on_done takes this same lock and simply waits for the tick.
-                    self._finish_utterance(now, reason="max_utterance")
+                    pending = ("turn", "max_utterance")   # dispatched below, off the lock
 
             elif state == STATE_SCAN_SPEECH:
                 if elapsed >= WAKE_WHISPER_MAX_UTTERANCE_S:
-                    # Re-enters the lock (RLock), same precedent as the LISTEN_SPEECH cap above.
-                    self._finish_scan(now, reason="too_long")
+                    pending = ("scan", "too_long")        # dispatched below, off the lock
 
             elif state == STATE_SCAN_CHECK:
                 if elapsed >= WAKE_WHISPER_CHECK_MAX_S:
@@ -1279,6 +1287,15 @@ class ConversationSession:
                 self._end_session(now, "mic_lost")
 
             self._heartbeat(now)
+
+        # Outside the lock, by construction rather than by convention: both of these harvest audio,
+        # spawn a worker and write a WAV, and the audio worker is waiting on this lock at ~30 Hz.
+        if pending is not None:
+            kind, reason = pending
+            if kind == "turn":
+                self._finish_utterance(now, reason=reason)
+            else:
+                self._finish_scan(now, reason=reason)
 
     def _end_session(self, now: float, reason: str) -> None:
         """Caller holds the lock. Back to idle, with the conversation forgotten."""
