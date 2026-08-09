@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import face_track
 import settings
+from app import lifecycle
 
 
 class _FakeCamThread:
@@ -127,21 +128,21 @@ class TestCameraProbe(WebCase):
 
 
 class TestRestart(WebCase):
-    """POST /restart. _schedule_restart is patched in every test here: unpatched it SIGTERMs the
-    process running the tests four tenths of a second later."""
+    """POST /restart. lifecycle.schedule_restart is patched in every test here: unpatched it
+    SIGTERMs the process running the tests four tenths of a second later."""
 
     def test_answers_before_it_tears_anything_down(self):
-        with patch.object(face_track, "_schedule_restart") as sched:
+        with patch.object(lifecycle, "schedule_restart") as sched:
             res = self.client.post('/restart')
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.get_json()["status"], "ok")
         self.assertEqual(sched.call_count, 1)
 
     def test_reports_whether_anything_will_restart_us(self):
-        with patch.object(face_track, "_schedule_restart"):
-            with patch.dict(face_track.os.environ, {"KAI_SUPERVISED": "1"}):
+        with patch.object(lifecycle, "schedule_restart"):
+            with patch.dict(lifecycle.os.environ, {"KAI_SUPERVISED": "1"}):
                 self.assertTrue(self.client.post('/restart').get_json()["supervised"])
-            with patch.dict(face_track.os.environ, {"KAI_SUPERVISED": "0"}):
+            with patch.dict(lifecycle.os.environ, {"KAI_SUPERVISED": "0"}):
                 body = self.client.post('/restart').get_json()
         # Unsupervised, this is a shutdown, not a restart — the dashboard has to be able to say so.
         self.assertFalse(body["supervised"])
@@ -149,29 +150,29 @@ class TestRestart(WebCase):
 
     def test_get_is_not_a_restart(self):
         # A crawler, a prefetch or a pasted URL must not be able to stop the robot.
-        with patch.object(face_track, "_schedule_restart") as sched:
+        with patch.object(lifecycle, "schedule_restart") as sched:
             self.assertEqual(self.client.get('/restart').status_code, 405)
         sched.assert_not_called()
 
     def test_the_shutdown_signals_this_process_and_flags_the_exit_code(self):
-        # _arm_restart_deadline is patched for the same reason _schedule_restart is: unpatched it
+        # arm_restart_deadline is patched for the same reason schedule_restart is: unpatched it
         # leaves a live timer that calls os._exit on the test runner twelve seconds later.
-        face_track._restart_requested.clear()
-        with patch.object(face_track.os, "kill") as kill, \
-             patch.object(face_track, "_arm_restart_deadline"):
-            face_track._request_restart()
-        self.assertTrue(face_track._restart_requested.is_set())
-        self.assertEqual(kill.call_args[0][0], face_track.os.getpid())
-        face_track._restart_requested.clear()
+        lifecycle.restart_requested.clear()
+        with patch.object(lifecycle.os, "kill") as kill, \
+             patch.object(lifecycle, "arm_restart_deadline"):
+            lifecycle.request_restart()
+        self.assertTrue(lifecycle.restart_requested.is_set())
+        self.assertEqual(kill.call_args[0][0], lifecycle.os.getpid())
+        lifecycle.restart_requested.clear()
 
     def test_a_failed_signal_does_not_leave_the_exit_code_armed(self):
         # Otherwise the next ordinary Ctrl-C would exit 7 and the supervisor would restart a robot
         # somebody had just stopped on purpose.
-        face_track._restart_requested.clear()
-        with patch.object(face_track.os, "kill", side_effect=OSError("EPERM")), \
-             patch.object(face_track, "_arm_restart_deadline") as armed:
-            face_track._request_restart()
-        self.assertFalse(face_track._restart_requested.is_set())
+        lifecycle.restart_requested.clear()
+        with patch.object(lifecycle.os, "kill", side_effect=OSError("EPERM")), \
+             patch.object(lifecycle, "arm_restart_deadline") as armed:
+            lifecycle.request_restart()
+        self.assertFalse(lifecycle.restart_requested.is_set())
         # And no force-exit timer either: the process is going to keep running, so a deadline that
         # fired would take down a robot that was never actually restarting.
         armed.assert_not_called()
@@ -182,34 +183,34 @@ class TestRestart(WebCase):
         It was wedged in mic resolution, so run()'s `finally` never completed and the graceful path
         never finished. From the dashboard that is indistinguishable from a restart that worked.
         """
-        with patch.object(face_track.os, "kill"), \
-             patch.object(face_track.threading, "Timer") as timer:
-            face_track._request_restart()
-        face_track._restart_requested.clear()
+        with patch.object(lifecycle.os, "kill"), \
+             patch.object(lifecycle.threading, "Timer") as timer:
+            lifecycle.request_restart()
+        lifecycle.restart_requested.clear()
         delay, fn = timer.call_args[0][0], timer.call_args[0][1]
-        self.assertEqual(delay, face_track._RESTART_FORCE_AFTER_S)
-        with patch.object(face_track.os, "_exit") as hard_exit:
+        self.assertEqual(delay, lifecycle.RESTART_FORCE_AFTER_S)
+        with patch.object(lifecycle.os, "_exit") as hard_exit:
             fn()
         # The same exit code as the graceful path, so the supervisor still treats it as a restart
         # and brings Kai back rather than reading it as a crash.
-        hard_exit.assert_called_once_with(face_track._EXIT_RESTART)
+        hard_exit.assert_called_once_with(lifecycle.EXIT_RESTART)
 
     def test_supervised_reads_the_env_var(self):
-        with patch.dict(face_track.os.environ, {}, clear=True):
-            with patch.object(face_track, "open", side_effect=OSError, create=True):
-                self.assertFalse(face_track._supervised())
-        with patch.dict(face_track.os.environ, {"KAI_SUPERVISED": "1"}):
-            self.assertTrue(face_track._supervised())
+        with patch.dict(lifecycle.os.environ, {}, clear=True):
+            with patch.object(lifecycle, "open", side_effect=OSError, create=True):
+                self.assertFalse(lifecycle.supervised())
+        with patch.dict(lifecycle.os.environ, {"KAI_SUPERVISED": "1"}):
+            self.assertTrue(lifecycle.supervised())
 
     def test_supervised_falls_back_to_the_parent_process(self):
         # A supervisor loop that predates this file's update exports nothing, and calling that robot
         # unsupervised would put a red "it will NOT come back" warning on a robot that will.
         from unittest.mock import mock_open
-        with patch.dict(face_track.os.environ, {}, clear=True):
-            with patch.object(face_track, "open",
+        with patch.dict(lifecycle.os.environ, {}, clear=True):
+            with patch.object(lifecycle, "open",
                               mock_open(read_data=b"bash\0/home/x/scripts/autostart.sh\0"),
                               create=True):
-                self.assertTrue(face_track._supervised())
+                self.assertTrue(lifecycle.supervised())
 
     def test_settings_get_carries_the_supervised_flag(self):
         # The Settings panel seeds from here, so an unsupervised robot can warn before the click.
@@ -307,12 +308,12 @@ class TestAudioReresolve(WebCase):
 
 
 class TestSystemReboot(WebCase):
-    """POST /system/reboot. _reboot_now is patched throughout — unpatched it would reboot the
-    machine running the tests, which is a uniquely bad property for a test suite to have."""
+    """POST /system/reboot. lifecycle.reboot_now is patched throughout — unpatched it would reboot
+    the machine running the tests, which is a uniquely bad property for a test suite to have."""
 
     def test_disabled_by_default_and_says_how_to_enable_it(self):
         with patch.object(face_track, "REBOOT_ENABLED", False), \
-             patch.object(face_track, "_reboot_now") as rb:
+             patch.object(lifecycle, "reboot_now") as rb:
             res = self.client.post('/system/reboot', json={"confirm": "reboot"})
         self.assertEqual(res.status_code, 403)
         self.assertIn("REBOOT_ENABLED", res.get_json()["error"])
@@ -322,7 +323,7 @@ class TestSystemReboot(WebCase):
         # The dashboard's two taps protect against a slip. This protects against everything else
         # that can POST to an endpoint on a service with no authentication at all.
         with patch.object(face_track, "REBOOT_ENABLED", True), \
-             patch.object(face_track, "_reboot_now") as rb:
+             patch.object(lifecycle, "reboot_now") as rb:
             for body in ({}, {"confirm": "yes"}, {"confirm": ""}):
                 res = self.client.post('/system/reboot', json=body)
                 self.assertEqual(res.status_code, 400, body)
@@ -331,7 +332,7 @@ class TestSystemReboot(WebCase):
 
     def test_reboots_when_enabled_and_confirmed(self):
         with patch.object(face_track, "REBOOT_ENABLED", True), \
-             patch.object(face_track, "_reboot_now", return_value=(True, "")) as rb:
+             patch.object(lifecycle, "reboot_now", return_value=(True, "")) as rb:
             res = self.client.post('/system/reboot', json={"confirm": "reboot"})
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.get_json()["status"], "ok")
@@ -342,7 +343,7 @@ class TestSystemReboot(WebCase):
         # the operator watching a robot that is never coming back. That is exactly what made the
         # wedged restart so misleading, and it must not be rebuilt here.
         with patch.object(face_track, "REBOOT_ENABLED", True), \
-             patch.object(face_track, "_reboot_now",
+             patch.object(lifecycle, "reboot_now",
                           return_value=(False, "this user may not run /usr/bin/systemctl reboot")):
             res = self.client.post('/system/reboot', json={"confirm": "reboot"})
         self.assertEqual(res.status_code, 500)
@@ -350,7 +351,7 @@ class TestSystemReboot(WebCase):
 
     def test_get_is_not_a_reboot(self):
         with patch.object(face_track, "REBOOT_ENABLED", True), \
-             patch.object(face_track, "_reboot_now") as rb:
+             patch.object(lifecycle, "reboot_now") as rb:
             self.assertEqual(self.client.get('/system/reboot').status_code, 405)
         rb.assert_not_called()
 
@@ -360,9 +361,9 @@ class TestSystemReboot(WebCase):
         A rule scoped to exactly `/usr/bin/systemctl reboot` does not match that command plus
         `--help`, so probing by dry-running would report a correctly-configured robot as broken.
         """
-        with patch.object(face_track.subprocess, "run") as run:
+        with patch.object(lifecycle.subprocess, "run") as run:
             run.return_value = type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
-            ok, detail = face_track._reboot_now()
+            ok, detail = lifecycle.reboot_now()
         self.assertFalse(ok)
         self.assertIn("-l", run.call_args[0][0])
         self.assertIn("sudoers", detail)

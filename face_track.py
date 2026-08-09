@@ -17,8 +17,6 @@ import os
 import queue
 import random
 import socket
-import subprocess
-import sys
 import threading
 import time
 from typing import NamedTuple
@@ -36,6 +34,7 @@ except ImportError:
     _FLASK_OK = False
     print("[face_track] WARNING: flask not installed — web dashboard disabled. Run: pip3 install flask")
 
+from app               import lifecycle
 from vision.camera      import CameraThread, NullCamera, device_signature, try_open_camera
 from vision.controller  import EMAFilter, PDAxis, TrackingTarget
 from vision.face_params import FaceParams, NOSE_TIP, PROCESS_W, PROCESS_H, compute_face_params, classify_emotion
@@ -67,7 +66,7 @@ from config.tracking import (
     WEB_PUBLISH_INTERVAL, PAN_KP, PAN_KD, FACE_MIN_DETECTION_CONF, FACE_MIN_TRACKING_CONF,
     WEB_PORT, UPLOAD_DIR, CONTROL_FPS, CONTROL_STALE_TIMEOUT, SERVO_ABSENCE_FRAMES,
     NO_FACE_LOG_INTERVAL_S, CONTROL_LOG_INTERVAL_S,
-    REBOOT_ENABLED, REBOOT_COMMAND, REBOOT_TIMEOUT_S,
+    REBOOT_ENABLED,
 )
 from config.servo import PAN_DEADBAND      # the control loop needs it to know when a send is a no-op
 from config.wake import SESSION_START_ATTEMPTS, SESSION_START_BACKOFF_S
@@ -264,7 +263,7 @@ if _FLASK_OK:
         return {"values": settings.snapshot(), "defaults": settings.defaults(),
                 "specs": settings.describe(), "locked": _settings_locked(),
                 "persist_error": settings.persist_error(),
-                "supervised": _supervised()}
+                "supervised": lifecycle.supervised()}
 
     @_flask_app.route('/settings', methods=['POST'])
     def _settings_post():
@@ -302,8 +301,8 @@ if _FLASK_OK:
         # The reply is sent BEFORE anything is torn down (the shutdown fires on a short timer), so
         # the dashboard learns whether a supervisor will actually restart us — the one thing the
         # operator cannot see from the UI, and the difference between "back in 20s" and "dead".
-        supervised = _supervised()
-        _schedule_restart()
+        supervised = lifecycle.supervised()
+        lifecycle.schedule_restart()
         return {"status": "ok", "supervised": supervised,
                 "message": ("restarting — the dashboard will reconnect on its own" if supervised
                             else "shutting down; nothing is supervising this process, so it will "
@@ -340,7 +339,7 @@ if _FLASK_OK:
         body = request.get_json(silent=True) or {}
         if body.get("confirm") != "reboot":
             return {"status": "error", "error": "missing confirmation"}, 400
-        ok, detail = _reboot_now()
+        ok, detail = lifecycle.reboot_now()
         if not ok:
             return {"status": "error", "error": detail}, 500
         return {"status": "ok", "message": "rebooting — Kai will be back in about 90 seconds"}
@@ -1176,218 +1175,6 @@ def run(args: argparse.Namespace) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-_LOCK_PATH = "/tmp/kai_face_track.lock"
-_lock_fd = None   # module-level: the lock lives as long as the process holds this open
-
-# Distinct exit code for "someone else is already running". scripts/autostart.sh treats it as
-# terminal and does NOT restart — a supervisor that retried this would spin forever against the
-# healthy instance it is losing the lock to.
-_EXIT_ALREADY_RUNNING = 3
-
-# Distinct exit code for "the dashboard asked for a restart". scripts/autostart.sh relaunches
-# immediately on this one and does NOT count it as a failure — an operator pressing the button is
-# not a crash, and letting it feed the consecutive-fast-failure backoff would make the second
-# restart in a minute take 10 s, the third 15 s, for no reason.
-_EXIT_RESTART = 7
-
-# Long enough for Flask to have written the response before the process starts tearing itself down,
-# short enough that nobody wonders whether the button worked. The reply is generated synchronously
-# in the route; this only covers the socket write.
-_RESTART_DELAY_S = 0.4
-
-# How long the orderly shutdown gets before _arm_restart_deadline() takes the process down by force.
-# Comfortably above a healthy teardown (measured ~1-2 s: the mic stop joins a 2 s thread, the camera
-# and serial close immediately) and well inside the supervisor's restart window, so a robot that
-# CAN exit cleanly always does. Only a wedged one ever reaches this.
-_RESTART_FORCE_AFTER_S = 12.0
-
-_restart_requested = threading.Event()
-
-
-def _supervised() -> bool:
-    """Is something going to start us again after we exit?
-
-    scripts/autostart.sh exports KAI_SUPERVISED=1 before its supervisor loop. Nothing else does, so
-    a run started by hand (scripts/run.sh, or python3 face_track.py over ssh) reports False and the
-    dashboard warns instead of quietly killing the robot on a click.
-
-    The parent-process fallback is not belt-and-braces, it is the deploy path: a supervisor loop that
-    was already running when this file was updated started from the OLD autostart.sh and therefore
-    exports nothing, so the env var alone would call a perfectly supervised robot unsupervised until
-    somebody rebooted it. Best-effort — no /proc (a Mac, the tests on Windows) just means we fall
-    back to the honest "no".
-    """
-    if os.environ.get("KAI_SUPERVISED", "") not in ("", "0"):
-        return True
-    try:
-        with open(f"/proc/{os.getppid()}/cmdline", "rb") as fh:
-            return b"autostart.sh" in fh.read()
-    except OSError:
-        return False
-
-
-def _schedule_restart() -> None:
-    """Tear ourselves down shortly after the caller's response has gone out.
-
-    Its own function, not an inline Timer, so the route can be exercised in the tests without a
-    live timer that would SIGTERM the test runner four tenths of a second later.
-    """
-    timer = threading.Timer(_RESTART_DELAY_S, _request_restart)
-    timer.daemon = True
-    timer.start()
-
-
-def _request_restart() -> None:
-    """Exit the way SIGTERM already exits, then have main() report _EXIT_RESTART.
-
-    Reuses _install_signal_handlers' path rather than inventing a second shutdown: the mic, the
-    Porcupine native memory, the serial port and the camera all have to be released before the
-    replacement process can open them (see scripts/autostart.sh's wait_for_capture_device), and
-    run()'s `finally` is the only code that does that.
-    """
-    _restart_requested.set()
-    print("[face_track] restart requested from the dashboard", flush=True)
-    try:
-        import signal
-        os.kill(os.getpid(), signal.SIGTERM)
-    except Exception as exc:
-        # Never leave the flag set on a process that is going to keep running — the next orderly
-        # Ctrl-C would then exit 7 and the supervisor would restart a robot somebody just stopped.
-        _restart_requested.clear()
-        print(f"[face_track] ERROR: could not signal ourselves to restart ({exc})", flush=True)
-        return
-    _arm_restart_deadline()
-
-
-def _reboot_now() -> tuple[bool, str]:
-    """Ask the OS to reboot. Returns (ok, detail); never raises.
-
-    Checks first, fires second. `sudo -n` fails immediately when no NOPASSWD rule matches, which
-    turns the most likely misconfiguration into a message the operator can act on instead of a
-    button that reports success and does nothing — the same failure mode that made the wedged
-    restart so misleading. The command is fixed here rather than composed from a setting, so the
-    sudoers rule can name exactly one binary and one argument.
-
-    The reboot itself is scheduled on a short timer for the same reason /restart is: the HTTP
-    response has to be written before the box starts going down, or the dashboard cannot tell
-    "rebooting" from "network died".
-    """
-    # `sudo -l <command>` asks "may I run this?" and answers without running it. Deliberately not a
-    # dry run of the command itself: a sudoers rule scoped to exactly `/usr/bin/systemctl reboot`
-    # does NOT match `/usr/bin/systemctl reboot --help`, so probing with an extra argument would
-    # report a correctly-configured robot as broken.
-    try:
-        probe = subprocess.run(["sudo", "-n", "-l", *REBOOT_COMMAND],
-                               capture_output=True, text=True, timeout=REBOOT_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"could not check sudo permission ({type(exc).__name__}: {exc})"
-    if probe.returncode != 0:
-        return False, ("this user may not run " + " ".join(REBOOT_COMMAND) + " without a password — "
-                       "add a NOPASSWD sudoers line for exactly that command (see REBOOT_ENABLED "
-                       "in config/tracking.py)")
-
-    def _fire() -> None:
-        try:
-            subprocess.run(["sudo", "-n", *REBOOT_COMMAND], capture_output=True, text=True,
-                           timeout=REBOOT_TIMEOUT_S)
-        except Exception as exc:                        # pragma: no cover - the box is going down
-            print(f"[face_track] ERROR: reboot command failed ({exc})", flush=True)
-
-    print("[face_track] REBOOT requested from the dashboard", flush=True)
-    timer = threading.Timer(_RESTART_DELAY_S, _fire)
-    timer.daemon = True
-    timer.start()
-    return True, ""
-
-
-def _arm_restart_deadline() -> None:
-    """Force the exit if the orderly shutdown does not finish in time.
-
-    The graceful path is the right one and stays the default: run()'s `finally` releases the mic,
-    Porcupine's native memory, the serial port and the camera, and the replacement process needs all
-    of them. But it only works if the threads it waits on are willing to stop, and the restart
-    button exists precisely for robots where something is stuck.
-
-    Observed 2026-08-09: face_track wedged inside mic resolution holding the raw I2S device, and a
-    POST /restart replied `{"status":"ok"}` and then did nothing at all — same pid 40 minutes later,
-    no log line past the request. From the dashboard that is indistinguishable from a restart that
-    worked, which is the worst possible outcome for a recovery control: the operator believes the
-    robot has been restarted and moves on. Only `kill -9` over ssh actually cleared it.
-
-    So the graceful attempt gets a deadline, and past it we leave the hard way. os._exit skips
-    atexit handlers and buffered output on purpose — everything worth flushing has already had
-    _RESTART_DELAY_S plus this window to do it, and the supervisor's wait_for_capture_device covers
-    the devices the `finally` did not get to release. Exiting with the same _EXIT_RESTART code means
-    the supervisor treats it as a restart rather than a crash, so the robot still comes back.
-    """
-    def _force() -> None:
-        print(f"[face_track] WARNING: orderly shutdown did not finish within "
-              f"{_RESTART_FORCE_AFTER_S:.0f}s — forcing the exit. Something was wedged; if this "
-              f"repeats, the log above the restart request says what.", flush=True)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(_EXIT_RESTART)
-
-    timer = threading.Timer(_RESTART_FORCE_AFTER_S, _force)
-    timer.daemon = True
-    timer.start()
-
-
-def _claim_single_instance(path: str = _LOCK_PATH) -> bool:
-    """Take an exclusive lock, or return False if another face_track already holds it.
-
-    Two of these fight over hardware that admits exactly one owner — the raw I2S capture device,
-    the CSI camera and the servo serial port — and the symptom is not a clean error but a robot
-    that half-works: tracking fine, deaf, or with the jaw driven from two places. Cron only starts
-    one at boot, but nothing stopped a manual start from landing on top of a running one (observed:
-    a kill that matched the wrong PID, followed by a relaunch, left two processes competing).
-
-    flock is released automatically by the kernel when the process dies, however it dies — which is
-    what makes it safe here, where clean shutdown is not guaranteed. Best-effort: if fcntl is
-    missing (non-Linux, e.g. running the tests on Windows) the guard is skipped rather than fatal."""
-    global _lock_fd
-    try:
-        import fcntl
-    except ImportError:
-        return True
-    try:
-        _lock_fd = open(path, "w")
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False
-    except OSError as exc:            # unwritable path, full disk — do not refuse to boot over it
-        print(f"[face_track] WARNING: instance lock unavailable ({exc}) — starting anyway",
-              flush=True)
-        return True
-    _lock_fd.write(f"{os.getpid()}\n")
-    _lock_fd.flush()
-    return True
-
-
-def _install_signal_handlers() -> None:
-    """Turn SIGTERM into the same orderly shutdown Ctrl-C already gets.
-
-    Without this, the default SIGTERM disposition kills the interpreter outright and run()'s
-    `finally` never executes — so the mic and Porcupine's native memory, the serial port and the
-    camera are all left to the OS. Measured before this existed: 5 process starts in one log and
-    not a single "[face_track] Stopped.", which is also why scripts/autostart.sh needs to wait for
-    the capture device to be released before the next start can open it.
-
-    Raising KeyboardInterrupt rather than setting a flag reuses the shutdown path that is already
-    there and already tested, and it interrupts the main loop wherever it happens to be."""
-    import signal
-
-    def _on_term(signum, _frame):
-        print(f"[face_track] received signal {signum} — shutting down", flush=True)
-        raise KeyboardInterrupt
-
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        try:
-            signal.signal(sig, _on_term)
-        except (ValueError, OSError, AttributeError):
-            pass          # not the main thread, or the platform lacks it — not worth failing over
-
-
 def main() -> None:
     from vision.camera import NETWORK_PORT
     parser = argparse.ArgumentParser(description="Face tracking servo — Jetson Orin Nano")
@@ -1411,16 +1198,16 @@ def main() -> None:
     parser.add_argument("--no-hands-free", action="store_true",
                                           help="With --wake: use the shared always-open stream but "
                                                "keep push-to-talk as the only way in")
-    if not _claim_single_instance():
-        print(f"[face_track] another instance already holds {_LOCK_PATH} — refusing to start "
-              "(stop the running one first: pkill -f face_track.py)", flush=True)
-        raise SystemExit(_EXIT_ALREADY_RUNNING)
-    _install_signal_handlers()
+    if not lifecycle.claim_single_instance():
+        print(f"[face_track] another instance already holds {lifecycle.LOCK_PATH} — refusing to "
+              "start (stop the running one first: pkill -f face_track.py)", flush=True)
+        raise SystemExit(lifecycle.EXIT_ALREADY_RUNNING)
+    lifecycle.install_signal_handlers()
     run(parser.parse_args())
     # After run()'s `finally` — everything is released, so the replacement can have the hardware.
-    if _restart_requested.is_set():
-        print(f"[face_track] exiting {_EXIT_RESTART} for a supervised restart", flush=True)
-        raise SystemExit(_EXIT_RESTART)
+    if lifecycle.restart_requested.is_set():
+        print(f"[face_track] exiting {lifecycle.EXIT_RESTART} for a supervised restart", flush=True)
+        raise SystemExit(lifecycle.EXIT_RESTART)
 
 
 if __name__ == "__main__":
