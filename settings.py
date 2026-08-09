@@ -197,10 +197,6 @@ def persist_error() -> str:
         return _persist_error
 
 
-def names() -> tuple[str, ...]:
-    return tuple(_SPECS)
-
-
 # ── Writes ────────────────────────────────────────────────────────────────────
 
 def set_many(updates: dict[str, Any], strict: bool = True, persist: bool = True) -> dict[str, Any]:

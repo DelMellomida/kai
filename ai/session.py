@@ -62,7 +62,7 @@ from config.wake import (
     MIN_UTTERANCE_S, PREROLL_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
     SESSION_MAX_NO_SPEECH_STREAK, SESSION_NO_FACE_S, SESSION_NO_SPEECH_S,
     SESSION_SPEAK_GRACE_S, SESSION_SPEAK_MAX_UNKNOWN_S, SESSION_TICK_HZ,
-    VAD_HANGOVER_S, VAD_RMS_FLOOR, WAKE_ACK_MAX_S, WAKE_ACK_TEXT, WAKE_ALLOW_BARGE_IN,
+    VAD_HANGOVER_S, WAKE_ACK_MAX_S, WAKE_ACK_TEXT, WAKE_ALLOW_BARGE_IN,
     WAKE_REFRACTORY_S, WAKE_SCAN_HANGOVER_S,
     WAKE_WHISPER_CHECK_MAX_S, WAKE_WHISPER_COOLDOWN_S, WAKE_WHISPER_LOG_CHARS,
     WAKE_WHISPER_LOG_TEXT, WAKE_WHISPER_LONG_COOLDOWN_S, WAKE_WHISPER_MAX_UTTERANCE_S,
@@ -1895,7 +1895,7 @@ class ConversationSession:
             return "unknown"
         return "yes" if visible else "no"
 
-    def _log(self, message: str, state: str | None = None) -> None:
+    def _log(self, message: str) -> None:
         # flush=True because stdout is block-buffered into /tmp/face-servo.log under the autostart,
         # and a transition you only see minutes later is no use while tuning.
         print(f"[session] {message}", flush=True)

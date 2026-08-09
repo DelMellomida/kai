@@ -5,7 +5,6 @@ Mirrors the face-detection-movements LOFI format exactly.
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 
@@ -79,14 +78,6 @@ class FaceParams:
         return (f"{p.x:02d}{p.y:02d}{p.distance:02d}{p.yaw:02d}{p.pitch:02d}"
                 f"{p.mouth:02d}{p.left_eye:02d}{p.right_eye:02d}"
                 f"{p.roll}{p.smile_kiss}{p.face_visible}")
-
-    def to_json(self) -> str:
-        p = self.clamp()
-        return json.dumps({"x": p.x, "y": p.y, "distance": p.distance,
-                           "yaw": p.yaw, "pitch": p.pitch, "mouth": p.mouth,
-                           "left_eye": p.left_eye, "right_eye": p.right_eye,
-                           "roll": p.roll, "smile_kiss": p.smile_kiss,
-                           "face_visible": p.face_visible}, separators=(",", ":"))
 
     @staticmethod
     def no_face() -> FaceParams:
