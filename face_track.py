@@ -32,7 +32,7 @@ from vision            import presence
 from servo.servo        import ServoSerial
 from ai.voice_assistant import VoiceAssistant
 from ai.session        import ConversationSession
-from ai import rag
+from ai import rag, tts
 import settings
 
 
@@ -519,6 +519,16 @@ def run(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # FIRST, before anything else is torn down. tts.stop() kills both the Piper synth and the
+        # paplay playback; those are child PROCESSES, not threads, so the interpreter exiting does
+        # not take them with it — they get re-parented and keep playing. scripts/autostart.sh brings
+        # the replacement up within seconds, so without this the new process starts talking over
+        # audio the old one left in the air, with its own mute gate wide open because it knows
+        # nothing about that sound. Doing it first also means the 1-2 s of teardown below happens in
+        # silence rather than under a half-spoken reply.
+        # NOTE: lifecycle.arm_restart_deadline()'s os._exit path deliberately skips this whole
+        # block; scripts/autostart.sh's wait_for_capture_device is the backstop there.
+        tts.stop()
         stop_evt.set()
         control_thread.join(timeout=1.0)   # stop the control thread before closing the serial
         # Before cam_thread.close(), or the supervisor could hot-swap a camera into a closing thread.

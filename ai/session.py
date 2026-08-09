@@ -267,6 +267,12 @@ class ConversationSession:
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=2.0)
+        # After the tick thread is down (so nothing can start a new line behind us) and before the
+        # mic goes: cancel any synth or playback still in flight. Every other teardown path already
+        # does this — _end_session, and face_track.run()'s finally — but stop() is reachable on its
+        # own, and a speech worker outliving the session it belongs to is how audio from one run
+        # ends up playing into the next. tts.stop() is a no-op when nothing is running.
+        tts.stop()
         self._mic.stop()
 
     def reresolve_mic(self) -> dict:
