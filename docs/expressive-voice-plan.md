@@ -232,7 +232,76 @@ Then **listen**. Nothing below is worth doing if it does not clearly beat what i
 
 ---
 
-## Step 3 — The service (2 h)
+## RESULT 2026-08-09: Gate A passed, **Gate B FAILED — GPU path abandoned**
+
+### Gate A — passed
+
+Isolation verified in both directions. The plan's `--system-site-packages` approach turned out to be
+the wrong shape for this box and was replaced by **full isolation** — the venv has its own torch:
+
+```
+system python3   torch 2.5.0a0+872d972e41.nv24.08  cuda True   (untouched)
+                 faster_whisper OK  mediapipe OK  ctranslate2 OK  numpy 1.26.4
+venv             torch 2.8.0  cuda True   torchaudio 2.8.0
+```
+
+Full isolation is safe here because **Kai never imports torch** — it was pulled in by `ultralytics`,
+which Kai's code does not use either. That makes Gate A structural rather than a matter of flag
+discipline.
+
+Four traps, recorded because they will recur:
+
+1. **`python3-venv` was not installed.** `python3 -m venv` fails with an ensurepip error.
+2. **torch lives in `~/.local`, not system site-packages** — a user install.
+3. **No torchaudio 2.5.x aarch64 wheel exists** on any Jetson index (2.8/2.9/2.10 only), and
+   torchaudio must match torch's minor version. PyPI's build links against standard libtorch.
+4. **`pip install --extra-index-url pypi.org` silently wins over the Jetson index** and installs
+   `torch 2.8.0+cpu` — reporting success, with `cuda False`. Pin CUDA wheels **by direct URL**.
+   Related: `voxcpm` requires `torch>=2.5.0`, and pip treats the JetPack `2.5.0a0` pre-release as
+   *older*, so a plain install replaces a working CUDA torch with a CPU one. `--no-deps` is
+   mandatory.
+
+### Gate B — failed: CUDA OOM loading the model
+
+```
+torch.AcceleratorError: CUDA error: out of memory
+  voxcpm/modules/minicpm4/cache.py:19  StaticKVCache  torch.zeros(...)
+  NvMapMemAllocInternalTagged: error 12
+```
+
+Twice, with **2399 MB and then 2986 MB available** and gemma2:2b resident at 2.37 GB. Retried with
+`max_length` 4096 → **1024** (verified applied) and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+**Same failure at the same allocation** — which is the informative part: shrinking the cache 4×
+changed nothing, so the KV cache was never the dominant term. It was simply the next allocation
+after the 0.5B bf16 weights (~1 GB), the AudioVAE, and PyTorch's CUDA context had consumed the
+headroom. **The context overhead is the term this plan underestimated.**
+
+### Conclusion
+
+**Offline expressive TTS does not fit on this board while Ollama holds the GPU.** Not "is slow" —
+does not load. The measured gap is not closable by tuning: the smallest model class that models
+expression at all is ~0.5B, and 0.5B plus a CUDA context does not fit in the ~2.4–3.0 GB left
+beside a 2.37 GB LLM on 7.6 GB of shared memory.
+
+The three ways out, all of which trade something the project has so far refused:
+
+1. **Give up the LLM's GPU residency** — evict or shrink gemma2:2b. Kai sounds human and answers
+   worse. Wrong trade for a Q&A robot.
+2. **Relax offline.** Cloud TTS measured 272 ms round trip from this Jetson and solves the problem
+   outright, with native `fil-PH` voices as a bonus. Rejected twice on principle.
+3. **Accept the read-speech ceiling** and spend effort on delivery instead of the voice model.
+
+Recommended: (3), plus the speech-path disfluency transform prototyped in this session — which the
+user judged "good, can be added later". It does not fix flat tone; it makes the delivery less
+uniform, and it is cheap, deterministic and engine-independent.
+
+**Nothing was shipped.** `config/voice.py` is untouched, `TTS_ENGINE` is still `piper`, and the
+venv at `~/kai-voice-venv` plus the HF cache can be deleted with `rm -rf` at no cost. Kai came
+through both OOMs with gemma still fully resident and fragmentation improved (`lfb 54x4MB`).
+
+---
+
+## Step 3 — The service (2 h) — NOT REACHED
 
 `services/kai_voice.py`, run by the venv python, `POST /synth {"text": ..., "out": ...}` →
 `{"ok": true, "wav": "...", "ms": 1234, "audio_s": 4.2}`.
