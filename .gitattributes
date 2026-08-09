@@ -1,0 +1,19 @@
+# Normalise line endings to LF in the repository, always.
+#
+# This project is edited from both Linux (the Jetson, where it runs) and Windows (over the SMB
+# share). Without this, a file written by a Windows editor lands as CRLF, git on Linux then reports
+# the whole file as modified, and a one-line change arrives as a diff touching every line. Four
+# files were already in that state when the repo was created — LICENSE, ai/rag.py, config/rag.py
+# and tests/test_audio.py — which is what prompted this.
+#
+# `text=auto` lets git decide what is text; `eol=lf` pins the working-tree ending on every platform.
+* text=auto eol=lf
+
+# Binary — never touch these.
+*.onnx    binary
+*.wav     binary
+*.bin     binary
+*.ko      binary
+*.png     binary
+*.jpg     binary
+*.tar.bz2 binary

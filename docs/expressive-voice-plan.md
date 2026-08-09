@@ -153,6 +153,39 @@ try CosyVoice2 before concluding the approach failed; they are interchangeable i
    two real voice turns — that log already breaks out `stt + rag + llm + synth` to first audio
    (`ai/voice_assistant.py:1224-1227`).
 
+### Baseline recorded 2026-08-09 19:44 (post-reboot, Kai up, Ollama warm)
+
+Every later measurement is read against this. Captured after the reboot, not before.
+
+```
+uptime        3 minutes
+memory        used 4948 MB   available 2420 MB
+fragmentation RAM 5030/7620MB (lfb 8x4MB)     <-- was (lfb 2x1MB) before the reboot
+swap          7/3810 MB                       <-- was 488 MB before the reboot
+ollama        gemma2:2b  size 2.37GB  vram 2.37GB  ctx 2048   (100% resident in VRAM)
+face_track    1.36 GB RSS
+test suite    1113 tests, 5.1 s, **3 FAILURES** (see below)
+```
+
+The reboot did what `config/voice.py:265-268` predicts: largest free block 1 MB → 4 MB, and swap
+essentially drained. **Ollama is fully in VRAM — this is the number Gate C compares against.**
+
+**The suite is NOT green at baseline.** Three failures, reproducible across runs, in code this work
+does not touch:
+
+```
+FAIL tests.test_audio.TestAmbientAdaptation.test_without_adaptation_the_same_room_never_closes_the_utterance
+     AssertionError: ['onset', 'hangover'] != ['onset']
+FAIL tests.test_session.TestWhisperTierScan.test_cooldown_blocks_a_second_scan
+FAIL tests.test_session.TestWhisperTierScan.test_matched_phrase_is_reported_on_params
+```
+
+These are **pre-existing and unrelated to TTS** — ambient-VAD adaptation and the whisper wake tier.
+Note the count moved from 1094 to 1113 tests, so ~19 tests were added recently and 3 of them (or of
+their neighbours) are failing. **Gate D therefore reads "still exactly these 3 failures", not
+"green"** — otherwise this work would be blamed for breakage that predates it. Worth fixing on its
+own branch; out of scope here.
+
 ---
 
 ## Step 1 — Isolated venv (45 min) — **Gate A**
