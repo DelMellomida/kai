@@ -40,9 +40,11 @@ from ai.audio import (
     CaptureBuffer, Decimator, FrameAssembler, HighPass, RingPreroll, SpeechGate, WakeDetector, rms,
 )
 from ai.audio_debug import UtteranceRecorder
+from ai.mic_device import (
+    apply_i2s_route, free_i2s_device, resolve_input_device, resume_pulse_source,
+)
 from ai.voice_assistant import (
     STATUS_DONE, STATUS_ERROR, STATUS_IDLE, STATUS_RECORDING, STATUS_TRANSCRIBING,
-    apply_i2s_route, free_i2s_device, resolve_input_device, resume_pulse_source,
 )
 from ai.wake_phrase import match_wake_phrase
 from config.filler import (
@@ -169,7 +171,8 @@ class MicStream:
         """Resolve a mic and open the stream. False (with .error set) if it can't be opened."""
         import sounddevice as sd
 
-        # Same sequence as VoiceAssistant.ensure_input_resolved(): route, take the card off pulse so
+        # Same sequence as VoiceAssistant.ensure_input_resolved() (both call ai/mic_device):
+        # route, take the card off pulse so
         # the raw hw probe can open at 48 kHz, hand pulse back if we land elsewhere.
         # Each step is logged because every one of them can block on external state (amixer, pulse,
         # ALSA device contention), and without this a hang here is indistinguishable from a hang
