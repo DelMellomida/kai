@@ -581,5 +581,72 @@ class TestStickyTopic(unittest.TestCase):
             self.assertEqual(rag.retrieve_context("how many active ones are there?"), "")
 
 
+class TestFailuresAreVisible(unittest.TestCase):
+    """S9. Failing open is right; failing SILENTLY is not.
+
+    retrieve_context() returning "" for a TypeError is indistinguishable from "no relevant
+    documents" — and "" is the dangerous state, the one where gemma2:2b answers DEVCON questions
+    from its own pretraining. A whole retrieval regression could ship and present only as "Kai's
+    answers got vaguer", with nothing in the log and nothing on /params.
+    """
+
+    def setUp(self):
+        rag._reset_errors()
+        self.addCleanup(rag._reset_errors)
+
+    def test_a_broken_query_rewrite_still_fails_open(self):
+        with patch("ai.rag._build_query", side_effect=TypeError("boom")):
+            self.assertEqual(rag.retrieve_context("what is DEVCON?"), "")
+
+    def test_a_broken_query_rewrite_is_counted(self):
+        with patch("ai.rag._build_query", side_effect=TypeError("boom")):
+            rag.retrieve_context("what is DEVCON?")
+        self.assertEqual(rag.status()["rag_errors"], 1)
+        self.assertIn("TypeError", rag.status()["rag_last_error"])
+
+    def test_a_broken_embedder_is_counted_and_returns_none(self):
+        with patch("ai.rag.embed_batch", side_effect=RuntimeError("no model")):
+            self.assertIsNone(rag.embed_query("anything"))
+        self.assertEqual(rag.status()["rag_errors"], 1)
+
+    def test_the_counter_is_monotonic_across_calls(self):
+        with patch("ai.rag._build_query", side_effect=TypeError("boom")):
+            for _ in range(5):
+                rag.retrieve_context("what is DEVCON?")
+        self.assertEqual(rag.status()["rag_errors"], 5)
+
+    def test_repeated_identical_failures_log_once(self):
+        # The counter is unconditional; the LOG is rate-limited. An unthrottled line here would run
+        # at turn rate against a persistent fault and bury everything worth reading.
+        with patch("ai.rag._build_query", side_effect=TypeError("boom")),              patch("builtins.print") as mock_print:
+            for _ in range(10):
+                rag.retrieve_context("what is DEVCON?")
+        self.assertEqual(mock_print.call_count, 1)
+        self.assertEqual(rag.status()["rag_errors"], 10)
+
+    def test_a_different_failure_logs_again_immediately(self):
+        # Rate-limiting is per distinct error: a NEW failure mode is news even inside the window.
+        with patch("builtins.print") as mock_print:
+            with patch("ai.rag._build_query", side_effect=TypeError("boom")):
+                rag.retrieve_context("q")
+            with patch("ai.rag._build_query", side_effect=ValueError("different")):
+                rag.retrieve_context("q")
+        self.assertEqual(mock_print.call_count, 2)
+
+    def test_a_missing_index_is_not_counted_as_a_failure(self):
+        # A fresh checkout has no index. That means "nothing indexed yet", not a fault, and
+        # counting it would make rag_errors non-zero on every healthy first boot.
+        with patch("ai.rag.INDEX_PATH") as mock_path:
+            mock_path.read_text.side_effect = FileNotFoundError("no index")
+            rag.load_index()
+        self.assertEqual(rag.status()["rag_errors"], 0)
+
+    def test_a_malformed_index_is_counted(self):
+        with patch("ai.rag.INDEX_PATH") as mock_path:
+            mock_path.read_text.return_value = "{not json"
+            rag.load_index()
+        self.assertEqual(rag.status()["rag_errors"], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

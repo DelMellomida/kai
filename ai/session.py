@@ -105,6 +105,12 @@ REWARM_RETRY_S = 1.5         # one retry if the ack still got cancelled
 GREETING_QUIET_WAIT_S = 20.0
 GREETING_POLL_S = 0.25
 
+# How often a persistently broken presence feed may log. Reached from the 20 Hz tick and from every
+# /params snapshot, so an unthrottled line here would run at hundreds per minute — the same failure
+# NO_FACE_LOG_INTERVAL_S exists to prevent (see config/tracking.py: NO FACE was 58% of a 1.5-hour
+# log). Implementation cadence, not a knob.
+PRESENCE_ERROR_LOG_S = 60.0
+
 
 class ConversationSession:
     """The hands-free state machine: wake word in, spoken reply out, and a session that ends itself.
@@ -182,6 +188,9 @@ class ConversationSession:
         self._discarded_short = 0
         self._end_reason = ""
         self._last_heartbeat = 0.0
+        # Last presence-feed failure and when it was logged — see _note_presence_error.
+        self._presence_error = ""
+        self._presence_error_t = -PRESENCE_ERROR_LOG_S
         # Wall time of the whole turn (utterance handed over -> worker reported back). The PER-STAGE
         # breakdown lives on the VoiceAssistant, which is the only thing that can see the stages
         # apart — see VoiceAssistant.stage_timings(). Kept as "llm_ms" here because the dashboard
@@ -1197,8 +1206,9 @@ class ConversationSession:
                 try:
                     visible, _since, is_fresh = self._presence(now)
                     self._apply_presence(visible, is_fresh, now)
-                except Exception:
+                except Exception as exc:
                     self._face_absent_since = None   # a broken feed must fail open
+                    self._note_presence_error(exc, now)
 
             state = self._state
             elapsed = now - self._state_since
@@ -1567,11 +1577,26 @@ class ConversationSession:
             return "unknown"
         try:
             visible, _since, is_fresh = self._presence(now)
-        except Exception:
+        except Exception as exc:
+            self._note_presence_error(exc, now)
             return "unknown"
         if not is_fresh:
             return "unknown"
         return "yes" if visible else "no"
+
+    def _note_presence_error(self, exc: BaseException, now: float) -> None:
+        """Say that the presence feed is broken, at most once a minute.
+
+        Failing open is right — a camera hiccup must never end a conversation — but doing it
+        silently is not: a snapshot callable that raises every time is indistinguishable from a
+        camera that simply cannot see anyone, and sess_face_present reports "unknown" for both.
+        Rate-limited because this is reached from the 20 Hz tick and from every /params snapshot.
+        """
+        detail = f"{type(exc).__name__}: {exc}"
+        if detail == self._presence_error and now - self._presence_error_t < PRESENCE_ERROR_LOG_S:
+            return
+        self._presence_error, self._presence_error_t = detail, now
+        self._log(f"WARNING: presence feed failed ({detail}) — treating presence as unknown")
 
     def _log(self, message: str) -> None:
         # flush=True because stdout is block-buffered into /tmp/face-servo.log under the autostart,

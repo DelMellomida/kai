@@ -226,6 +226,13 @@ class TestParamsSnapshot(WebCase):
     def test_is_json_safe(self):
         json.dumps(face_track._dashboard.params_snapshot())
 
+    def test_publishes_retrieval_failure_counters(self):
+        # S9. RAG fails OPEN by design, so a real regression there is otherwise invisible — it
+        # presents only as answers getting vaguer, with nothing to point at over ssh.
+        snap = face_track._dashboard.params_snapshot()
+        self.assertIn("rag_errors", snap)
+        self.assertIsInstance(snap["rag_errors"], int)
+
     def test_reports_the_camera_even_with_no_frames(self):
         # THE regression test. _publish_web only runs when a frame arrives, so on a robot with no camera
         # nothing published camera state at all and the dashboard fell back to showing "live" — claiming

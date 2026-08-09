@@ -25,6 +25,7 @@ from pathlib import Path
 import cv2
 
 import settings
+from ai import rag
 from ai.wake_phrase import match_wake_phrase
 from app import lifecycle
 from config.tracking import REBOOT_ENABLED, UPLOAD_DIR
@@ -71,6 +72,10 @@ class Dashboard:
         # button out entirely rather than show one that always answers 403 — an operator reaching
         # for a recovery control should not have to learn it was never switched on.
         data["reboot_enabled"] = REBOOT_ENABLED
+        # Retrieval failures. RAG fails OPEN by design — a broken index answers exactly as if RAG
+        # did not exist — which means a real regression there is otherwise invisible: it presents
+        # only as answers getting vaguer. A counter is the cheapest way to make it visible over ssh.
+        data.update(rag.status())
         return data
 
     def capture_start(self) -> dict:
