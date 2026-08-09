@@ -272,17 +272,18 @@ OLLAMA_NUM_GPU   = None
 # nobody ever heard. Every token saved here is paid back twice, once in generation (~27 tok/s) and
 # again in Piper synthesis (~0.55x realtime). None = uncapped.
 #
-# 192 (was 96): 96 was sized as ~2x the 36-52 tokens measured back when persona.txt demanded "1 to 3
-# short sentences" unconditionally. That line is gone — persona.txt now lets the question set the
-# length, and its upper case (four or five sentences for an explanation or a multi-part question) is
-# ~110 tokens on its own, which 96 would have cut mid-sentence. 192 keeps the same ~2x-typical
-# runaway margin, measured against the new ceiling instead of the old one.
+# 160 (was 96, briefly 192): 96 was sized as ~2x the 36-52 tokens measured back when persona.txt
+# demanded "1 to 3 short sentences" unconditionally. That line is gone — persona.txt now lets the
+# question set the length, up to a hard four spoken sentences, which is ~125 tokens. 96 would cut
+# that mid-sentence; 160 only truncates runaways. 192 was tried first against a looser persona that
+# invited five sentences, and on-device that produced 134-word replies — correct, well grounded, and
+# far too long to listen to. The persona is what fixed that, not this number.
 #
-# Deliberately set ABOVE what TTS_MAX_SPOKEN_CHARS (700) allows, so the CHARACTER clamp is the one
+# Deliberately set ABOVE what TTS_MAX_SPOKEN_CHARS (500) allows, so the CHARACTER clamp is the one
 # that normally binds. That ordering matters for how a runaway sounds: tts.clamp_for_speech backs up
-# to a sentence end, while num_predict stops the model wherever the 192nd token fell — usually
+# to a sentence end, while num_predict stops the model wherever the 160th token fell — usually
 # mid-word. Keep this the looser of the two if you retune either.
-OLLAMA_NUM_PREDICT = 192
+OLLAMA_NUM_PREDICT = 160
 
 # Ceiling on the `/api/ps` placement probe (ai/voice_assistant.log_model_placement). Purely
 # diagnostic, and it runs on the startup warm path, so it must not be able to hold anything up if
