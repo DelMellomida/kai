@@ -11,7 +11,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import random
@@ -24,17 +23,10 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-import logging
-logging.getLogger('werkzeug').setLevel(logging.ERROR)
-try:
-    from flask import Flask, Response, send_from_directory, request
-    _FLASK_OK = True
-except ImportError:
-    _FLASK_OK = False
-    print("[face_track] WARNING: flask not installed — web dashboard disabled. Run: pip3 install flask")
-
 from app               import lifecycle
 from app.camera_supervisor import CameraSupervisor
+from web.server         import Dashboard
+from web.state          import DashboardState
 from vision.camera      import CameraThread, NullCamera
 from vision.controller  import EMAFilter, PDAxis, TrackingTarget
 from vision.face_params import FaceParams, NOSE_TIP, PROCESS_W, PROCESS_H, compute_face_params, classify_emotion
@@ -43,7 +35,6 @@ from vision            import presence
 from servo.servo        import ServoSerial
 from ai.voice_assistant import STATUS_THINKING, STATUS_TRANSCRIBING, VoiceAssistant
 from ai.session        import ConversationSession
-from ai.wake_phrase    import match_wake_phrase
 from ai import rag
 import settings
 
@@ -66,7 +57,6 @@ from config.tracking import (
     WEB_PUBLISH_INTERVAL, PAN_KP, PAN_KD, FACE_MIN_DETECTION_CONF, FACE_MIN_TRACKING_CONF,
     WEB_PORT, UPLOAD_DIR, CONTROL_FPS, CONTROL_STALE_TIMEOUT, SERVO_ABSENCE_FRAMES,
     NO_FACE_LOG_INTERVAL_S, CONTROL_LOG_INTERVAL_S,
-    REBOOT_ENABLED,
 )
 from config.servo import PAN_DEADBAND      # the control loop needs it to know when a send is a no-op
 from config.wake import SESSION_START_ATTEMPTS, SESSION_START_BACKOFF_S
@@ -86,279 +76,20 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # CLI facts by configure() in run().
 _camera = CameraSupervisor()
 
-# ── Web state ─────────────────────────────────────────────────────────────────
-# _web_raw_frame holds the latest *un-encoded* frame; the /video generator encodes it on
-# demand (only while a client is connected). _video_clients gates that work — when it's 0
-# (the headless autostart case) no JPEG encoding happens at all. _web_frame_id lets the
-# generator skip re-encoding a frame it already sent.
-#
-# The published state is split in two by whether it needs a FRAME:
-#   _web_params — face data + fps. Written only when a frame arrives, so it is empty with no camera.
-#   _web_status — camera/servo/settings state. Written every loop iteration, frame or not, because
-#                 "there is no camera, and here is why" is exactly what the dashboard must show when
-#                 no frames exist. Publishing this only alongside a frame is what used to make the
-#                 UI claim LIVE on a robot with no camera at all.
-# No key is written by both, so the merge order in _params_snapshot cannot matter.
-_web_lock   = threading.Lock()
-_web_raw_frame: np.ndarray | None = None
-_web_frame_id  = 0
-_web_params: dict = {}
-# Seeded, not empty: the dashboard is served as soon as Flask starts, which is before the tracking
-# loop's first _publish_status. An empty status there would let the frontend fall back to "live" and
-# claim a camera we do not have.
-_web_status: dict = {"cam_source": "none", "cam_reason": "starting up",
-                     "cam_mode": "auto", "cam_mode_locked": False, "cam_retry_in_s": 0.0}
-_web_frame_t   = 0.0     # monotonic time of the last published frame; 0.0 = none yet
-_video_clients = 0
-
-
-def _has_video_client() -> bool:
-    return _video_clients > 0
-
 # ── Voice ─────────────────────────────────────────────────────────────────────
-# Module scope, NOT inside the _FLASK_OK guard: neither of these touches Flask, and constructing
-# them there would mean "no flask installed -> no wake word", with nothing saying so. The Flask
-# routes below are only a second way to reach them; the wake word is the first.
+# Module scope, NOT behind a flask check: neither of these touches Flask, and constructing them
+# there would mean "no flask installed -> no wake word", with nothing saying so. The dashboard
+# routes are only a second way to reach them; the wake word is the first.
 _voice   = VoiceAssistant()
 _session = ConversationSession(_voice, presence=presence.snapshot)
 
-if _FLASK_OK:
-    _flask_app = Flask(__name__, static_folder=None)
-    _flask_app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB
-
-    @_flask_app.route('/')
-    def _index():
-        return send_from_directory(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web', 'frontend'),
-            'dashboard.html'
-        )
-
-    @_flask_app.route('/guide')
-    def _guide():
-        return send_from_directory(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web', 'frontend'),
-            'guide.html'
-        )
-
-    @_flask_app.route('/video')
-    def _video_feed():
-        def _gen():
-            global _video_clients
-            with _web_lock:
-                _video_clients += 1
-            last_id = -1
-            try:
-                while True:
-                    with _web_lock:
-                        frame = _web_raw_frame
-                        fid   = _web_frame_id
-                    # Encode on the Flask thread (off the tracking loop) and only when the
-                    # frame is new — never re-encode one we already sent.
-                    if frame is not None and fid != last_id:
-                        last_id = fid
-                        ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                        if ok:
-                            yield (b'--frame\r\n'
-                                   b'Content-Type: image/jpeg\r\n\r\n' + jpg.tobytes() + b'\r\n')
-                    time.sleep(0.02)
-            finally:
-                with _web_lock:
-                    _video_clients -= 1
-        return Response(_gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-    @_flask_app.route('/params')
-    def _params_stream():
-        def _gen():
-            while True:
-                yield f'data: {json.dumps(_params_snapshot())}\n\n'
-                time.sleep(0.05)
-        return Response(_gen(), mimetype='text/event-stream',
-                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
-
-    @_flask_app.route('/voice/start', methods=['POST'])
-    def _voice_start():
-        # Routed through the session, not straight to the assistant: after a hands-free turn the
-        # assistant's status is DONE while the session is still SPEAKING, so its own guard would
-        # accept this and open a SECOND stream on the raw hw device — which admits only one opener.
-        result = _voice_capture_start()
-        return result, (400 if 'error' in result else 200)
-
-    @_flask_app.route('/voice/stop', methods=['POST'])
-    def _voice_stop():
-        result = _voice_capture_stop()
-        return result, (400 if 'error' in result else 200)
-
-    @_flask_app.route('/voice/wake', methods=['POST'])
-    def _voice_wake():
-        # Fire the wake word by hand. Invaluable when the wake engine is misbehaving: it separates
-        # "the session machine is broken" from "the engine isn't hearing me".
-        #
-        # With {"text": "..."} it runs the whisper tier's matcher over that text and takes the
-        # one-breath path — which is how you exercise the matcher, say(), the epoch plumbing and
-        # _on_turn_done over ssh with curl, with no mic, no whisper and no room noise.
-        data = request.get_json(silent=True) or {}
-        text = (data.get('text') or request.form.get('text') or '').strip()
-        if text:
-            match = match_wake_phrase(text)
-            if match is None:
-                return {"error": f"no wake phrase in {text!r}"}, 400
-            accepted = _session.on_wake(command=match.command)
-        else:
-            accepted = _session.on_wake()
-        return ({"status": "ok"} if accepted
-                else {"error": f"wake rejected while {_session.state}"}), (200 if accepted else 400)
-
-    @_flask_app.route('/session/end', methods=['POST'])
-    def _session_end():
-        return _session.end_session("manual"), 200
-
-    @_flask_app.route('/voice/say', methods=['POST'])
-    def _voice_say():
-        # Mic-free jaw trigger: POST {"text": "...", "use_llm": true|false}. Animates the
-        # mouth from model output (use_llm) or verbatim text — no audio capture, so it can't
-        # hit the PulseAudio teardown crash the record path can.
-        data = request.get_json(silent=True) or {}
-        text = data.get('text') or request.form.get('text') or ''
-        use_llm = data.get('use_llm', True)
-        result = _voice.say(text, use_llm=bool(use_llm))
-        return result, (400 if 'error' in result else 200)
-
-    @_flask_app.route('/upload_video', methods=['POST'])
-    def _upload_video():
-        f = request.files.get('video')
-        if not f:
-            return {"error": "no file"}, 400
-        ext  = os.path.splitext(f.filename or "")[1].lower() or ".mp4"
-        path = os.path.join(UPLOAD_DIR, f"upload{ext}")
-        f.save(path)
-        try:
-            from vision.camera import VideoFileCamera
-            cam = VideoFileCamera(path)
-        except Exception as exc:
-            return {"error": str(exc)}, 422
-        warnings = []
-        if cam.width < 640 or cam.height < 480:
-            warnings.append(f"Resolution {cam.width}×{cam.height} below recommended 640×480")
-        if cam.fps < 15:
-            warnings.append(f"FPS {cam.fps:.1f} below recommended 15")
-        _camera.play_video(cam)
-        return {"status": "ok", "fps": cam.fps, "width": cam.width,
-                "height": cam.height, "frame_count": cam.frame_count,
-                "warnings": warnings}
-
-    @_flask_app.route('/stop_video', methods=['POST'])
-    def _stop_video():
-        _camera.stop_video()
-        return {"status": "ok"}
-
-    @_flask_app.route('/settings')
-    def _settings_get():
-        # The values are already on /params as set_*; this exists so the specs and the valid ranges are
-        # discoverable with curl over ssh, the same reason /voice/wake accepts a text payload.
-        return {"values": settings.snapshot(), "defaults": settings.defaults(),
-                "specs": settings.describe(), "locked": _camera.settings_locked(),
-                "persist_error": settings.persist_error(),
-                "supervised": lifecycle.supervised()}
-
-    @_flask_app.route('/settings', methods=['POST'])
-    def _settings_post():
-        data = request.get_json(silent=True) or {}
-        if not isinstance(data, dict) or not data:
-            return {"error": "expected a JSON object of setting -> value"}, 400
-        locked = _camera.settings_locked()
-        for name in data:
-            if name in locked:
-                return {"error": f"{name}: {locked[name]}"}, 400
-        try:
-            # All-or-nothing: a batch that half-applied could leave two knobs disagreeing.
-            applied = settings.set_many(data)
-        except ValueError as exc:
-            return {"error": str(exc)}, 400
-        # A failed SAVE is not a failed request — the change is live, which is what was asked. Reporting
-        # 400 here would make the dashboard snap the control back to a value no longer in effect.
-        return {"status": "ok", "values": applied, "persist_error": settings.persist_error()}
-
-    @_flask_app.route('/settings/reset', methods=['POST'])
-    def _settings_reset():
-        return {"status": "ok", "values": settings.reset()}
-
-    @_flask_app.route('/restart', methods=['POST'])
-    def _restart():
-        # The escape hatch for the failures a setting cannot reach: a wedged capture device, a
-        # Porcupine engine that stopped hearing, an Ollama that came back after face_track gave up.
-        # Everything those need is done at startup, so restarting the process is the fix, and the
-        # alternative in the room is an ssh session or a power cycle.
-        #
-        # It exits rather than re-initialising in place: run() builds the camera, servo, MediaPipe
-        # and session state as locals, and a second run() on top of a half-torn-down first one is a
-        # much worse thing to get wrong than a 20 s outage. scripts/autostart.sh brings us back.
-        #
-        # The reply is sent BEFORE anything is torn down (the shutdown fires on a short timer), so
-        # the dashboard learns whether a supervisor will actually restart us — the one thing the
-        # operator cannot see from the UI, and the difference between "back in 20s" and "dead".
-        supervised = lifecycle.supervised()
-        lifecycle.schedule_restart()
-        return {"status": "ok", "supervised": supervised,
-                "message": ("restarting — the dashboard will reconnect on its own" if supervised
-                            else "shutting down; nothing is supervising this process, so it will "
-                                 "NOT come back on its own")}
-
-    @_flask_app.route('/audio/reresolve', methods=['POST'])
-    def _audio_reresolve():
-        # The cheap half of the restart button. A mic that failed at boot is usually fine a minute
-        # later (the INMP441 read silent on one boot and timed out on the next, with `arecord`
-        # finding real audio on both), but nothing short of restarting the process used to take that
-        # second look — the watchdog only reopens a stream that died, and skips STATE_DISABLED
-        # entirely, which is exactly the state a never-started mic leaves behind.
-        #
-        # Seconds instead of the restart's ~20 s, and it keeps the camera, servos and conversation
-        # history up. Reach for the restart only when this does not help.
-        return _session.reresolve_mic()
-
-    @_flask_app.route('/system/reboot', methods=['POST'])
-    def _system_reboot():
-        # The blunt instrument, for the residue a process restart genuinely cannot clear: a wedged
-        # ALSA/kernel audio path, nvargus-daemon, GPU memory fragmentation. Try /audio/reresolve,
-        # then /restart, before this — both are seconds and neither drops the network.
-        #
-        # Guarded three ways, because unlike every other control on this dashboard a reboot is not
-        # recoverable-in-place and the dashboard has NO authentication (Flask binds 0.0.0.0):
-        #   - an explicit {"confirm": "reboot"} body, so no stray or replayed POST can trigger it
-        #   - REBOOT_ENABLED off by default, so it cannot fire on a robot nobody set it up on
-        #   - a sudo probe first, so an unconfigured sudoers reports a clear error instead of a
-        #     silent no-op that leaves the operator watching a robot that is never coming back
-        if not REBOOT_ENABLED:
-            return {"status": "error", "error":
-                    "the reboot control is disabled — set REBOOT_ENABLED in config/tracking.py and "
-                    "give this user a NOPASSWD sudoers line for exactly the reboot command"}, 403
-        body = request.get_json(silent=True) or {}
-        if body.get("confirm") != "reboot":
-            return {"status": "error", "error": "missing confirmation"}, 400
-        ok, detail = lifecycle.reboot_now()
-        if not ok:
-            return {"status": "error", "error": detail}, 500
-        return {"status": "ok", "message": "rebooting — Kai will be back in about 90 seconds"}
-
-    @_flask_app.route('/camera/probe', methods=['POST'])
-    def _camera_probe():
-        # Wakes the supervisor so a camera just plugged in is picked up now rather than after the
-        # backoff. The outcome arrives on /params as cam_source/cam_reason, like every other async
-        # result in this app.
-        _camera.probe_now()
-        return {"status": "ok"}
-
-
-def _voice_capture_start() -> dict:
-    """Begin a push-to-talk recording, via the session when it owns the stream."""
-    if _session.owns_capture:
-        return _session.request_ptt_start()
-    return _voice.start_recording()
-
-
-def _voice_capture_stop() -> dict:
-    if _session.owns_capture:
-        return _session.request_ptt_stop()
-    return _voice.stop_recording()
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+# The published state, and the Flask app built around it. _flask_app is None when flask is not
+# installed, which is the headless case: the robot still runs and the wake word still works,
+# nothing is served.
+_web       = DashboardState()
+_dashboard = Dashboard(voice=_voice, session=_session, camera=_camera, state=_web)
+_flask_app = _dashboard.create_app()
 
 
 # ── Servo availability ────────────────────────────────────────────────────────
@@ -659,30 +390,21 @@ def _make_face_data(fp: FaceParams | None, gesture: str | None, frame_t: float) 
 
 
 def _publish_web(frame, fp: FaceParams | None, gesture: str | None,
-                 servo: ServoSerial, frame_t: float, last_web_t: float) -> float:
+                 frame_t: float, last_web_t: float) -> float:
     """Store the latest raw frame + face params if WEB_PUBLISH_INTERVAL has elapsed. JPEG encoding
     happens lazily in the /video generator (only while a client is connected), not here.
 
     Frame-dependent state only — pan/tilt/jaw and cam_source moved to _publish_status, which runs
     even when there are no frames at all."""
-    global _web_raw_frame, _web_frame_id, _web_params, _web_frame_t
     now = time.monotonic()
-    if not _FLASK_OK or now - last_web_t < WEB_PUBLISH_INTERVAL:
+    if _flask_app is None or now - last_web_t < WEB_PUBLISH_INTERVAL:
         return last_web_t
     face_data = _make_face_data(fp, gesture, frame_t)
     # Effective feed rate = inter-publish interval (steady ~25 fps while streaming),
     # which is meaningful even though inference is decimated below the camera rate.
     fps_val   = int(1.0 / (now - last_web_t)) if last_web_t else 0
-    params    = {**face_data, "fps": fps_val}
-    with _web_lock:
-        _web_raw_frame = frame
-        _web_frame_id += 1
-        _web_params  = params
-        _web_frame_t = now
+    _web.publish_frame(frame, {**face_data, "fps": fps_val}, now)
     return now
-
-
-FRAME_STALE_S = 1.0   # after this long with no frame, stop reporting the last frame's face data
 
 
 def _publish_status(cam_thread, servo, last_status_t: float) -> float:
@@ -695,9 +417,8 @@ def _publish_status(cam_thread, servo, last_status_t: float) -> float:
     Gated at the same 25 Hz as _publish_web, so the ~200 Hz no-frame loop does not rebuild this dict
     on every pass.
     """
-    global _web_status, _web_params
     now = time.monotonic()
-    if not _FLASK_OK or now - last_status_t < WEB_PUBLISH_INTERVAL:
+    if _flask_app is None or now - last_status_t < WEB_PUBLISH_INTERVAL:
         return last_status_t
 
     cam    = _camera.snapshot()
@@ -715,32 +436,10 @@ def _publish_status(cam_thread, servo, last_status_t: float) -> float:
     }
     status.update({f"set_{name}": value for name, value in settings.snapshot().items()})
 
-    # Built outside the lock (settings and cam have their own); the lock is shared with the /video
-    # generator, so hold it for the assignment only.
-    with _web_lock:
-        _web_status = status
-        # Frames have stopped: drop the stale face data rather than let the dashboard keep showing
-        # the last face and fps it saw. The frontend's `?? 0` fallbacks then read as "no face, 0 fps".
-        if _web_params and (not _web_frame_t or now - _web_frame_t > FRAME_STALE_S):
-            _web_params = {}
+    # Built outside the state's lock (settings and the supervisor have their own); publish_status
+    # holds it for the assignment only, and it also expires the face data once frames stop.
+    _web.publish_status(status, now)
     return now
-
-
-def _params_snapshot() -> dict:
-    """One full state snapshot for /params. Extracted from the SSE generator so it can be tested —
-    the generator itself never terminates."""
-    with _web_lock:
-        data = dict(_web_status)
-        data.update(_web_params)
-    data.update(_voice.get_status())
-    # Additive sess_* keys, plus the projected voice_status/voice_speaking for hands-free states.
-    # Unknown keys are ignored by the frontend.
-    data.update(_session.get_status())
-    # Whether the reboot control is configured at all. Published so the dashboard can leave the
-    # button out entirely rather than show one that always answers 403 — an operator reaching for
-    # a recovery control should not have to learn it was never switched on.
-    data["reboot_enabled"] = REBOOT_ENABLED
-    return data
 
 
 def _register_settings_callbacks() -> None:
@@ -787,7 +486,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"[face_track] flip={args.flip}  tilt={args.tilt}  lofi={args.lofi}  "
           f"ema={EMA_ALPHA}  infer={INFERENCE_FPS}fps")
 
-    if _FLASK_OK:
+    if _flask_app is not None:
         _start_web_server(resolve_mic=not args.wake)
 
     mp_mesh = mp.solutions.face_mesh.FaceMesh(
@@ -878,7 +577,7 @@ def run(args: argparse.Namespace) -> None:
             # Drive the speaking jaw every iteration, independent of frames — the mouth must
             # keep animating mid-sentence even if the camera stalls. Uses the fast jaw-only
             # channel (20 Hz), decoupled from the 10 Hz pan/tilt gate.
-            # No longer gated on _FLASK_OK: _voice is constructed at module scope now, and the wake
+            # No longer gated on flask: _voice is constructed at module scope now, and the wake
             # word can drive a reply with no dashboard running at all.
             jaw_on = _jaw_on(args)
             if prev_jaw_on and not jaw_on:
@@ -921,7 +620,7 @@ def run(args: argparse.Namespace) -> None:
                     will_log = frame_t - last_log_t >= 0.5
                     # solvePnP (yaw/pitch/roll) only feeds logging + the dashboard, so skip it
                     # unless we're about to log or someone is watching the video feed.
-                    fp = compute_face_params(lm, compute_pose=(will_log or _has_video_client()))
+                    fp = compute_face_params(lm, compute_pose=(will_log or _web.has_video_client()))
                     gesture = detector.update(fp, frame_t)
                     if gesture:
                         servo.send_gesture(gesture)
@@ -984,7 +683,7 @@ def run(args: argparse.Namespace) -> None:
                     cv2.putText(frame, "NO FACE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                     last_fp = None
 
-            last_web_t = _publish_web(frame, last_fp, publish_gesture, servo, frame_t, last_web_t)
+            last_web_t = _publish_web(frame, last_fp, publish_gesture, frame_t, last_web_t)
 
             if show:
                 cv2.imshow("face_track", frame)

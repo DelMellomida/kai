@@ -14,6 +14,7 @@ from unittest.mock import patch
 import face_track
 import settings
 from app import lifecycle
+from web import server as web_server
 
 
 class _FakeCamThread:
@@ -223,18 +224,17 @@ class TestParamsSnapshot(WebCase):
     """The /params generator never terminates, so the snapshot is the testable seam."""
 
     def test_is_json_safe(self):
-        json.dumps(face_track._params_snapshot())
+        json.dumps(face_track._dashboard.params_snapshot())
 
     def test_reports_the_camera_even_with_no_frames(self):
         # THE regression test. _publish_web only runs when a frame arrives, so on a robot with no camera
         # nothing published camera state at all and the dashboard fell back to showing "live" — claiming
         # a camera that does not exist. _publish_status runs on every loop iteration instead.
-        with face_track._web_lock:
-            face_track._web_params = {}
+        face_track._web.publish_frame(None, {}, 0.0)
         face_track._camera.set_state(reason="no /dev/video* device and no --network host")
         face_track._publish_status(_FakeCamThread("none"), _FakeServo(), 0.0)
 
-        snap = face_track._params_snapshot()
+        snap = face_track._dashboard.params_snapshot()
         self.assertEqual(snap["cam_source"], "none")
         self.assertIn("/dev/video*", snap["cam_reason"])
         self.assertEqual(snap["pan"], 90, "servo angles are frame-independent and must keep flowing")
@@ -243,25 +243,24 @@ class TestParamsSnapshot(WebCase):
     def test_a_live_camera_reports_no_reason(self):
         face_track._camera.set_state(reason="")
         face_track._publish_status(_FakeCamThread("csi"), _FakeServo(), 0.0)
-        snap = face_track._params_snapshot()
+        snap = face_track._dashboard.params_snapshot()
         self.assertEqual(snap["cam_source"], "csi")
         self.assertEqual(snap["cam_reason"], "")
 
     def test_stale_frame_data_is_dropped(self):
         # Otherwise the dashboard would keep showing the last face and fps it ever saw after the camera
         # went away. Cleared, the frontend's `?? 0` fallbacks read as "no face, 0 fps".
-        with face_track._web_lock:
-            face_track._web_params = {"face_visible": 1, "fps": 25}
-            face_track._web_frame_t = 0.0        # no frame has ever been published
+        # Face data present, but no frame has ever been published (frame_t stays 0.0).
+        face_track._web._params = {"face_visible": 1, "fps": 25}
+        face_track._web._frame_t = 0.0
         face_track._publish_status(_FakeCamThread("none"), _FakeServo(), 0.0)
-        self.assertNotIn("face_visible", face_track._params_snapshot())
+        self.assertNotIn("face_visible", face_track._dashboard.params_snapshot())
 
     def test_frame_data_overlays_status_without_colliding(self):
         # The two halves must not fight: no key is written by both publishers.
-        with face_track._web_lock:
-            face_track._web_status = {"cam_source": "none", "pan": 90}
-            face_track._web_params = {"face_visible": 1, "fps": 25}
-        snap = face_track._params_snapshot()
+        face_track._web._status = {"cam_source": "none", "pan": 90}
+        face_track._web._params = {"face_visible": 1, "fps": 25}
+        snap = face_track._dashboard.params_snapshot()
         self.assertEqual(snap["cam_source"], "none")
         self.assertEqual(snap["pan"], 90)
         self.assertEqual(snap["fps"], 25)
@@ -269,16 +268,15 @@ class TestParamsSnapshot(WebCase):
     def test_carries_the_settings_echo_namespaced(self):
         # set_* prefixed so a knob can never collide with telemetry — `jaw` is already a servo angle.
         settings.set_many({"tts_volume": 1.1})
-        with face_track._web_lock:
-            face_track._web_status = {f"set_{k}": v for k, v in settings.snapshot().items()}
-        snap = face_track._params_snapshot()
+        face_track._web._status = {f"set_{k}": v for k, v in settings.snapshot().items()}
+        snap = face_track._dashboard.params_snapshot()
         self.assertEqual(snap["set_tts_volume"], 1.1)
         self.assertNotIn("tts_volume", snap)
 
     def test_publishes_whether_the_reboot_control_is_configured(self):
         # The dashboard leaves the button out entirely when this is False, so it has to be on every
         # snapshot rather than only when enabled.
-        self.assertIn("reboot_enabled", face_track._params_snapshot())
+        self.assertIn("reboot_enabled", face_track._dashboard.params_snapshot())
 
 
 class TestAudioReresolve(WebCase):
@@ -314,7 +312,7 @@ class TestSystemReboot(WebCase):
     the machine running the tests, which is a uniquely bad property for a test suite to have."""
 
     def test_disabled_by_default_and_says_how_to_enable_it(self):
-        with patch.object(face_track, "REBOOT_ENABLED", False), \
+        with patch.object(web_server, "REBOOT_ENABLED", False), \
              patch.object(lifecycle, "reboot_now") as rb:
             res = self.client.post('/system/reboot', json={"confirm": "reboot"})
         self.assertEqual(res.status_code, 403)
@@ -324,7 +322,7 @@ class TestSystemReboot(WebCase):
     def test_without_the_confirmation_token_nothing_happens(self):
         # The dashboard's two taps protect against a slip. This protects against everything else
         # that can POST to an endpoint on a service with no authentication at all.
-        with patch.object(face_track, "REBOOT_ENABLED", True), \
+        with patch.object(web_server, "REBOOT_ENABLED", True), \
              patch.object(lifecycle, "reboot_now") as rb:
             for body in ({}, {"confirm": "yes"}, {"confirm": ""}):
                 res = self.client.post('/system/reboot', json=body)
@@ -333,7 +331,7 @@ class TestSystemReboot(WebCase):
         rb.assert_not_called()
 
     def test_reboots_when_enabled_and_confirmed(self):
-        with patch.object(face_track, "REBOOT_ENABLED", True), \
+        with patch.object(web_server, "REBOOT_ENABLED", True), \
              patch.object(lifecycle, "reboot_now", return_value=(True, "")) as rb:
             res = self.client.post('/system/reboot', json={"confirm": "reboot"})
         self.assertEqual(res.status_code, 200)
@@ -344,7 +342,7 @@ class TestSystemReboot(WebCase):
         # The failure being guarded against: a button that answers "ok" and does nothing, leaving
         # the operator watching a robot that is never coming back. That is exactly what made the
         # wedged restart so misleading, and it must not be rebuilt here.
-        with patch.object(face_track, "REBOOT_ENABLED", True), \
+        with patch.object(web_server, "REBOOT_ENABLED", True), \
              patch.object(lifecycle, "reboot_now",
                           return_value=(False, "this user may not run /usr/bin/systemctl reboot")):
             res = self.client.post('/system/reboot', json={"confirm": "reboot"})
@@ -352,7 +350,7 @@ class TestSystemReboot(WebCase):
         self.assertIn("may not run", res.get_json()["error"])
 
     def test_get_is_not_a_reboot(self):
-        with patch.object(face_track, "REBOOT_ENABLED", True), \
+        with patch.object(web_server, "REBOOT_ENABLED", True), \
              patch.object(lifecycle, "reboot_now") as rb:
             self.assertEqual(self.client.get('/system/reboot').status_code, 405)
         rb.assert_not_called()
