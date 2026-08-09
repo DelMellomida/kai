@@ -373,6 +373,87 @@ TTS_CARD_PROFILE = "output:analog-stereo+input:mono-fallback"
 # unresponsive pulseaudio must not be able to wedge the speak worker thread indefinitely.
 TTS_PACTL_TIMEOUT_S = 5.0
 
+# ── Delivery shaping (ai/delivery.py) ───────────────────────────────────────────
+# Applied to the SPOKEN text only, on the way to Piper. Read ai/delivery.py's module docstring
+# before touching these — in short: 29 voices across 7 engine families were measured on this box
+# (docs/expressive-voice-plan.md) and the flat-tone complaint survived all of them, because every
+# TTS model that fits beside Ollama here was trained on read-aloud audiobook corpora. The remaining
+# lever is DELIVERY, not timbre: breaths, non-uniform pacing, a conversational opening.
+#
+# Default for the dashboard's "Natural delivery" toggle; the live value is
+# settings.get("delivery_shaping"). Turn it off to hear the unshaped voice for comparison — that
+# A/B is the only way to judge any of this, and it needs no restart.
+DELIVERY_ENABLED = True
+
+# The break inserted before a clause-initial conjunction. A SEMICOLON, and that is a measured choice
+# rather than a typographic one — it is never seen, only heard.
+#
+# MEASURED on this robot (en_US-hfc_female-medium, length-scale 1.0, longest interior silence in the
+# RAW pre-sox Piper output, 4 replies at the real insertion points):
+#
+#   token        avg pause   per-reply
+#   none           0.053 s   0.090 0.110 0.070 0.050
+#   comma          0.110 s   0.090 0.359 0.120 0.090   <- erratic: twice it bought NOTHING
+#   semicolon      0.156 s   0.160 0.289 0.259 0.229   <- consistent, and ~3x "none"
+#
+# and on a single-sentence sweep of the other candidates: ellipsis 0.110 s, double-comma 0.140 s,
+# " --" 0.100 s, period 0.080 s. The comma was the original choice on the reasoning that it cannot
+# be mis-voiced — true, but it turned out to be worth ~10 ms in half the sentences, which is no
+# breath at all. The semicolon measured equally unvoiced and roughly twice the pause.
+#
+# espeak voices some strings in ways you cannot predict by reading them (config/thinking.py records
+# "Hmmmm..." transcribing back as "H-A-M-A-M-M"), so a change here is verified by synthesizing
+# through Piper and running Whisper over the result — checking that the token's NAME ("semicolon",
+# "comma") never appears in the transcript. Not by eye, and not by ear alone.
+DELIVERY_PAUSE = ";"
+
+# Conjunctions that may earn a breath before them. English only — a Tagalog reply matches nothing
+# here and passes through unshaped, which is deliberate (see ai/delivery.py). Multi-word entries are
+# matched with flexible internal whitespace and win over the single word they start with.
+DELIVERY_BREATH_CONJUNCTIONS = (
+    "but", "so", "because", "although", "though", "while", "which",
+    "and then", "or", "unless", "whereas",
+)
+# Words that must precede a conjunction before it is worth breathing after, counted from the
+# sentence start or the last existing break. The failure mode of this whole transform is
+# over-punctuation: a comma every few words is a stutter, not a breath, and sounds worse than the
+# flat reading it replaced. Raise this first if the delivery starts sounding choppy.
+DELIVERY_BREATH_MIN_WORDS = 6
+# ...and words that must FOLLOW it, so a break never strands a two-word tail.
+DELIVERY_BREATH_MIN_TAIL_WORDS = 3
+# Ceiling per sentence, for the same reason. 0 disables breath insertion entirely.
+DELIVERY_BREATH_MAX_PER_SENTENCE = 1
+
+# Discourse markers that may open a reply. This is the highest-value item in the block and the
+# riskiest: it ADDS words the LLM did not generate (to the speech only — the dashboard still shows
+# the real reply). It earns its place because a listener judges the first second of a turn, and
+# right now every turn starts the same way, mid-fact. Keep them short, and keep them the kind of
+# word that survives PH English/Tagalog code-switching. Empty tuple disables.
+DELIVERY_OPENERS = ("So,", "Well,", "Okay,", "Right,", "Alright,")
+# Percentage of replies that get one, chosen by a CRC of the text (stable per reply, evenly spread,
+# never random). An opener on EVERY reply becomes its own fixed shape — the exact tic this is meant
+# to break up — so this is deliberately well under 100. Lower it to 0 to keep breaths and tempo
+# without ever adding a word.
+DELIVERY_OPENER_RATE = 35
+# Replies shorter than this get none: "Yes, at 9 AM." does not want a preamble.
+DELIVERY_OPENER_MIN_WORDS = 8
+# First words that already open conversationally, or where a marker would be actively wrong — a
+# greeting, an apology, a direct yes/no. Compared lowercased with trailing punctuation stripped.
+DELIVERY_OPENER_SKIP_STARTS = frozenset({
+    "so", "well", "okay", "ok", "right", "alright", "actually", "sure", "yeah", "yes", "no",
+    "hi", "hello", "hey", "sorry", "oh", "hmm", "kumusta", "oo", "hindi", "opo",
+})
+
+# Per-reply jitter on Piper's --length-scale, as a fraction: 0.06 = ±6% speaking rate, keyed on the
+# text. Aimed at "uniform pacing" — two consecutive replies currently come out at byte-identical
+# tempo, which no single-reply improvement can fix. Costs nothing (one CLI argument, not a re-synth).
+# Past a few percent it stops reading as natural variation and starts reading as a rate bug. 0 off.
+DELIVERY_TEMPO_JITTER = 0.06
+# Hard bounds on the result — the same range as the dashboard's Speaking rate slider, so a mis-set
+# jitter can never hand Piper a scale that smears the voice.
+DELIVERY_TEMPO_MIN = 0.5
+DELIVERY_TEMPO_MAX = 2.0
+
 TTS_OUTPUT_DIR   = "/tmp"                 # where the transient reply WAV (kai_tts.wav) is written
 # paplay needs XDG_RUNTIME_DIR to find the PulseAudio socket in non-login contexts (the @reboot
 # cron autostart, or an SSH session). ai/tts.py forces this in the playback subprocess env.

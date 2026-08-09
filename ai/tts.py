@@ -256,17 +256,20 @@ def _run_piper(text: str, dst: Path, length_scale: float | None = None) -> bool:
     return True
 
 
-def synthesize(text: str) -> Path | None:
+def synthesize(text: str, length_scale: float | None = None) -> Path | None:
     """Synthesize `text` to a WAV with Piper, apply the loudness/stereo post-process, and return the
     path to play (or None on any failure, logged). Piper writes the raw WAV to
     TTS_OUTPUT_DIR/kai_tts_raw.wav, which _post_process() turns into TTS_OUTPUT_DIR/kai_tts.wav.
 
     Both paths are FIXED and shared by every reply, so the returned WAV is only valid until the next
-    synthesize() call. Anything meant to be cached and replayed must use synthesize_to()."""
+    synthesize() call. Anything meant to be cached and replayed must use synthesize_to().
+
+    `length_scale` overrides the dashboard's rate for this one reply — ai/voice_assistant passes the
+    per-reply tempo jitter from ai/delivery.length_scale here. None keeps the live setting."""
     text = clean_for_speech(text)   # never let emoji/symbols reach the phonemizer
     if not text:
         return None
-    if not _run_piper(text, _RAW_WAV):
+    if not _run_piper(text, _RAW_WAV, length_scale=length_scale):
         return None
     return _post_process(_RAW_WAV, _OUTPUT_WAV)
 
