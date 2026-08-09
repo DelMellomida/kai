@@ -267,12 +267,22 @@ OLLAMA_NUM_CTX   = 2048
 # thrashing — a reboot defragments and GPU inference is fast again. If OOM recurs on long uptimes,
 # free GPU headroom (e.g. disable the desktop GUI: `systemctl set-default multi-user.target`).
 OLLAMA_NUM_GPU   = None
-# Hard cap on generated tokens. Generation was previously unbounded while TTS_MAX_SPOKEN_CHARS (400)
+# Hard cap on generated tokens. Generation was previously unbounded while TTS_MAX_SPOKEN_CHARS
 # silently discarded the overflow — so a long reply cost generation time AND synthesis time for text
-# nobody ever heard. persona.txt already asks for 1-3 sentences and measured replies run 36-52 tokens,
-# so 96 is ~2x typical: it only truncates runaways. Every token saved here is paid back twice, once
-# in generation (~27 tok/s) and again in Piper synthesis (~0.55x realtime). None = uncapped.
-OLLAMA_NUM_PREDICT = 96
+# nobody ever heard. Every token saved here is paid back twice, once in generation (~27 tok/s) and
+# again in Piper synthesis (~0.55x realtime). None = uncapped.
+#
+# 192 (was 96): 96 was sized as ~2x the 36-52 tokens measured back when persona.txt demanded "1 to 3
+# short sentences" unconditionally. That line is gone — persona.txt now lets the question set the
+# length, and its upper case (four or five sentences for an explanation or a multi-part question) is
+# ~110 tokens on its own, which 96 would have cut mid-sentence. 192 keeps the same ~2x-typical
+# runaway margin, measured against the new ceiling instead of the old one.
+#
+# Deliberately set ABOVE what TTS_MAX_SPOKEN_CHARS (700) allows, so the CHARACTER clamp is the one
+# that normally binds. That ordering matters for how a runaway sounds: tts.clamp_for_speech backs up
+# to a sentence end, while num_predict stops the model wherever the 192nd token fell — usually
+# mid-word. Keep this the looser of the two if you retune either.
+OLLAMA_NUM_PREDICT = 192
 
 # Ceiling on the `/api/ps` placement probe (ai/voice_assistant.log_model_placement). Purely
 # diagnostic, and it runs on the startup warm path, so it must not be able to hold anything up if

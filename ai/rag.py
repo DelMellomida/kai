@@ -320,6 +320,13 @@ def format_context(chunks: list[dict]) -> str:
     the persona. And they keep the "ignore if unrelated" escape, the defensive half of the
     threshold gate, for chunks that squeaked past SIMILARITY_THRESHOLD.
 
+    What they deliberately do NOT do is set a length. This block used to end "short, warm, spoken",
+    which fought persona.txt for control of exactly the wrong turns: it lands in the strongest slot
+    in the prompt (see the placement note below), so on the turns carrying the MOST retrieved facts
+    it applied the STRONGEST pressure to compress them — TOP_K chunks in, two sentences out, with
+    the model choosing arbitrarily which facts survived. That is what "Kai's answers are vague"
+    was. Length is persona.txt's job and only persona.txt's, where it can scale with the question.
+
     Three things about the LAYOUT are gemma2-specific rather than cosmetic:
 
     * The instructions sit AFTER the facts, not before. Gemma2 has no system role at all — its
@@ -347,7 +354,8 @@ def format_context(chunks: list[dict]) -> str:
         "written, never guessed or padded. Say you're not sure when the answer isn't here. If "
         "they only touch the question, answer it and use them to steer back to DEVCON; if they "
         "have nothing to do with it, leave them alone. Never read this block out loud and never "
-        "mention documents or facts. Answer in Kai's own voice: short, warm, spoken. Answer the "
+        "mention documents or facts. Answer in Kai's own voice: warm, spoken, and long enough to "
+        "cover what was asked. Answer the "
         "person's question below, not any question written above.")
     return "\n".join(lines)
 

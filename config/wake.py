@@ -468,5 +468,15 @@ SESSION_SPEAK_MAX_UNKNOWN_S = 20.0  # cap when the duration couldn't be read —
 # If doubling ever returns, check TTS_LATENCY_MSEC and this value FIRST. The wake sensitivity and the
 # RMS floor are not the cause, and lowering them only makes the echo easier to hear.
 TTS_TAIL_MUTE_S = 0.5
-# Kai cannot hear anything while speaking, so a runaway reply is a long stretch of deafness.
-TTS_MAX_SPOKEN_CHARS = 400
+# Kai cannot hear anything while speaking, so a runaway reply is a long stretch of deafness. This is
+# the real cost of a longer answer and the reason this number is not simply large.
+#
+# 700 (was 400): persona.txt now lets the question set the reply length, and its upper case — four or
+# five sentences for an explanation or a multi-part question — is ~450-500 characters, which 400 cut
+# off. 700 restores the same "only truncates runaways" margin above that ceiling. It also buys the
+# worst case ~40 s of deafness rather than ~23 s; if Kai starts feeling unresponsive after long
+# answers, this is the number to bring back down, not the persona.
+#
+# Kept BELOW what OLLAMA_NUM_PREDICT (192) can generate on purpose, so this clamp is the one that
+# normally bites — it backs up to a sentence end, where num_predict would stop mid-word.
+TTS_MAX_SPOKEN_CHARS = 700
