@@ -6,8 +6,8 @@ with `now` passed in rather than read from the clock. That's what makes the fram
 every bug in this feature will live) testable off the Jetson, on a machine with none of the audio
 stack installed. ai/session.py owns the device and wires these together.
 
-pvporcupine and webrtcvad are imported behind flags, mirroring face_track.py's flask handling: on a
-dev box neither is installed, and importing this module must still work.
+pvporcupine and webrtcvad are imported behind flags, mirroring web/server.py's flask handling: on
+a dev box neither is installed, and importing this module must still work.
 """
 
 from __future__ import annotations

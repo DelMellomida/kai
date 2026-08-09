@@ -1,16 +1,12 @@
-"""Hands-free conversation: one always-open mic, a wake word, and a session state machine.
-
-Two objects live here.
-
-MicStream owns the ONE sd.InputStream in the process. Capture is the raw ALSA hw:APE device with
-PulseAudio suspended on it (config/voice.py), and a raw hw device admits exactly one opener — so a
-self-contained wake module that opened its own 16 kHz mic would fail intermittently and re-trigger
-the pulse-grabs-the-card-at-44.1k garble. Instead the callback stays dumb (slice, copy, enqueue) and
-one worker thread fans blocks out to Porcupine, the VAD, and the utterance buffer.
+"""Hands-free conversation: a wake word, turn-taking, and a session that ends itself.
 
 ConversationSession owns the state machine, every timer, and all the counters. It does not import
-Flask, cv2, mediapipe or face_track; presence arrives as an injected callable, so the session-end
-rules are testable with a fake clock and a fake camera.
+Flask, cv2, mediapipe or face_track; presence arrives as an injected callable and the microphone as
+an injected object, so the session-end rules are testable with a fake clock and a fake camera.
+
+The mic it drives is ai/mic_stream.MicStream — the process's single always-open capture stream.
+The seam between them is three callbacks (on_wake, on_audio, muted): the stream knows nothing about
+conversation states, and this file knows nothing about PortAudio.
 
 Two design choices carry most of the weight:
 
@@ -28,7 +24,6 @@ Two design choices carry most of the weight:
 
 from __future__ import annotations
 
-import queue
 import random
 import threading
 import time
@@ -36,13 +31,11 @@ import time
 import numpy as np
 
 from ai import filler, tts
-from ai.audio import (
-    CaptureBuffer, Decimator, FrameAssembler, HighPass, RingPreroll, SpeechGate, WakeDetector, rms,
-)
+from ai.audio import SpeechGate
 from ai.audio_debug import UtteranceRecorder
+from ai.mic_stream import MicStream
 from ai.voice_assistant import (
     STATUS_DONE, STATUS_ERROR, STATUS_IDLE, STATUS_RECORDING, STATUS_TRANSCRIBING,
-    apply_i2s_route, free_i2s_device, resolve_input_device, resume_pulse_source,
 )
 from ai.wake_phrase import match_wake_phrase
 from config.filler import (
@@ -54,15 +47,14 @@ from config.filler import (
 from config.thinking import THINKING_SOUND_DELAY_S, THINKING_SOUND_TARGET_S, THINKING_SOUND_TEXT
 from config.voice import SAMPLE_RATE
 from config.wake import (
-    ACK_PRESYNTH, ACK_WAV_DIR, CANNED_ERROR, CANNED_NO_SPEECH, CAPTURE_BLOCKSIZE,
-    CAPTURE_HARD_CAP_S, CAPTURE_QUEUE_BLOCKS, DEBUG_CAPTURE_DIR, DEBUG_CAPTURE_ENABLED,
+    ACK_PRESYNTH, ACK_WAV_DIR, CANNED_ERROR, CANNED_NO_SPEECH,
+    DEBUG_CAPTURE_DIR, DEBUG_CAPTURE_ENABLED,
     DEBUG_CAPTURE_KINDS, DEBUG_CAPTURE_MAX_FILES, DEBUG_CAPTURE_MAX_MB, HANDS_FREE_ENABLED,
-    MAX_UTTERANCE_S, MIC_HIGHPASS_HZ, MIC_INPUT_GAIN, MIC_LEGACY_CAPTURE, MIC_REOPEN_BACKOFF_S,
-    MIC_STALL_S,
-    MIN_UTTERANCE_S, PREROLL_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
+    MAX_UTTERANCE_S, MIC_LEGACY_CAPTURE,
+    MIN_UTTERANCE_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
     SESSION_MAX_NO_SPEECH_STREAK, SESSION_NO_FACE_S, SESSION_NO_SPEECH_S,
     SESSION_SPEAK_GRACE_S, SESSION_SPEAK_MAX_UNKNOWN_S, SESSION_TICK_HZ,
-    VAD_HANGOVER_S, VAD_RMS_FLOOR, WAKE_ACK_MAX_S, WAKE_ACK_TEXT, WAKE_ALLOW_BARGE_IN,
+    VAD_HANGOVER_S, WAKE_ACK_MAX_S, WAKE_ACK_TEXT, WAKE_ALLOW_BARGE_IN,
     WAKE_REFRACTORY_S, WAKE_SCAN_HANGOVER_S,
     WAKE_WHISPER_CHECK_MAX_S, WAKE_WHISPER_COOLDOWN_S, WAKE_WHISPER_LOG_CHARS,
     WAKE_WHISPER_LOG_TEXT, WAKE_WHISPER_LONG_COOLDOWN_S, WAKE_WHISPER_MAX_UTTERANCE_S,
@@ -105,422 +97,6 @@ REWARM_QUIET_WAIT_S = 20.0   # give a long reply time to finish before re-synthe
 REWARM_RETRY_S = 1.5         # one retry if the ack still got cancelled
 
 
-class MicStream:
-    """The process's single always-open capture stream, fanned out to several consumers.
-
-    Consumers are pulled, not pushed: the session hands in callbacks and MicStream calls them from
-    its worker thread. Nothing here knows about conversation states — it only knows whether capture
-    is armed and whether the mic is currently gated shut.
-    """
-
-    def __init__(self, on_wake=None, on_audio=None, muted=None) -> None:
-        self._on_wake = on_wake or (lambda now: None)
-        self._on_audio = on_audio or (lambda pcm, now: None)
-        self._muted = muted or (lambda now: False)
-
-        self._lock = threading.Lock()
-        self._stream = None
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._blocks: queue.Queue = queue.Queue(maxsize=CAPTURE_QUEUE_BLOCKS)
-
-        self.rate = SAMPLE_RATE          # the rate we EMIT, always 16 kHz
-        self._capture_rate = SAMPLE_RATE
-        self._take_channel = 0
-        self._channels = 1
-        self._dtype = "int16"
-        self._device = None
-        self._is_i2s = False
-
-        self._decim: Decimator | None = None
-        # Built once, not per open: it runs at the EMIT rate (always 16 kHz), so unlike the decimator
-        # it does not depend on which device won. None when MIC_HIGHPASS_HZ is 0.
-        self._hpf = HighPass() if MIC_HIGHPASS_HZ > 0 else None
-        self.wake = WakeDetector()
-        # Guards the wake engine against being torn down mid-process(). Porcupine's handle owns native
-        # memory, so freeing it while the audio worker is inside process() is a use-after-free, not just
-        # a race. Held only around the framing/process block and around reload_wake() — deliberately
-        # NOT the same lock as self._lock, and never taken on the PortAudio callback (_on_block only
-        # enqueues), so it cannot xrun the device.
-        self._wake_lock = threading.Lock()
-        self._wake_frames = FrameAssembler(self.wake.frame_length)
-        self._preroll = RingPreroll(PREROLL_S, SAMPLE_RATE)
-        self._capture = CaptureBuffer(SAMPLE_RATE, CAPTURE_HARD_CAP_S)
-        self._armed = False
-        self._wake_enabled = True
-        # True across the close/open window of a watchdog reopen. Without it the session sees a
-        # momentarily-dead stream and declares mic_lost, ending a conversation that was fine.
-        self.reopening = False
-
-        # Counters, all published on /params — a misfire has to be diagnosable over ssh with no
-        # debugger, which means every drop and every suppression is counted rather than ignored.
-        self.blocks = 0
-        self.dropped_blocks = 0
-        self.overflows = 0
-        self.muted_blocks = 0
-        self.reopens = 0
-        self.last_block_t = 0.0
-        self.last_rms = 0.0
-        self.error: str | None = None
-
-    # ── lifecycle ───────────────────────────────────────────────────────────
-
-    def open(self) -> bool:
-        """Resolve a mic and open the stream. False (with .error set) if it can't be opened."""
-        import sounddevice as sd
-
-        # Same sequence as VoiceAssistant.ensure_input_resolved(): route, take the card off pulse so
-        # the raw hw probe can open at 48 kHz, hand pulse back if we land elsewhere.
-        # Each step is logged because every one of them can block on external state (amixer, pulse,
-        # ALSA device contention), and without this a hang here is indistinguishable from a hang
-        # anywhere else in startup.
-        apply_i2s_route()
-        free_i2s_device()
-        print("[mic] resolving input device…", flush=True)
-        mic = resolve_input_device()
-        if not mic.is_i2s:
-            resume_pulse_source()
-        print(f"[mic] resolved device={mic.device} rate={mic.rate} ch={mic.channels} "
-              f"i2s={mic.is_i2s} — opening stream…", flush=True)
-
-        with self._lock:
-            self._device, self._capture_rate = mic.device, mic.rate
-            self._channels, self._take_channel = mic.channels, mic.take_channel
-            self._dtype, self._is_i2s = mic.dtype, mic.is_i2s
-            # Only the raw I2S device is rate-locked to 48 kHz. USB/default go through pulse's
-            # plughw, which resamples for us — so ask for 16 kHz directly and skip the decimator,
-            # which deletes the 44.1 kHz non-integer-ratio problem instead of solving it.
-            if mic.rate == SAMPLE_RATE:
-                self._decim = None
-            else:
-                try:
-                    self._decim = Decimator(mic.rate, SAMPLE_RATE, gain=MIC_INPUT_GAIN)
-                except ValueError as exc:
-                    self.error = f"cannot resample {mic.rate} Hz: {exc}"
-                    print(f"[mic] ERROR: {self.error}", flush=True)
-                    return False
-
-        try:
-            stream = sd.InputStream(
-                samplerate=self._capture_rate, channels=self._channels, dtype=self._dtype,
-                device=self._device, blocksize=CAPTURE_BLOCKSIZE, callback=self._on_block,
-            )
-            stream.start()
-        except Exception as exc:
-            self.error = f"could not open microphone: {exc}"
-            print(f"[mic] ERROR: {self.error}", flush=True)
-            return False
-
-        with self._lock:
-            self._stream = stream
-            self.error = None
-        self.last_block_t = time.monotonic()
-        print(f"[mic] open: device={self._device} {self._capture_rate} Hz x{self._channels} "
-              f"-> {SAMPLE_RATE} Hz{'' if self._decim else ' (no resample)'}", flush=True)
-        return True
-
-    def start(self) -> bool:
-        """Open the stream and start the fan-out worker."""
-        if not self.open():
-            return False
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._worker, daemon=True, name="kai-audio")
-        self._thread.start()
-        return True
-
-    def stop(self) -> None:
-        self._stop.set()
-        thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=2.0)
-        self._close_stream()
-        self.wake.close()   # Porcupine holds native memory; leaking it across restarts is a leak
-
-    def _close_stream(self) -> None:
-        with self._lock:
-            stream, self._stream = self._stream, None
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
-
-    def reopen(self) -> bool:
-        """Tear the stream down and open it again, after a stall. Keeps the worker running."""
-        self.reopens += 1
-        print(f"[mic] reopening (attempt {self.reopens})", flush=True)
-        self.reopening = True
-        try:
-            self._close_stream()
-            while not self._blocks.empty():     # stale audio must not survive the gap
-                try:
-                    self._blocks.get_nowait()
-                except queue.Empty:
-                    break
-            ok = self.open()
-            if ok:
-                self.reset_dsp()
-            return ok
-        finally:
-            self.reopening = False
-
-    # ── the PortAudio callback: stays dumb, never blocks ────────────────────
-
-    def _on_block(self, indata, frames, time_info, status) -> None:
-        if status is not None and getattr(status, "input_overflow", False):
-            self.overflows += 1
-        col = self._take_channel
-        # .copy() is required — PortAudio reuses indata's buffer once we return.
-        chunk = indata[:, col:col + 1].copy().ravel()
-        try:
-            self._blocks.put_nowait(chunk)
-        except queue.Full:
-            # Drop the oldest and keep the newest: for wake-word spotting, fresh audio is worth more
-            # than complete audio, and blocking here would xrun the device.
-            self.dropped_blocks += 1
-            try:
-                self._blocks.get_nowait()
-                self._blocks.put_nowait(chunk)
-            except (queue.Empty, queue.Full):
-                pass
-
-    # ── the fan-out worker ──────────────────────────────────────────────────
-
-    def _worker(self) -> None:
-        backoff_i = 0
-        while not self._stop.is_set():
-            try:
-                chunk = self._blocks.get(timeout=0.2)
-            except queue.Empty:
-                # Nothing arriving. If pulse re-grabbed the suspended APE card (a settings panel, a
-                # stray pactl, a USB re-enumeration) the stream goes silent with NO exception, so
-                # without this Kai would go permanently deaf with no signal at all.
-                now = time.monotonic()
-                if now - self.last_block_t > MIC_STALL_S and not self._stop.is_set():
-                    delay = MIC_REOPEN_BACKOFF_S[min(backoff_i, len(MIC_REOPEN_BACKOFF_S) - 1)]
-                    print(f"[mic] WARNING: no audio for {now - self.last_block_t:.1f}s — "
-                          f"reopening in {delay:.0f}s", flush=True)
-                    if self._stop.wait(delay):
-                        return
-                    if self.reopen():
-                        backoff_i = 0
-                        self.last_block_t = time.monotonic()
-                    else:
-                        backoff_i += 1
-                continue
-
-            backoff_i = 0
-            self._process_block(chunk, time.monotonic())
-
-    def _process_block(self, chunk: np.ndarray, now: float) -> None:
-        """Gate, resample, and fan one captured block out to the wake word, the VAD and the buffer.
-
-        Split out of _worker so the fan-out can be driven directly in tests with no device, no
-        PortAudio and no thread."""
-        self.last_block_t = now
-        self.blocks += 1
-
-        # The self-hearing gate, enforced in exactly one place and BEFORE any DSP: no resample, no
-        # Porcupine, no VAD, no append. Skipping the decimation saves the CPU too.
-        if self._muted(now):
-            self.muted_blocks += 1
-            return
-
-        pcm = self._decim.feed(chunk) if self._decim else chunk.astype(np.int16)
-        if pcm.size == 0:
-            return
-        # After decimation, before anything measures or stores it — so the wake engine, the VAD and
-        # the audio Whisper transcribes all see the same de-rumbled signal. See MIC_HIGHPASS_HZ.
-        if self._hpf is not None:
-            pcm = self._hpf.feed(pcm)
-        # DC-blocked, deliberately: this number is published as sess_rms and is what VAD_RMS_FLOOR
-        # gets tuned against, so it MUST be the same quantity SpeechGate compares to that floor.
-        # Measured raw it reads roughly 2x higher on this mic (the INMP441 carries a large standing
-        # offset), which made the floor look comfortably clear while not a single frame passed it.
-        self.last_rms = rms(pcm.astype(np.float64) - float(np.mean(pcm)))
-
-        # frame_ready, not ready: the utterance tier is "ready" but has no frames to push, and
-        # framing blocks to feed a no-op would be pure waste.
-        if self._wake_enabled and self.wake.frame_ready:
-            with self._wake_lock:
-                # Re-check under the lock: a reload may have closed the engine while we waited.
-                if self.wake.frame_ready:
-                    if self._wake_frames.size != self.wake.frame_length:
-                        # Self-heal. The assembler is sized in __init__, before open() knows which tier
-                        # won and therefore what frame size it wants (512 for Porcupine, 1280 for
-                        # openWakeWord). One integer compare per block makes that ordering bug
-                        # structurally impossible rather than something a future refactor must remember.
-                        self.sync_wake_geometry()
-                    # Count the hits rather than stopping at the first: openWakeWord keeps a rolling
-                    # feature history, so every frame must be fed, and the caller's contract is one
-                    # _on_wake per firing frame (the session's WAKE_REFRACTORY_S is what collapses
-                    # them into a single wake).
-                    fired = sum(1 for frame in self._wake_frames.push(pcm)
-                                if self.wake.process(frame))
-                else:
-                    fired = 0
-            # Outside the lock: _on_wake runs the session's own machinery (and takes its lock), so
-            # holding the wake lock across it would invert the lock order against reload_wake().
-            for _ in range(fired):
-                self._on_wake(now)
-
-        # ── the fan-out splits here ──────────────────────────────────────────
-        # Everything above this line is shared. Below it there are two consumers with genuinely
-        # different needs, and _asr_signal is the seam between them. See its docstring.
-        asr = self._asr_signal(pcm)
-        self._preroll.push(asr)
-        with self._lock:
-            armed = self._armed
-        if armed:
-            self._capture.push(asr)
-        # `pcm`, not `asr`: the VAD keeps the un-enhanced signal (see _asr_signal).
-        self._on_audio(pcm, now)
-
-    def _asr_signal(self, pcm: np.ndarray) -> np.ndarray:
-        """The branch of the fan-out that ends up in Whisper. Identity today.
-
-        The seam is here rather than added later because the split is structural, not speculative.
-        Noise suppression — spectral subtraction, RNNoise, speex, anything of that family — reliably
-        helps ASR on a noisy room and reliably HURTS acoustic wake-word models, which were trained
-        on unprocessed audio and see a denoiser's artefacts as a different signal. One buffer cannot
-        serve both, so the two paths have to diverge before any of it can be tried.
-
-        The VAD stays on the un-enhanced side too, for a separate reason: VAD_RMS_FLOOR and
-        VAD_RMS_FLOOR_HOLD are absolute int16 levels, measured on this exact chain (config/wake.py
-        documents the room and the date), and sess_rms is published as the number they are tuned
-        against. Putting a gain-changing stage in front of the gate would invalidate both at once
-        and the symptom would be a floor that no longer means anything, not an error.
-
-        Rules for anything added here:
-          * It must be block-continuous — carried state, overlap-save — exactly like Decimator and
-            HighPass. A stateless per-block filter injects a discontinuity every 32 ms; see the
-            Decimator docstring for why that is worse than it sounds.
-          * It must be reset in reset_dsp(), or residue from before a mute rings into the first
-            frames back.
-          * It must not change length, or the pre-roll arithmetic stops lining up with the capture.
-        """
-        return pcm
-
-    # ── consumer controls (called from the session thread) ──────────────────
-
-    def sync_wake_geometry(self) -> None:
-        """Re-size the wake frame assembler to whatever the tier that actually WON reports.
-
-        Must happen after wake.open(): the frame length isn't known until then, and a stale size
-        means the engine is fed wrong-shaped frames and silently never fires — with sess_wake_ok
-        still reading True, which is the nastiest way for this to fail."""
-        with self._lock:
-            want = max(1, self.wake.frame_length)
-            if self._wake_frames.size != want:
-                self._wake_frames = FrameAssembler(want)
-
-    def reset_dsp(self) -> None:
-        """Drop every scrap of buffered/filtered audio. Called when the mic un-mutes: pre-mute
-        residue and half-frames would otherwise trip a speech onset on the first frame back."""
-        if self._decim is not None:
-            self._decim.reset()
-        if self._hpf is not None:
-            self._hpf.reset()          # 255 taps of ring-out would otherwise trip the first onset
-        self._wake_frames.reset()
-        self._preroll.reset()
-        # openWakeWord keeps its own audio/feature history, which must go for the same reason.
-        self.wake.reset()
-
-    def set_wake_enabled(self, enabled: bool) -> None:
-        self._wake_enabled = enabled
-
-    def set_wake_sensitivity(self, value: float) -> bool:
-        """Retune the wake word. Returns True if the engine was reloaded to apply it.
-
-        Called from a Flask request thread, which is why the reload is guarded: see reload_wake.
-        """
-        if not self.wake.set_sensitivity(value):
-            return False        # the live tier compares per frame — nothing to reopen
-        self.reload_wake()
-        return True
-
-    def reload_wake(self) -> None:
-        """Close and reopen the wake engine, safely, while audio keeps flowing.
-
-        The audio worker is inside wake.process() at 30+ blocks a second, and close() frees Porcupine's
-        native handle — so this MUST hold _wake_lock. create() costs ~10-50 ms, which delays at most a
-        block or two; those are already counted as sess_blocks_dropped / sess_audio_overflows. Wake
-        detection is disabled across the window so no frame reaches a half-built engine.
-        """
-        was_enabled = self._wake_enabled
-        self._wake_enabled = False
-        try:
-            with self._wake_lock:
-                self.wake.close()
-                if not self.wake.open():
-                    print(f"[mic] WARNING: wake engine did not come back after a reload "
-                          f"({self.wake.unavailable}) — push-to-talk is unaffected", flush=True)
-                    return
-            # After open(), never before: the winning tier decides the frame size.
-            self.sync_wake_geometry()
-        finally:
-            self._wake_enabled = was_enabled and self.wake.ready
-
-    def arm_utterance(self, preroll: bool = False) -> bool:
-        """Begin buffering audio into the utterance buffer. `preroll` seeds it with the ring, so
-        speech that arrived before the VAD confirmed onset isn't clipped off the front."""
-        with self._lock:
-            if self._stream is None:
-                return False
-            self._capture.reset()
-            self._armed = True
-        if preroll:
-            self._capture.prepend(self._preroll.take())
-        return True
-
-    def harvest_utterance(self) -> tuple[np.ndarray, int]:
-        """Stop buffering and return (audio, rate). Always 16 kHz mono int16."""
-        with self._lock:
-            self._armed = False
-        return self._capture.take(), SAMPLE_RATE
-
-    @property
-    def armed(self) -> bool:
-        with self._lock:
-            return self._armed
-
-    @property
-    def capture_seconds(self) -> float:
-        return self._capture.seconds
-
-    @property
-    def capture_truncated(self) -> bool:
-        return self._capture.truncated
-
-    @property
-    def live(self) -> bool:
-        with self._lock:
-            return self._stream is not None
-
-    # Which mic actually won, published so /audio/reresolve can report what it landed on and the
-    # dashboard can say "I2S" or "fallback" rather than just "ok". Read under the lock because
-    # open() writes them from the session-start thread while a request thread may be reading.
-    #
-    # Named `capture_rate`, NOT `rate`: `self.rate` is already taken and means the opposite end of
-    # the pipeline — the rate this class EMITS, always 16 kHz. Shadowing it with the rate the
-    # hardware is opened at would be a genuinely confusing bug to chase.
-    @property
-    def device(self) -> int | None:
-        with self._lock:
-            return self._device
-
-    @property
-    def capture_rate(self) -> int:
-        with self._lock:
-            return self._capture_rate
-
-    @property
-    def is_i2s(self) -> bool:
-        with self._lock:
-            return self._is_i2s
-
-
 class ConversationSession:
     """The hands-free state machine: wake word in, spoken reply out, and a session that ends itself.
 
@@ -551,9 +127,9 @@ class ConversationSession:
 
         # Filler bank state. All of it is re-armed by _arm_filler on every entry to BUSY, so a turn
         # can never inherit the previous turn's queue or its already-spoken flag. _filler_rng is a
-        # private Random rather than the module-level one: the sweep in face_track draws from its
-        # own too, and sharing global state across two independent randomised features makes each
-        # one's behaviour depend on how often the other ran.
+        # private Random rather than the module-level one: the sweep in app/control_loop.py draws
+        # from its own too, and sharing global state across two independent randomised features
+        # makes each one's behaviour depend on how often the other ran.
         self._filler_rng = random.Random()
         self._filler_lang = FILLER_DEFAULT_LANG   # latched at the opener, so a turn never switches
         self._filler_delay = 0.0                  # drawn per turn, clamped against the ceiling
@@ -1370,7 +946,7 @@ class ConversationSession:
         itself makes the wait it is covering longer. Silence is the correct degradation."""
         wav = self._canned.get(key)
         if wav is not None:
-            self._voice._speak_wav(wav, filler.text_for(key), epoch=self._epoch)
+            self._voice.speak_wav(wav, filler.text_for(key), epoch=self._epoch)
 
     def _tick_filler(self, now: float, elapsed: float) -> bool:
         """Caller holds the lock. Drive the filler for one tick of a BUSY turn. True if the filler
@@ -1439,7 +1015,7 @@ class ConversationSession:
         # speaking — that is what would turn two lines into one garbled overlap.
         #
         # speech_in_flight(), NOT tts.is_playing(). is_playing() only goes true once a playback
-        # PROCESS exists, and _speak_wav hands off to a worker thread first; at 20 Hz that leaves
+        # PROCESS exists, and speak_wav hands off to a worker thread first; at 20 Hz that leaves
         # several ticks where a line has been started but is not yet "playing", and each of those
         # ticks happily started another one. That is the overlap heard on the robot — three stalls
         # talking over each other. speech_in_flight covers the whole span from before synthesis to
@@ -1468,9 +1044,9 @@ class ConversationSession:
         post a spurious "Kai: Yes?" chat bubble on every single wake."""
         wav = self._canned.get(key)
         if wav is not None:
-            self._voice._speak_wav(wav, fallback, epoch=self._epoch)
+            self._voice.speak_wav(wav, fallback, epoch=self._epoch)
         else:
-            self._voice._speak(fallback, epoch=self._epoch)
+            self._voice.speak_text(fallback, epoch=self._epoch)
 
     # ── state + timers ──────────────────────────────────────────────────────
 
@@ -1718,7 +1294,7 @@ class ConversationSession:
             return False
         if self.enabled and not self._mic.wake.ready:
             return False
-        return self._voice._whisper_model is not None
+        return self._voice.stt_ready
 
     @property
     def state(self) -> str:
@@ -1895,7 +1471,7 @@ class ConversationSession:
             return "unknown"
         return "yes" if visible else "no"
 
-    def _log(self, message: str, state: str | None = None) -> None:
+    def _log(self, message: str) -> None:
         # flush=True because stdout is block-buffered into /tmp/face-servo.log under the autostart,
         # and a transition you only see minutes later is no use while tuning.
         print(f"[session] {message}", flush=True)

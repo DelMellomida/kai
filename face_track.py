@@ -11,40 +11,27 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
-import math
 import os
-import queue
-import random
 import socket
-import subprocess
-import sys
 import threading
 import time
-from typing import NamedTuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
 
-import logging
-logging.getLogger('werkzeug').setLevel(logging.ERROR)
-try:
-    from flask import Flask, Response, send_from_directory, request
-    _FLASK_OK = True
-except ImportError:
-    _FLASK_OK = False
-    print("[face_track] WARNING: flask not installed — web dashboard disabled. Run: pip3 install flask")
-
-from vision.camera      import CameraThread, NullCamera, device_signature, try_open_camera
-from vision.controller  import EMAFilter, PDAxis, TrackingTarget
+from app               import control_loop, lifecycle
+from app.camera_supervisor import CameraSupervisor
+from web.server         import Dashboard
+from web.state          import DashboardState
+from vision.camera      import CameraThread, NullCamera
+from vision.controller  import EMAFilter, TrackingTarget
 from vision.face_params import FaceParams, NOSE_TIP, PROCESS_W, PROCESS_H, compute_face_params, classify_emotion
 from vision.gesture     import GestureDetector
 from vision            import presence
 from servo.servo        import ServoSerial
-from ai.voice_assistant import STATUS_THINKING, STATUS_TRANSCRIBING, VoiceAssistant
+from ai.voice_assistant import VoiceAssistant
 from ai.session        import ConversationSession
-from ai.wake_phrase    import match_wake_phrase
 from ai import rag
 import settings
 
@@ -63,349 +50,41 @@ class _NullServo:
 # Tunable knobs live in config/tracking.py; re-imported here so the names stay module-level.
 from config.tracking import (
     INFERENCE_FPS, NO_FRAME_SLEEP, EMA_ALPHA, PAN_SCALE, TILT_SCALE, MIN_FACE_AREA,
-    JAW_CLOSED, JAW_OPEN, JAW_EMA_ALPHA, JAW_DEADBAND, PAN_MAX_STEP, EMA_RESET_FRAMES,
-    WEB_PUBLISH_INTERVAL, PAN_KP, PAN_KD, FACE_MIN_DETECTION_CONF, FACE_MIN_TRACKING_CONF,
-    WEB_PORT, UPLOAD_DIR, CONTROL_FPS, CONTROL_STALE_TIMEOUT, SERVO_ABSENCE_FRAMES,
-    NO_FACE_LOG_INTERVAL_S, CONTROL_LOG_INTERVAL_S,
-    REBOOT_ENABLED, REBOOT_COMMAND, REBOOT_TIMEOUT_S,
+    JAW_CLOSED, JAW_OPEN, JAW_EMA_ALPHA, JAW_DEADBAND, EMA_RESET_FRAMES,
+    WEB_PUBLISH_INTERVAL, FACE_MIN_DETECTION_CONF, FACE_MIN_TRACKING_CONF,
+    WEB_PORT, UPLOAD_DIR, SERVO_ABSENCE_FRAMES, NO_FACE_LOG_INTERVAL_S,
 )
-from config.servo import PAN_DEADBAND      # the control loop needs it to know when a send is a no-op
 from config.wake import SESSION_START_ATTEMPTS, SESSION_START_BACKOFF_S
-from config.thinking import (
-    THINKING_SWEEP_AMP_JITTER, THINKING_SWEEP_DEG, THINKING_SWEEP_PERIOD_JITTER,
-    THINKING_SWEEP_PERIOD_S, THINKING_SWEEP_RETURN_DPS, THINKING_SWEEP_START_S,
-    THINKING_SWEEP_WANDER_FRAC, THINKING_SWEEP_WANDER_RATIO,
-)
-from config.camera import (
-    CAMERA_RETRY_INTERVAL_S, CAMERA_RETRY_MAX_S, CAMERA_STALL_S,
-    CSI_FIRST_FRAME_S, CSI_FIRST_FRAME_RETRY_S,
-)
 
 INFERENCE_INTERVAL = 1.0 / INFERENCE_FPS   # derived from INFERENCE_FPS
-CONTROL_INTERVAL   = 1.0 / CONTROL_FPS     # servo control-loop period (decoupled from inference)
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Thread-safe camera swap signal: ("video", VideoFileCamera), ("live", None), or
-# ("live_source", camera) from the camera supervisor when a real camera appears or is released.
-# Depth 3, not 1: an upload and a supervisor swap can be in flight together, and with depth 1 the
-# drop-oldest replace in _replace_cam_swap would silently evict one before CameraThread applied it.
-_cam_swap: queue.Queue = queue.Queue(maxsize=3)
-
-# ── Web state ─────────────────────────────────────────────────────────────────
-# _web_raw_frame holds the latest *un-encoded* frame; the /video generator encodes it on
-# demand (only while a client is connected). _video_clients gates that work — when it's 0
-# (the headless autostart case) no JPEG encoding happens at all. _web_frame_id lets the
-# generator skip re-encoding a frame it already sent.
-#
-# The published state is split in two by whether it needs a FRAME:
-#   _web_params — face data + fps. Written only when a frame arrives, so it is empty with no camera.
-#   _web_status — camera/servo/settings state. Written every loop iteration, frame or not, because
-#                 "there is no camera, and here is why" is exactly what the dashboard must show when
-#                 no frames exist. Publishing this only alongside a frame is what used to make the
-#                 UI claim LIVE on a robot with no camera at all.
-# No key is written by both, so the merge order in _params_snapshot cannot matter.
-_web_lock   = threading.Lock()
-_web_raw_frame: np.ndarray | None = None
-_web_frame_id  = 0
-_web_params: dict = {}
-# Seeded, not empty: the dashboard is served as soon as Flask starts, which is before the tracking
-# loop's first _publish_status. An empty status there would let the frontend fall back to "live" and
-# claim a camera we do not have.
-_web_status: dict = {"cam_source": "none", "cam_reason": "starting up",
-                     "cam_mode": "auto", "cam_mode_locked": False, "cam_retry_in_s": 0.0}
-_web_frame_t   = 0.0     # monotonic time of the last published frame; 0.0 = none yet
-_video_clients = 0
-
-
-def _has_video_client() -> bool:
-    return _video_clients > 0
+# The live camera's owner: probing, hot-swap, release, and the state the dashboard reads. Built at
+# import time (the routes need something to talk to before run() has parsed the CLI) and given the
+# CLI facts by configure() in run().
+_camera = CameraSupervisor()
 
 # ── Voice ─────────────────────────────────────────────────────────────────────
-# Module scope, NOT inside the _FLASK_OK guard: neither of these touches Flask, and constructing
-# them there would mean "no flask installed -> no wake word", with nothing saying so. The Flask
-# routes below are only a second way to reach them; the wake word is the first.
+# Module scope, NOT behind a flask check: neither of these touches Flask, and constructing them
+# there would mean "no flask installed -> no wake word", with nothing saying so. The dashboard
+# routes are only a second way to reach them; the wake word is the first.
 _voice   = VoiceAssistant()
 _session = ConversationSession(_voice, presence=presence.snapshot)
 
-if _FLASK_OK:
-    _flask_app = Flask(__name__, static_folder=None)
-    _flask_app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB
-
-    @_flask_app.route('/')
-    def _index():
-        return send_from_directory(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web', 'frontend'),
-            'dashboard.html'
-        )
-
-    @_flask_app.route('/guide')
-    def _guide():
-        return send_from_directory(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web', 'frontend'),
-            'guide.html'
-        )
-
-    @_flask_app.route('/video')
-    def _video_feed():
-        def _gen():
-            global _video_clients
-            with _web_lock:
-                _video_clients += 1
-            last_id = -1
-            try:
-                while True:
-                    with _web_lock:
-                        frame = _web_raw_frame
-                        fid   = _web_frame_id
-                    # Encode on the Flask thread (off the tracking loop) and only when the
-                    # frame is new — never re-encode one we already sent.
-                    if frame is not None and fid != last_id:
-                        last_id = fid
-                        ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                        if ok:
-                            yield (b'--frame\r\n'
-                                   b'Content-Type: image/jpeg\r\n\r\n' + jpg.tobytes() + b'\r\n')
-                    time.sleep(0.02)
-            finally:
-                with _web_lock:
-                    _video_clients -= 1
-        return Response(_gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-    @_flask_app.route('/params')
-    def _params_stream():
-        def _gen():
-            while True:
-                yield f'data: {json.dumps(_params_snapshot())}\n\n'
-                time.sleep(0.05)
-        return Response(_gen(), mimetype='text/event-stream',
-                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
-
-    @_flask_app.route('/voice/start', methods=['POST'])
-    def _voice_start():
-        # Routed through the session, not straight to the assistant: after a hands-free turn the
-        # assistant's status is DONE while the session is still SPEAKING, so its own guard would
-        # accept this and open a SECOND stream on the raw hw device — which admits only one opener.
-        result = _voice_capture_start()
-        return result, (400 if 'error' in result else 200)
-
-    @_flask_app.route('/voice/stop', methods=['POST'])
-    def _voice_stop():
-        result = _voice_capture_stop()
-        return result, (400 if 'error' in result else 200)
-
-    @_flask_app.route('/voice/wake', methods=['POST'])
-    def _voice_wake():
-        # Fire the wake word by hand. Invaluable when the wake engine is misbehaving: it separates
-        # "the session machine is broken" from "the engine isn't hearing me".
-        #
-        # With {"text": "..."} it runs the whisper tier's matcher over that text and takes the
-        # one-breath path — which is how you exercise the matcher, say(), the epoch plumbing and
-        # _on_turn_done over ssh with curl, with no mic, no whisper and no room noise.
-        data = request.get_json(silent=True) or {}
-        text = (data.get('text') or request.form.get('text') or '').strip()
-        if text:
-            match = match_wake_phrase(text)
-            if match is None:
-                return {"error": f"no wake phrase in {text!r}"}, 400
-            accepted = _session.on_wake(command=match.command)
-        else:
-            accepted = _session.on_wake()
-        return ({"status": "ok"} if accepted
-                else {"error": f"wake rejected while {_session.state}"}), (200 if accepted else 400)
-
-    @_flask_app.route('/session/end', methods=['POST'])
-    def _session_end():
-        return _session.end_session("manual"), 200
-
-    @_flask_app.route('/voice/say', methods=['POST'])
-    def _voice_say():
-        # Mic-free jaw trigger: POST {"text": "...", "use_llm": true|false}. Animates the
-        # mouth from model output (use_llm) or verbatim text — no audio capture, so it can't
-        # hit the PulseAudio teardown crash the record path can.
-        data = request.get_json(silent=True) or {}
-        text = data.get('text') or request.form.get('text') or ''
-        use_llm = data.get('use_llm', True)
-        result = _voice.say(text, use_llm=bool(use_llm))
-        return result, (400 if 'error' in result else 200)
-
-    @_flask_app.route('/upload_video', methods=['POST'])
-    def _upload_video():
-        f = request.files.get('video')
-        if not f:
-            return {"error": "no file"}, 400
-        ext  = os.path.splitext(f.filename or "")[1].lower() or ".mp4"
-        path = os.path.join(UPLOAD_DIR, f"upload{ext}")
-        f.save(path)
-        try:
-            from vision.camera import VideoFileCamera
-            cam = VideoFileCamera(path)
-        except Exception as exc:
-            return {"error": str(exc)}, 422
-        warnings = []
-        if cam.width < 640 or cam.height < 480:
-            warnings.append(f"Resolution {cam.width}×{cam.height} below recommended 640×480")
-        if cam.fps < 15:
-            warnings.append(f"FPS {cam.fps:.1f} below recommended 15")
-        _replace_cam_swap(("video", cam))
-        return {"status": "ok", "fps": cam.fps, "width": cam.width,
-                "height": cam.height, "frame_count": cam.frame_count,
-                "warnings": warnings}
-
-    @_flask_app.route('/stop_video', methods=['POST'])
-    def _stop_video():
-        _replace_cam_swap(("live", None))
-        return {"status": "ok"}
-
-    @_flask_app.route('/settings')
-    def _settings_get():
-        # The values are already on /params as set_*; this exists so the specs and the valid ranges are
-        # discoverable with curl over ssh, the same reason /voice/wake accepts a text payload.
-        return {"values": settings.snapshot(), "defaults": settings.defaults(),
-                "specs": settings.describe(), "locked": _settings_locked(),
-                "persist_error": settings.persist_error(),
-                "supervised": _supervised()}
-
-    @_flask_app.route('/settings', methods=['POST'])
-    def _settings_post():
-        data = request.get_json(silent=True) or {}
-        if not isinstance(data, dict) or not data:
-            return {"error": "expected a JSON object of setting -> value"}, 400
-        locked = _settings_locked()
-        for name in data:
-            if name in locked:
-                return {"error": f"{name}: {locked[name]}"}, 400
-        try:
-            # All-or-nothing: a batch that half-applied could leave two knobs disagreeing.
-            applied = settings.set_many(data)
-        except ValueError as exc:
-            return {"error": str(exc)}, 400
-        # A failed SAVE is not a failed request — the change is live, which is what was asked. Reporting
-        # 400 here would make the dashboard snap the control back to a value no longer in effect.
-        return {"status": "ok", "values": applied, "persist_error": settings.persist_error()}
-
-    @_flask_app.route('/settings/reset', methods=['POST'])
-    def _settings_reset():
-        return {"status": "ok", "values": settings.reset()}
-
-    @_flask_app.route('/restart', methods=['POST'])
-    def _restart():
-        # The escape hatch for the failures a setting cannot reach: a wedged capture device, a
-        # Porcupine engine that stopped hearing, an Ollama that came back after face_track gave up.
-        # Everything those need is done at startup, so restarting the process is the fix, and the
-        # alternative in the room is an ssh session or a power cycle.
-        #
-        # It exits rather than re-initialising in place: run() builds the camera, servo, MediaPipe
-        # and session state as locals, and a second run() on top of a half-torn-down first one is a
-        # much worse thing to get wrong than a 20 s outage. scripts/autostart.sh brings us back.
-        #
-        # The reply is sent BEFORE anything is torn down (the shutdown fires on a short timer), so
-        # the dashboard learns whether a supervisor will actually restart us — the one thing the
-        # operator cannot see from the UI, and the difference between "back in 20s" and "dead".
-        supervised = _supervised()
-        _schedule_restart()
-        return {"status": "ok", "supervised": supervised,
-                "message": ("restarting — the dashboard will reconnect on its own" if supervised
-                            else "shutting down; nothing is supervising this process, so it will "
-                                 "NOT come back on its own")}
-
-    @_flask_app.route('/audio/reresolve', methods=['POST'])
-    def _audio_reresolve():
-        # The cheap half of the restart button. A mic that failed at boot is usually fine a minute
-        # later (the INMP441 read silent on one boot and timed out on the next, with `arecord`
-        # finding real audio on both), but nothing short of restarting the process used to take that
-        # second look — the watchdog only reopens a stream that died, and skips STATE_DISABLED
-        # entirely, which is exactly the state a never-started mic leaves behind.
-        #
-        # Seconds instead of the restart's ~20 s, and it keeps the camera, servos and conversation
-        # history up. Reach for the restart only when this does not help.
-        return _session.reresolve_mic()
-
-    @_flask_app.route('/system/reboot', methods=['POST'])
-    def _system_reboot():
-        # The blunt instrument, for the residue a process restart genuinely cannot clear: a wedged
-        # ALSA/kernel audio path, nvargus-daemon, GPU memory fragmentation. Try /audio/reresolve,
-        # then /restart, before this — both are seconds and neither drops the network.
-        #
-        # Guarded three ways, because unlike every other control on this dashboard a reboot is not
-        # recoverable-in-place and the dashboard has NO authentication (Flask binds 0.0.0.0):
-        #   - an explicit {"confirm": "reboot"} body, so no stray or replayed POST can trigger it
-        #   - REBOOT_ENABLED off by default, so it cannot fire on a robot nobody set it up on
-        #   - a sudo probe first, so an unconfigured sudoers reports a clear error instead of a
-        #     silent no-op that leaves the operator watching a robot that is never coming back
-        if not REBOOT_ENABLED:
-            return {"status": "error", "error":
-                    "the reboot control is disabled — set REBOOT_ENABLED in config/tracking.py and "
-                    "give this user a NOPASSWD sudoers line for exactly the reboot command"}, 403
-        body = request.get_json(silent=True) or {}
-        if body.get("confirm") != "reboot":
-            return {"status": "error", "error": "missing confirmation"}, 400
-        ok, detail = _reboot_now()
-        if not ok:
-            return {"status": "error", "error": detail}, 500
-        return {"status": "ok", "message": "rebooting — Kai will be back in about 90 seconds"}
-
-    @_flask_app.route('/camera/probe', methods=['POST'])
-    def _camera_probe():
-        # Wakes the supervisor so a camera just plugged in is picked up now rather than after the
-        # backoff. The outcome arrives on /params as cam_source/cam_reason, like every other async
-        # result in this app.
-        _cam_probe_now.set()
-        return {"status": "ok"}
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+# The published state, and the Flask app built around it. _flask_app is None when flask is not
+# installed, which is the headless case: the robot still runs and the wake word still works,
+# nothing is served.
+_web       = DashboardState()
+_dashboard = Dashboard(voice=_voice, session=_session, camera=_camera, state=_web)
+_flask_app = _dashboard.create_app()
 
 
-def _voice_capture_start() -> dict:
-    """Begin a push-to-talk recording, via the session when it owns the stream."""
-    if _session.owns_capture:
-        return _session.request_ptt_start()
-    return _voice.start_recording()
-
-
-def _voice_capture_stop() -> dict:
-    if _session.owns_capture:
-        return _session.request_ptt_stop()
-    return _voice.stop_recording()
-
-
-# ── Camera + servo availability ───────────────────────────────────────────────
-# Written by the camera supervisor thread, read by _publish_status on the tracking loop. Same
-# lock-guarded-holder shape as vision/controller.py's TrackingTarget.
-_cam_lock  = threading.Lock()
-_cam_state = {"reason": "starting up", "mode": "auto", "locked": False, "next_probe_at": 0.0}
-_cam_probe_now = threading.Event()      # set by POST /camera/probe to skip the backoff wait
-
-_cam_live = False        # is the live source a real camera (vs a NullCamera)?
-_cam_last_reason = None  # last reason we logged, so a stuck robot doesn't spam the log
-_cam_thread = None       # the live CameraThread, so the supervisor can check frame staleness
-
-
-def _set_cam_thread(thread) -> None:
-    global _cam_thread
-    _cam_thread = thread
-
+# ── Servo availability ────────────────────────────────────────────────────────
 # Set once by _open_servo; the dashboard shows it so an unplugged Arduino is visible rather than
 # just silently motionless.
 _servo_state = {"ok": True, "reason": ""}
-
-
-def _settings_locked() -> dict:
-    """Settings a CLI flag has taken away for this run -> why.
-
-    The dashboard disables those controls and shows the reason, rather than accepting a click that
-    silently does nothing.
-    """
-    cam = _cam_snapshot()
-    return {"camera_mode": "locked off by --no-camera"} if cam["locked"] else {}
-
-
-def _cam_set_state(**kw) -> None:
-    with _cam_lock:
-        _cam_state.update(kw)
-
-
-def _cam_snapshot() -> dict:
-    with _cam_lock:
-        return dict(_cam_state)
 
 
 def _open_servo(port: str):
@@ -423,130 +102,6 @@ def _open_servo(port: str):
         print(f"[servo] WARNING: serial port unavailable ({exc}) — running without servos; "
               f"the dashboard, voice and wake word are unaffected", flush=True)
         return _NullServo()
-
-
-def _effective_camera_mode(args: argparse.Namespace) -> str:
-    """"auto" or "off". --no-camera wins over the stored setting.
-
-    Like --no-servo, --no-camera declares this machine's hardware situation for this run, so a remote
-    browser must not be able to re-enable hardware the operator disabled at launch. The dashboard is
-    told (cam_mode_locked) so it can disable the control and say why instead of accepting a click that
-    does nothing. scripts/autostart.sh does not pass --no-camera, so in production the setting rules.
-    """
-    if args.no_camera:
-        return "off"
-    return settings.get("camera_mode")
-
-
-def _camera_supervisor(args: argparse.Namespace, stop_evt: threading.Event) -> None:
-    """Keep the live camera in sync with what is actually plugged in and what the operator asked for.
-
-    Runs for the whole process rather than exiting once a camera is found, because camera_mode can be
-    flipped to "off" later, and a USB camera can be unplugged and replugged. Parked cost is one
-    settings lookup per interval.
-
-    Backoff applies only to *expensive* failures. When there is no device node at all, try_open_camera
-    returns in microseconds, so those attempts stay at the base interval — there is nothing to spare
-    the machine from.
-    """
-    interval = CAMERA_RETRY_INTERVAL_S
-    first    = True
-    while not stop_evt.is_set():
-        mode   = _effective_camera_mode(args)
-        locked = bool(args.no_camera)
-        _cam_set_state(mode=mode, locked=locked)
-
-        if mode == "off":
-            if _cam_live:
-                _release_camera("camera off (settings)" if not locked
-                                else "locked off by --no-camera")
-            elif locked:
-                _cam_set_state(reason="locked off by --no-camera", next_probe_at=0.0)
-            else:
-                _cam_set_state(reason="camera off (settings)", next_probe_at=0.0)
-            interval = CAMERA_RETRY_INTERVAL_S
-        elif _cam_live:
-            # Parked on a live camera — but verify it is still DELIVERING. A camera unplugged mid-run
-            # (or a wedged CSI pipeline) just returns no frames forever, which is indistinguishable
-            # from a healthy idle camera unless we time it. Without this the dashboard goes on
-            # reporting cam_source="csi" at 0 fps, claiming a feed that no longer exists.
-            last = _cam_thread.last_frame_t if _cam_thread is not None else 0.0
-            if (_cam_thread is not None and _cam_thread.showing_live and last
-                    and (time.monotonic() - last) > CAMERA_STALL_S):
-                _release_camera(f"camera stopped delivering frames "
-                                f"({CAMERA_STALL_S:g}s with none) — looking for it again")
-                interval = CAMERA_RETRY_INTERVAL_S
-        else:
-            # A shorter Argus budget on retries than at startup: a node that just appeared is warm,
-            # and we would rather come back around than block this thread for 10s.
-            budget = CSI_FIRST_FRAME_S if first else CSI_FIRST_FRAME_RETRY_S
-            cheap  = not device_signature()
-            cam, reason = try_open_camera(args.camera, args.network, args.network_port,
-                                          csi_first_frame_s=budget,
-                                          force=_cam_probe_now.is_set())
-            first = False
-            if cam is not None:
-                _acquire_camera(cam)
-                interval = CAMERA_RETRY_INTERVAL_S
-            else:
-                _cam_report_failure(reason)
-                interval = (CAMERA_RETRY_INTERVAL_S if cheap
-                            else min(interval * 2, CAMERA_RETRY_MAX_S))
-
-        _cam_probe_now.clear()
-        _cam_set_state(next_probe_at=time.monotonic() + interval)
-        # Wake early for shutdown or for an explicit "Probe now".
-        deadline = time.monotonic() + interval
-        while not stop_evt.is_set() and not _cam_probe_now.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            stop_evt.wait(min(0.25, remaining))
-
-
-def _acquire_camera(cam) -> None:
-    global _cam_live, _cam_last_reason
-    _cam_live = True
-    _cam_last_reason = None
-    _cam_set_state(reason="")
-    if _cam_thread is not None:
-        # Start the staleness clock now, so a camera that takes a moment to produce its first frame
-        # is not immediately judged dead by the stall check.
-        _cam_thread.note_frame_time(time.monotonic())
-    _replace_cam_swap(("live_source", cam))
-    presence.reset()     # a hot-swap means the old presence history describes a different camera
-    print(f"[camera] live camera acquired: {cam.source_name}", flush=True)
-
-
-def _release_camera(reason: str) -> None:
-    global _cam_live, _cam_last_reason
-    _cam_live = False
-    _cam_last_reason = reason
-    _cam_set_state(reason=reason, next_probe_at=0.0)
-    _replace_cam_swap(("live_source", NullCamera(reason)))
-    presence.reset()
-    print(f"[camera] released the camera — {reason}", flush=True)
-
-
-def _cam_report_failure(reason: str) -> None:
-    """Record why there is no camera, logging only when the reason CHANGES — this runs on a timer for
-    the life of the process, and a fixed hardware fault would otherwise fill the log."""
-    global _cam_last_reason
-    _cam_set_state(reason=reason)
-    if reason != _cam_last_reason:
-        print(f"[camera] no camera — {reason}", flush=True)
-        _cam_last_reason = reason
-
-
-def _replace_cam_swap(item: tuple) -> None:
-    try:
-        _cam_swap.put_nowait(item)
-    except queue.Full:
-        try:
-            _cam_swap.get_nowait()
-        except queue.Empty:
-            pass
-        _cam_swap.put_nowait(item)
 
 
 # ── Run helpers ───────────────────────────────────────────────────────────────
@@ -618,170 +173,6 @@ def _speaking_jaw(openness: float) -> int:
     return int(round(JAW_CLOSED + (JAW_OPEN - JAW_CLOSED) * openness))
 
 
-# ── "Thinking" pan sweep ──────────────────────────────────────────────────────
-# The two statuses that mean "Kai has stopped listening and is working out a reply". Read off the
-# assistant, not the session's projected voice_status: the projection exists for the dashboard and
-# reports "recording" while a session listens, which is not the window we want.
-_THINKING_STATUSES = (STATUS_TRANSCRIBING, STATUS_THINKING)
-
-
-class SweepShape(NamedTuple):
-    """One thinking window's randomly drawn sweep. Immutable and drawn once per window, so the motion
-    within a window is smooth and deterministic while no two windows look alike."""
-    main_amp:      float   # degrees
-    main_period:   float   # seconds
-    wander_amp:    float   # degrees
-    wander_period: float   # seconds
-    direction:     float   # +1 or -1: which way the head goes first
-
-
-def _draw_sweep(rng: random.Random) -> SweepShape:
-    """Draw the shape for one thinking window.
-
-    Amplitude and period are jittered and the starting direction is a coin flip, so the gesture is not
-    the same arc every turn. main_amp + wander_amp == amp by construction, which is what keeps
-    THINKING_SWEEP_DEG a hard bound on the sum rather than on each component separately."""
-    amp    = THINKING_SWEEP_DEG * rng.uniform(*THINKING_SWEEP_AMP_JITTER)
-    period = THINKING_SWEEP_PERIOD_S * rng.uniform(*THINKING_SWEEP_PERIOD_JITTER)
-    return SweepShape(
-        main_amp      = amp * (1.0 - THINKING_SWEEP_WANDER_FRAC),
-        main_period   = period,
-        wander_amp    = amp * THINKING_SWEEP_WANDER_FRAC,
-        wander_period = period * THINKING_SWEEP_WANDER_RATIO,
-        direction     = rng.choice((-1.0, 1.0)),
-    )
-
-
-def _thinking_offset(elapsed: float, shape: SweepShape) -> float:
-    """Pan offset in degrees for a head that is thinking, `elapsed` seconds in. 0 before the dead time.
-
-    Two sines at incommensurate periods, so the path never repeats even on a long think. Pure — the
-    randomness is all in `shape`, drawn by the caller — so the maths stays testable with no hardware
-    and no seeding. Both components start at sin(0) = 0, so the sweep grows out of wherever the head
-    already was instead of stepping to one side of it."""
-    if elapsed < THINKING_SWEEP_START_S:
-        return 0.0
-    t = elapsed - THINKING_SWEEP_START_S
-    main   = shape.main_amp   * math.sin(2.0 * math.pi * t / shape.main_period)
-    wander = shape.wander_amp * math.sin(2.0 * math.pi * t / shape.wander_period)
-    return shape.direction * (main + wander)
-
-
-def _ease_toward(current: float, target: float, max_step: float) -> float:
-    """Move `current` toward `target` by at most `max_step`. Also pure.
-
-    This is what stops the head jerking back to the tracked angle when a reply lands mid-swing: the
-    offset walks home at THINKING_SWEEP_RETURN_DPS instead of vanishing in one tick."""
-    delta = target - current
-    if abs(delta) <= max_step:
-        return target
-    return current + (max_step if delta > 0 else -max_step)
-
-
-def _control_loop(servo, target: TrackingTarget, stop_evt: threading.Event) -> None:
-    """Dedicated servo control thread — decoupled from MediaPipe inference.
-
-    Runs at a fixed CONTROL_FPS and drives the pan PD controller toward the LATEST target set
-    by the inference thread, so the head glides smoothly *between* inference ticks instead of
-    stepping only on them. Each command stays bounded by PAN_MAX_STEP, so the per-command
-    current draw is unchanged (only the cadence is fixed and inference-independent — see the
-    brownout note in config/servo.py). Owns pan_pd + last_pan_cmd (moved out of the main loop).
-
-    On no-face / stale target it HOLDS: sends nothing (so the firmware idle-detach still relaxes
-    the servos) and keeps the PD synced to the held position so re-acquire doesn't jump.
-
-    While the assistant is thinking it adds a slow ±THINKING_SWEEP_DEG pan offset on top of whatever
-    it would otherwise be doing (config/thinking.py). The offset RIDES ON the tracked or held angle
-    rather than replacing it, so the person stays framed; last_pan_cmd and the PD stay anchored to the
-    un-swept position, so re-acquire still glides from where the head really was."""
-    pan_pd       = PDAxis(start=90, kp=PAN_KP, kd=PAN_KD)
-    last_pan_cmd = 90.0
-    next_tick    = time.monotonic()
-    ticks        = 0
-    last_rate_t  = next_tick
-    logged_face  = None      # face_present as of the last [control] line; None = nothing logged yet
-    sweep_off      = 0.0     # live thinking offset in degrees; eased, never snapped
-    thinking_since = None    # monotonic time thinking began; None means "not thinking"
-    sweep_settled  = True    # has the head been returned to the anchor since the last sweep?
-    sweep_shape    = None    # this window's randomly drawn arc; redrawn on each entry into thinking
-    sweep_rng      = random.Random()
-    sweep_max_step = THINKING_SWEEP_RETURN_DPS * CONTROL_INTERVAL
-    while not stop_evt.is_set():
-        pan_t, tilt_t, face_present, updated_at = target.snapshot()
-        now   = time.monotonic()
-        stale = (now - updated_at) > CONTROL_STALE_TIMEOUT
-
-        # Thinking is tracked LOCALLY off the assistant's own status: one dict copy under an
-        # uncontended lock at CONTROL_FPS, and no new shared mutable or lock to reason about. (The
-        # heavier _session.get_status() is deliberately not used here.)
-        if _voice.get_status()["voice_status"] in _THINKING_STATUSES:
-            if thinking_since is None:
-                thinking_since = now
-                # Draw the arc ONCE, here, on entry. Drawing per tick would resample the amplitude and
-                # period every 67 ms and turn a smooth sweep into noise.
-                sweep_shape = _draw_sweep(sweep_rng)
-        else:
-            thinking_since = None
-        # Gated on BOTH toggles: "Follow faces" off has to mean the head does not move at all, sweep
-        # included. Don't drop the servo_tracking half in a refactor.
-        want_off = 0.0
-        if (thinking_since is not None
-                and settings.get("thinking_sweep") and settings.get("servo_tracking")):
-            want_off = _thinking_offset(now - thinking_since, sweep_shape)
-        sweep_off = _ease_toward(sweep_off, want_off, sweep_max_step)
-
-        # "Follow faces" off routes into the existing HOLD branch rather than a new code path: nothing
-        # is sent, so the firmware's idle-detach relaxes the servos, and the PD stays synced so
-        # switching it back on glides instead of snapping.
-        if not face_present or stale or not settings.get("servo_tracking"):
-            pan_pd.reset(last_pan_cmd)     # hold: resync PD so re-acquire glides, no jump
-            # A held head still sweeps while thinking — the offset is what moves, around the held
-            # position. Once it has eased back to 0 we go quiet again, so idle-detach still fires.
-            anchor = int(round(last_pan_cmd))
-            if round(sweep_off) != 0:
-                servo.send(int(round(anchor + sweep_off)), servo.last_tilt)
-                sweep_settled = False
-            elif not sweep_settled:
-                # One explicit command AT the anchor before going quiet. Necessary because send() is
-                # gated to 10 Hz while this loop runs at 15: the easing's last steps toward 0 can be
-                # dropped, and simply falling silent then leaves the head parked a few degrees off the
-                # anchor — physically out of sync with last_pan_cmd, which is the desync that costs a
-                # jump on the next re-acquire. Retried until send() reports it landed.
-                if abs(anchor - servo.last_pan) <= PAN_DEADBAND or servo.send(anchor, servo.last_tilt):
-                    sweep_settled = True
-        else:
-            pan_out = pan_pd.update(pan_t)
-            if abs(pan_out - last_pan_cmd) > PAN_MAX_STEP:   # bound per-command travel (current safety)
-                pan_out = last_pan_cmd + (PAN_MAX_STEP if pan_out > last_pan_cmd else -PAN_MAX_STEP)
-                pan_pd.reset(pan_out)
-            last_pan_cmd = pan_out
-            # servo.send() clamps to SERVO_MIN/MAX, so the offset can never drive into a stop.
-            servo.send(int(round(pan_out + sweep_off)), int(round(tilt_t)))
-            # Tracking sends every tick, so it needs no anchor-return of its own — it just has to leave
-            # the flag honest for whenever this drops into the hold branch.
-            sweep_settled = round(sweep_off) == 0
-
-        # Lightweight observability: effective control rate (shows decoupling working). Edge-
-        # triggered on face presence, plus a slow heartbeat — see CONTROL_LOG_INTERVAL_S for why.
-        # Reuses `now` from the top of the tick — a send takes well under the window's precision.
-        ticks += 1
-        elapsed = now - last_rate_t
-        if face_present != logged_face or elapsed >= CONTROL_LOG_INTERVAL_S:
-            # flush=True: stdout is block-buffered to the log file, so force this out for tuning
-            rate = ticks / elapsed if elapsed > 0 else 0.0
-            print(f"[control] {rate:.1f} Hz  face={face_present}", flush=True)
-            ticks = 0
-            last_rate_t = now
-            logged_face = face_present
-
-        next_tick += CONTROL_INTERVAL
-        delay = next_tick - time.monotonic()
-        if delay > 0:
-            stop_evt.wait(delay)           # sleep but wake immediately on shutdown
-        else:
-            next_tick = time.monotonic()   # fell behind — resync, don't spiral
-
-
 def _annotate_frame(frame, lm, pan: int, tilt: int, jaw: int | None,
                     args: argparse.Namespace) -> None:
     h, w = frame.shape[:2]
@@ -824,30 +215,21 @@ def _make_face_data(fp: FaceParams | None, gesture: str | None, frame_t: float) 
 
 
 def _publish_web(frame, fp: FaceParams | None, gesture: str | None,
-                 servo: ServoSerial, frame_t: float, last_web_t: float) -> float:
+                 frame_t: float, last_web_t: float) -> float:
     """Store the latest raw frame + face params if WEB_PUBLISH_INTERVAL has elapsed. JPEG encoding
     happens lazily in the /video generator (only while a client is connected), not here.
 
     Frame-dependent state only — pan/tilt/jaw and cam_source moved to _publish_status, which runs
     even when there are no frames at all."""
-    global _web_raw_frame, _web_frame_id, _web_params, _web_frame_t
     now = time.monotonic()
-    if not _FLASK_OK or now - last_web_t < WEB_PUBLISH_INTERVAL:
+    if _flask_app is None or now - last_web_t < WEB_PUBLISH_INTERVAL:
         return last_web_t
     face_data = _make_face_data(fp, gesture, frame_t)
     # Effective feed rate = inter-publish interval (steady ~25 fps while streaming),
     # which is meaningful even though inference is decimated below the camera rate.
     fps_val   = int(1.0 / (now - last_web_t)) if last_web_t else 0
-    params    = {**face_data, "fps": fps_val}
-    with _web_lock:
-        _web_raw_frame = frame
-        _web_frame_id += 1
-        _web_params  = params
-        _web_frame_t = now
+    _web.publish_frame(frame, {**face_data, "fps": fps_val}, now)
     return now
-
-
-FRAME_STALE_S = 1.0   # after this long with no frame, stop reporting the last frame's face data
 
 
 def _publish_status(cam_thread, servo, last_status_t: float) -> float:
@@ -860,12 +242,11 @@ def _publish_status(cam_thread, servo, last_status_t: float) -> float:
     Gated at the same 25 Hz as _publish_web, so the ~200 Hz no-frame loop does not rebuild this dict
     on every pass.
     """
-    global _web_status, _web_params
     now = time.monotonic()
-    if not _FLASK_OK or now - last_status_t < WEB_PUBLISH_INTERVAL:
+    if _flask_app is None or now - last_status_t < WEB_PUBLISH_INTERVAL:
         return last_status_t
 
-    cam    = _cam_snapshot()
+    cam    = _camera.snapshot()
     source = cam_thread.source_name
     status = {
         "pan": servo.last_pan, "tilt": servo.last_tilt, "jaw": servo.last_jaw,
@@ -880,32 +261,10 @@ def _publish_status(cam_thread, servo, last_status_t: float) -> float:
     }
     status.update({f"set_{name}": value for name, value in settings.snapshot().items()})
 
-    # Built outside the lock (settings and cam have their own); the lock is shared with the /video
-    # generator, so hold it for the assignment only.
-    with _web_lock:
-        _web_status = status
-        # Frames have stopped: drop the stale face data rather than let the dashboard keep showing
-        # the last face and fps it saw. The frontend's `?? 0` fallbacks then read as "no face, 0 fps".
-        if _web_params and (not _web_frame_t or now - _web_frame_t > FRAME_STALE_S):
-            _web_params = {}
+    # Built outside the state's lock (settings and the supervisor have their own); publish_status
+    # holds it for the assignment only, and it also expires the face data once frames stop.
+    _web.publish_status(status, now)
     return now
-
-
-def _params_snapshot() -> dict:
-    """One full state snapshot for /params. Extracted from the SSE generator so it can be tested —
-    the generator itself never terminates."""
-    with _web_lock:
-        data = dict(_web_status)
-        data.update(_web_params)
-    data.update(_voice.get_status())
-    # Additive sess_* keys, plus the projected voice_status/voice_speaking for hands-free states.
-    # Unknown keys are ignored by the frontend.
-    data.update(_session.get_status())
-    # Whether the reboot control is configured at all. Published so the dashboard can leave the
-    # button out entirely rather than show one that always answers 403 — an operator reaching for
-    # a recovery control should not have to learn it was never switched on.
-    data["reboot_enabled"] = REBOOT_ENABLED
-    return data
 
 
 def _register_settings_callbacks() -> None:
@@ -943,16 +302,16 @@ def run(args: argparse.Namespace) -> None:
     settings.load()
     # Before the dashboard can be served, so a --no-camera run never briefly shows the camera control
     # as changeable.
-    _cam_set_state(mode=_effective_camera_mode(args), locked=bool(args.no_camera))
+    _camera.configure(args.camera, args.network, args.network_port, args.no_camera)
 
     servo       = _NullServo() if args.no_servo else _open_servo(args.port)
     camera      = NullCamera("starting up")
-    cam_thread  = CameraThread(camera, _cam_swap).start()   # reads frames off the tracking loop
-    _set_cam_thread(cam_thread)                             # so the supervisor can watch frame health
+    cam_thread  = CameraThread(camera, _camera.swap_queue).start()  # reads frames off the loop
+    _camera.attach_thread(cam_thread)                       # so the supervisor can watch frame health
     print(f"[face_track] flip={args.flip}  tilt={args.tilt}  lofi={args.lofi}  "
           f"ema={EMA_ALPHA}  infer={INFERENCE_FPS}fps")
 
-    if _FLASK_OK:
+    if _flask_app is not None:
         _start_web_server(resolve_mic=not args.wake)
 
     mp_mesh = mp.solutions.face_mesh.FaceMesh(
@@ -972,7 +331,8 @@ def run(args: argparse.Namespace) -> None:
     target         = TrackingTarget()
     stop_evt       = threading.Event()
     control_thread = threading.Thread(
-        target=_control_loop, args=(servo, target, stop_evt), daemon=True, name="servo-control")
+        target=control_loop.run, args=(servo, target, _voice, stop_evt),
+        daemon=True, name="servo-control")
     control_thread.start()
 
     # Hands-free listening. Started here rather than in _start_web_server() so it comes up with
@@ -1024,7 +384,7 @@ def run(args: argparse.Namespace) -> None:
 
     # LAST, and on its own thread: the only camera-dependent step. It probes, hot-swaps a real camera
     # in when one appears, and releases it when camera_mode goes to "off".
-    cam_thread_sup = threading.Thread(target=_camera_supervisor, args=(args, stop_evt),
+    cam_thread_sup = threading.Thread(target=_camera.run, args=(stop_evt,),
                                       daemon=True, name="kai-camera")
     cam_thread_sup.start()
 
@@ -1043,7 +403,7 @@ def run(args: argparse.Namespace) -> None:
             # Drive the speaking jaw every iteration, independent of frames — the mouth must
             # keep animating mid-sentence even if the camera stalls. Uses the fast jaw-only
             # channel (20 Hz), decoupled from the 10 Hz pan/tilt gate.
-            # No longer gated on _FLASK_OK: _voice is constructed at module scope now, and the wake
+            # No longer gated on flask: _voice is constructed at module scope now, and the wake
             # word can drive a reply with no dashboard running at all.
             jaw_on = _jaw_on(args)
             if prev_jaw_on and not jaw_on:
@@ -1086,7 +446,7 @@ def run(args: argparse.Namespace) -> None:
                     will_log = frame_t - last_log_t >= 0.5
                     # solvePnP (yaw/pitch/roll) only feeds logging + the dashboard, so skip it
                     # unless we're about to log or someone is watching the video feed.
-                    fp = compute_face_params(lm, compute_pose=(will_log or _has_video_client()))
+                    fp = compute_face_params(lm, compute_pose=(will_log or _web.has_video_client()))
                     gesture = detector.update(fp, frame_t)
                     if gesture:
                         servo.send_gesture(gesture)
@@ -1149,7 +509,7 @@ def run(args: argparse.Namespace) -> None:
                     cv2.putText(frame, "NO FACE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                     last_fp = None
 
-            last_web_t = _publish_web(frame, last_fp, publish_gesture, servo, frame_t, last_web_t)
+            last_web_t = _publish_web(frame, last_fp, publish_gesture, frame_t, last_web_t)
 
             if show:
                 cv2.imshow("face_track", frame)
@@ -1176,218 +536,6 @@ def run(args: argparse.Namespace) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-_LOCK_PATH = "/tmp/kai_face_track.lock"
-_lock_fd = None   # module-level: the lock lives as long as the process holds this open
-
-# Distinct exit code for "someone else is already running". scripts/autostart.sh treats it as
-# terminal and does NOT restart — a supervisor that retried this would spin forever against the
-# healthy instance it is losing the lock to.
-_EXIT_ALREADY_RUNNING = 3
-
-# Distinct exit code for "the dashboard asked for a restart". scripts/autostart.sh relaunches
-# immediately on this one and does NOT count it as a failure — an operator pressing the button is
-# not a crash, and letting it feed the consecutive-fast-failure backoff would make the second
-# restart in a minute take 10 s, the third 15 s, for no reason.
-_EXIT_RESTART = 7
-
-# Long enough for Flask to have written the response before the process starts tearing itself down,
-# short enough that nobody wonders whether the button worked. The reply is generated synchronously
-# in the route; this only covers the socket write.
-_RESTART_DELAY_S = 0.4
-
-# How long the orderly shutdown gets before _arm_restart_deadline() takes the process down by force.
-# Comfortably above a healthy teardown (measured ~1-2 s: the mic stop joins a 2 s thread, the camera
-# and serial close immediately) and well inside the supervisor's restart window, so a robot that
-# CAN exit cleanly always does. Only a wedged one ever reaches this.
-_RESTART_FORCE_AFTER_S = 12.0
-
-_restart_requested = threading.Event()
-
-
-def _supervised() -> bool:
-    """Is something going to start us again after we exit?
-
-    scripts/autostart.sh exports KAI_SUPERVISED=1 before its supervisor loop. Nothing else does, so
-    a run started by hand (scripts/run.sh, or python3 face_track.py over ssh) reports False and the
-    dashboard warns instead of quietly killing the robot on a click.
-
-    The parent-process fallback is not belt-and-braces, it is the deploy path: a supervisor loop that
-    was already running when this file was updated started from the OLD autostart.sh and therefore
-    exports nothing, so the env var alone would call a perfectly supervised robot unsupervised until
-    somebody rebooted it. Best-effort — no /proc (a Mac, the tests on Windows) just means we fall
-    back to the honest "no".
-    """
-    if os.environ.get("KAI_SUPERVISED", "") not in ("", "0"):
-        return True
-    try:
-        with open(f"/proc/{os.getppid()}/cmdline", "rb") as fh:
-            return b"autostart.sh" in fh.read()
-    except OSError:
-        return False
-
-
-def _schedule_restart() -> None:
-    """Tear ourselves down shortly after the caller's response has gone out.
-
-    Its own function, not an inline Timer, so the route can be exercised in the tests without a
-    live timer that would SIGTERM the test runner four tenths of a second later.
-    """
-    timer = threading.Timer(_RESTART_DELAY_S, _request_restart)
-    timer.daemon = True
-    timer.start()
-
-
-def _request_restart() -> None:
-    """Exit the way SIGTERM already exits, then have main() report _EXIT_RESTART.
-
-    Reuses _install_signal_handlers' path rather than inventing a second shutdown: the mic, the
-    Porcupine native memory, the serial port and the camera all have to be released before the
-    replacement process can open them (see scripts/autostart.sh's wait_for_capture_device), and
-    run()'s `finally` is the only code that does that.
-    """
-    _restart_requested.set()
-    print("[face_track] restart requested from the dashboard", flush=True)
-    try:
-        import signal
-        os.kill(os.getpid(), signal.SIGTERM)
-    except Exception as exc:
-        # Never leave the flag set on a process that is going to keep running — the next orderly
-        # Ctrl-C would then exit 7 and the supervisor would restart a robot somebody just stopped.
-        _restart_requested.clear()
-        print(f"[face_track] ERROR: could not signal ourselves to restart ({exc})", flush=True)
-        return
-    _arm_restart_deadline()
-
-
-def _reboot_now() -> tuple[bool, str]:
-    """Ask the OS to reboot. Returns (ok, detail); never raises.
-
-    Checks first, fires second. `sudo -n` fails immediately when no NOPASSWD rule matches, which
-    turns the most likely misconfiguration into a message the operator can act on instead of a
-    button that reports success and does nothing — the same failure mode that made the wedged
-    restart so misleading. The command is fixed here rather than composed from a setting, so the
-    sudoers rule can name exactly one binary and one argument.
-
-    The reboot itself is scheduled on a short timer for the same reason /restart is: the HTTP
-    response has to be written before the box starts going down, or the dashboard cannot tell
-    "rebooting" from "network died".
-    """
-    # `sudo -l <command>` asks "may I run this?" and answers without running it. Deliberately not a
-    # dry run of the command itself: a sudoers rule scoped to exactly `/usr/bin/systemctl reboot`
-    # does NOT match `/usr/bin/systemctl reboot --help`, so probing with an extra argument would
-    # report a correctly-configured robot as broken.
-    try:
-        probe = subprocess.run(["sudo", "-n", "-l", *REBOOT_COMMAND],
-                               capture_output=True, text=True, timeout=REBOOT_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"could not check sudo permission ({type(exc).__name__}: {exc})"
-    if probe.returncode != 0:
-        return False, ("this user may not run " + " ".join(REBOOT_COMMAND) + " without a password — "
-                       "add a NOPASSWD sudoers line for exactly that command (see REBOOT_ENABLED "
-                       "in config/tracking.py)")
-
-    def _fire() -> None:
-        try:
-            subprocess.run(["sudo", "-n", *REBOOT_COMMAND], capture_output=True, text=True,
-                           timeout=REBOOT_TIMEOUT_S)
-        except Exception as exc:                        # pragma: no cover - the box is going down
-            print(f"[face_track] ERROR: reboot command failed ({exc})", flush=True)
-
-    print("[face_track] REBOOT requested from the dashboard", flush=True)
-    timer = threading.Timer(_RESTART_DELAY_S, _fire)
-    timer.daemon = True
-    timer.start()
-    return True, ""
-
-
-def _arm_restart_deadline() -> None:
-    """Force the exit if the orderly shutdown does not finish in time.
-
-    The graceful path is the right one and stays the default: run()'s `finally` releases the mic,
-    Porcupine's native memory, the serial port and the camera, and the replacement process needs all
-    of them. But it only works if the threads it waits on are willing to stop, and the restart
-    button exists precisely for robots where something is stuck.
-
-    Observed 2026-08-09: face_track wedged inside mic resolution holding the raw I2S device, and a
-    POST /restart replied `{"status":"ok"}` and then did nothing at all — same pid 40 minutes later,
-    no log line past the request. From the dashboard that is indistinguishable from a restart that
-    worked, which is the worst possible outcome for a recovery control: the operator believes the
-    robot has been restarted and moves on. Only `kill -9` over ssh actually cleared it.
-
-    So the graceful attempt gets a deadline, and past it we leave the hard way. os._exit skips
-    atexit handlers and buffered output on purpose — everything worth flushing has already had
-    _RESTART_DELAY_S plus this window to do it, and the supervisor's wait_for_capture_device covers
-    the devices the `finally` did not get to release. Exiting with the same _EXIT_RESTART code means
-    the supervisor treats it as a restart rather than a crash, so the robot still comes back.
-    """
-    def _force() -> None:
-        print(f"[face_track] WARNING: orderly shutdown did not finish within "
-              f"{_RESTART_FORCE_AFTER_S:.0f}s — forcing the exit. Something was wedged; if this "
-              f"repeats, the log above the restart request says what.", flush=True)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(_EXIT_RESTART)
-
-    timer = threading.Timer(_RESTART_FORCE_AFTER_S, _force)
-    timer.daemon = True
-    timer.start()
-
-
-def _claim_single_instance(path: str = _LOCK_PATH) -> bool:
-    """Take an exclusive lock, or return False if another face_track already holds it.
-
-    Two of these fight over hardware that admits exactly one owner — the raw I2S capture device,
-    the CSI camera and the servo serial port — and the symptom is not a clean error but a robot
-    that half-works: tracking fine, deaf, or with the jaw driven from two places. Cron only starts
-    one at boot, but nothing stopped a manual start from landing on top of a running one (observed:
-    a kill that matched the wrong PID, followed by a relaunch, left two processes competing).
-
-    flock is released automatically by the kernel when the process dies, however it dies — which is
-    what makes it safe here, where clean shutdown is not guaranteed. Best-effort: if fcntl is
-    missing (non-Linux, e.g. running the tests on Windows) the guard is skipped rather than fatal."""
-    global _lock_fd
-    try:
-        import fcntl
-    except ImportError:
-        return True
-    try:
-        _lock_fd = open(path, "w")
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return False
-    except OSError as exc:            # unwritable path, full disk — do not refuse to boot over it
-        print(f"[face_track] WARNING: instance lock unavailable ({exc}) — starting anyway",
-              flush=True)
-        return True
-    _lock_fd.write(f"{os.getpid()}\n")
-    _lock_fd.flush()
-    return True
-
-
-def _install_signal_handlers() -> None:
-    """Turn SIGTERM into the same orderly shutdown Ctrl-C already gets.
-
-    Without this, the default SIGTERM disposition kills the interpreter outright and run()'s
-    `finally` never executes — so the mic and Porcupine's native memory, the serial port and the
-    camera are all left to the OS. Measured before this existed: 5 process starts in one log and
-    not a single "[face_track] Stopped.", which is also why scripts/autostart.sh needs to wait for
-    the capture device to be released before the next start can open it.
-
-    Raising KeyboardInterrupt rather than setting a flag reuses the shutdown path that is already
-    there and already tested, and it interrupts the main loop wherever it happens to be."""
-    import signal
-
-    def _on_term(signum, _frame):
-        print(f"[face_track] received signal {signum} — shutting down", flush=True)
-        raise KeyboardInterrupt
-
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        try:
-            signal.signal(sig, _on_term)
-        except (ValueError, OSError, AttributeError):
-            pass          # not the main thread, or the platform lacks it — not worth failing over
-
-
 def main() -> None:
     from vision.camera import NETWORK_PORT
     parser = argparse.ArgumentParser(description="Face tracking servo — Jetson Orin Nano")
@@ -1411,16 +559,16 @@ def main() -> None:
     parser.add_argument("--no-hands-free", action="store_true",
                                           help="With --wake: use the shared always-open stream but "
                                                "keep push-to-talk as the only way in")
-    if not _claim_single_instance():
-        print(f"[face_track] another instance already holds {_LOCK_PATH} — refusing to start "
-              "(stop the running one first: pkill -f face_track.py)", flush=True)
-        raise SystemExit(_EXIT_ALREADY_RUNNING)
-    _install_signal_handlers()
+    if not lifecycle.claim_single_instance():
+        print(f"[face_track] another instance already holds {lifecycle.LOCK_PATH} — refusing to "
+              "start (stop the running one first: pkill -f face_track.py)", flush=True)
+        raise SystemExit(lifecycle.EXIT_ALREADY_RUNNING)
+    lifecycle.install_signal_handlers()
     run(parser.parse_args())
     # After run()'s `finally` — everything is released, so the replacement can have the hardware.
-    if _restart_requested.is_set():
-        print(f"[face_track] exiting {_EXIT_RESTART} for a supervised restart", flush=True)
-        raise SystemExit(_EXIT_RESTART)
+    if lifecycle.restart_requested.is_set():
+        print(f"[face_track] exiting {lifecycle.EXIT_RESTART} for a supervised restart", flush=True)
+        raise SystemExit(lifecycle.EXIT_RESTART)
 
 
 if __name__ == "__main__":

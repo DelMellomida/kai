@@ -19,151 +19,50 @@ request that was already in flight when it was cleared.
 from __future__ import annotations
 
 import math
-import numbers
-import re
-import subprocess
 import threading
 import time
-import unicodedata
-from collections import namedtuple
 from pathlib import Path
 
 import numpy as np
-import requests
 import sounddevice as sd
 from scipy.signal import resample_poly
 
 from ai import rag
 from ai import tts
 from ai.audio import normalize_for_asr
+# Device plumbing lives in ai/mic_device.py — this class is one of its two consumers, not its owner.
+# Re-exported (rather than reached through the module) because ensure_input_resolved() and
+# start_recording() call these by bare name, which is what lets a test patch them here.
+from ai.mic_device import (
+    MicChoice, apply_i2s_route, free_i2s_device, resolve_input_device, resume_pulse_source,
+)
+# Three layers this class uses but does not own. Re-exported for the same reason as mic_device's
+# entry points: _call_ollama, ensure_llm_warm, _speak and _transcribe call them by bare name, so
+# they resolve through this module's globals — which is what a test patches.
+from ai.llm import (
+    _log_llm_timings, _ollama_request, build_chat_messages, load_persona, log_model_placement,
+)
+from ai.speak_envelope import _speak_segments, _speak_segments_for_duration, speaking_openness_at
+from ai.transcript import _best_allowed_language, transcript_rejection
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 # All tunable knobs (audio, Whisper, Ollama, history, jaw-speaking envelope) live in
 # config/voice.py; re-imported so the names stay module-level for internal use and so
 # existing `from ai.voice_assistant import ...` callers keep working.
 from config.voice import (
-    SAMPLE_RATE, CHANNELS, LIVE_PROBE_DURATION_S, LIVE_PROBE_RMS_THRESHOLD,
-    LIVE_PROBE_TIMEOUT_S, I2S_PROBE_SILENT_RETRIES, I2S_PROBE_RETRY_DELAY_S,
-    FALLBACK_CAPTURE_RATES,
-    I2S_MIC_NAME_HINTS, USB_MIC_NAME_HINTS, I2S_CAPTURE_CHANNELS, I2S_TAKE_CHANNEL,
-    I2S_CAPTURE_RATE, I2S_SUSPEND_PULSE, I2S_PULSE_SOURCE, PULSE_SUSPEND_ALL_SOURCES,
-    I2S_APPLY_ROUTE_ON_STARTUP, I2S_ROUTE_CARD, I2S_ROUTE_CONTROLS,
+    SAMPLE_RATE, CHANNELS,
     WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE, WHISPER_LANGUAGE, WHISPER_LANGUAGES,
     WHISPER_CPU_THREADS, WHISPER_BEAM_SIZE, WHISPER_INITIAL_PROMPT,
     ASR_NORMALIZE, ASR_NORMALIZE_MAX_GAIN, ASR_NORMALIZE_SCAN,
-    TRANSCRIPT_SCRIPT_GUARD, TRANSCRIPT_MIN_LATIN_RATIO, TRANSCRIPT_MIN_AVG_LOGPROB,
-    TRANSCRIPT_MAX_NO_SPEECH_PROB,
-    OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_S, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU,
-    OLLAMA_NUM_PREDICT, OLLAMA_PS_TIMEOUT_S, OLLAMA_LOG_TIMINGS, RAG_CONTEXT_PLACEMENT,
-    MAX_HISTORY_TURNS,
-    SPEAK_SEC_PER_WORD, SPEAK_MIN_SENTENCE_S, SPEAK_MAX_S, SPEAK_GAP_S,
-    SPEAK_AMP, SPEAK_OPEN_S, SPEAK_CLOSE_S,
+    RAG_CONTEXT_PLACEMENT, MAX_HISTORY_TURNS,
 )
 from config.wake import (
-    CAPTURE_HARD_CAP_S, MIXER_TIMEOUT_S, TTS_MAX_SPOKEN_CHARS, TTS_TAIL_MUTE_S,
+    CAPTURE_HARD_CAP_S, TTS_MAX_SPOKEN_CHARS, TTS_TAIL_MUTE_S,
     WAKE_WHISPER_SCAN_LANGUAGE, WAKE_WHISPER_SCAN_MODEL,
 )
 
-# resolve_input_device() uses this to parse ALSA card ids so it can dedupe the many subdevice
-# entries one card exposes. Card ids can be numeric ("hw:1,0") or named ("hw:APE,0"), so match
-# everything up to the subdevice comma / closing paren (structural, not a tunable).
-_HW_CARD_RE = re.compile(r"hw:([^,\)]+)")
-
-# The resolved mic: which device index/rate to open, how many channels to capture, which channel
-# holds the real audio (the INMP441 puts it only in the left slot), the sample dtype, and whether
-# it's the raw I2S device (which needs pulseaudio suspended before each open).
-MicChoice = namedtuple("MicChoice", "device rate channels take_channel dtype is_i2s")
-MicChoice.__new__.__defaults__ = (False,)   # is_i2s defaults False (keeps non-i2s call sites terse)
-
-# Fallback only — the real, editable persona lives in persona.txt (see load_persona()) so it
-# can be tuned without touching code or restarting the service.
-_DEFAULT_PERSONA = (
-    "You are Kai, a small friendly companion robot built by Devcon Philippines. "
-    "You have a camera for eyes and a servo neck that lets you look toward whoever "
-    "is talking to you. Speak warmly and simply, like a curious, upbeat companion — "
-    "not like a generic assistant. Keep replies short: 1-3 sentences, plain "
-    "conversational text, no markdown, no lists, no code blocks."
-)
-PERSONA_PATH = Path(__file__).parent / "persona.txt"
 
 NO_SPEECH_RESPONSE = "(didn't catch that — try again)"
-
-
-def _best_allowed_language(info, allowed: tuple[str, ...]) -> str:
-    """Pick the most probable of `allowed` from a TranscriptionInfo's language scores.
-
-    `all_language_probs` is produced for free by any transcribe(language=None) call, so restricting
-    the language set costs nothing until it is actually needed. Falls back to the first allowed entry
-    when the field is missing (older faster-whisper) rather than guessing."""
-    probs = getattr(info, "all_language_probs", None) or ()
-    scores = {lang: p for lang, p in probs if lang in allowed}
-    if not scores:
-        return allowed[0]
-    return max(scores, key=scores.get)
-
-
-def latin_letter_ratio(text: str) -> float:
-    """Fraction of `text`'s ALPHABETIC characters that are Latin. 1.0 when there are no letters.
-
-    Only letters are counted: punctuation, digits, spaces and emoji are ignored, so they can neither
-    trip the check nor dilute a genuinely non-Latin transcript into passing it.
-    """
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
-        return 1.0
-    latin = sum(1 for c in letters if "LATIN" in unicodedata.name(c, ""))
-    return latin / len(letters)
-
-
-def _segment_floats(segments, attr: str) -> list[float]:
-    """Collect a per-segment numeric field, skipping anything that isn't a real finite number.
-
-    Strict on purpose. A faster-whisper version that renames or omits one of these fields must
-    degrade to "this gate is off", exactly as _best_allowed_language degrades when
-    all_language_probs is missing — never to a TypeError that fails every turn. bool is excluded
-    because it is a Real and would silently read as 0/1.
-    """
-    out: list[float] = []
-    for seg in segments:
-        value = getattr(seg, attr, None)
-        if isinstance(value, numbers.Real) and not isinstance(value, bool):
-            as_float = float(value)
-            if math.isfinite(as_float):
-                out.append(as_float)
-    return out
-
-
-def transcript_rejection(text: str, segments) -> str:
-    """Why this transcript should be thrown away, or "" to keep it.
-
-    Exists because WHISPER_LANGUAGES only constrains the detected-language LABEL. A clip labelled
-    "en" is never re-transcribed, so a decode that emitted '嘿哀' — or invented a sentence out of fan
-    noise — reached the LLM unchallenged and got answered as though someone had asked it. Checking the
-    label is not the same as checking the output.
-
-    Returns a human-readable reason so the log says which gate fired and with what number; a silent
-    rejection would be indistinguishable from the mic being broken.
-    """
-    if not text:
-        return ""                     # empty is already handled upstream, and is not a rejection
-    if TRANSCRIPT_SCRIPT_GUARD:
-        ratio = latin_letter_ratio(text)
-        if ratio < TRANSCRIPT_MIN_LATIN_RATIO:
-            return (f"only {ratio:.0%} of letters are Latin "
-                    f"(< {TRANSCRIPT_MIN_LATIN_RATIO:.0%}) — not English or Tagalog")
-    # Both of these come per-segment; the worst segment is what matters, since one confidently-wrong
-    # stretch is enough to turn a transcript into a different question than the one that was asked.
-    if TRANSCRIPT_MIN_AVG_LOGPROB is not None:
-        logprobs = _segment_floats(segments, "avg_logprob")
-        if logprobs and min(logprobs) < TRANSCRIPT_MIN_AVG_LOGPROB:
-            return (f"decode confidence {min(logprobs):.2f} "
-                    f"(< {TRANSCRIPT_MIN_AVG_LOGPROB}) — unintelligible")
-    if TRANSCRIPT_MAX_NO_SPEECH_PROB is not None:
-        nsp = _segment_floats(segments, "no_speech_prob")
-        if nsp and max(nsp) > TRANSCRIPT_MAX_NO_SPEECH_PROB:
-            return (f"no_speech_prob {max(nsp):.2f} "
-                    f"(> {TRANSCRIPT_MAX_NO_SPEECH_PROB}) — words decoded out of silence")
-    return ""
 
 STATUS_IDLE         = "idle"
 STATUS_RECORDING    = "recording"
@@ -180,511 +79,6 @@ STATUS_ERROR        = "error"
 # sentences. face_track.py reads speaking_openness() each frame and maps the 0..1
 # result onto the jaw servo (overriding the human-mouth mirror during a reply).
 # The SPEAK_* envelope values are imported from config/voice.py (see the import block above).
-
-_SENTENCE_RE = re.compile(r"[^.!?]+[.!?]*")
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split a reply into sentences on . ! ? — falls back to the whole text as one."""
-    parts = [m.group().strip() for m in _SENTENCE_RE.finditer(text)]
-    parts = [p for p in parts if p]
-    if parts:
-        return parts
-    stripped = text.strip()
-    return [stripped] if stripped else []
-
-
-def _speak_segments(text: str, now: float) -> tuple[float, tuple[tuple[float, float], ...]]:
-    """Build the per-sentence open/close schedule. Returns (start, segments) where each
-    segment is (rel_start, rel_end) seconds from start — one per sentence, separated by
-    SPEAK_GAP_S closed pauses, and truncated so the whole reply never exceeds SPEAK_MAX_S."""
-    sentences = _split_sentences(text) or ["…"]
-    segs: list[tuple[float, float]] = []
-    t = 0.0
-    for s in sentences:
-        if t >= SPEAK_MAX_S:
-            break
-        words = max(1, len(s.split()))
-        dur   = max(SPEAK_MIN_SENTENCE_S, words * SPEAK_SEC_PER_WORD)
-        end   = min(t + dur, SPEAK_MAX_S)
-        segs.append((t, end))
-        t = end + SPEAK_GAP_S
-    return now, tuple(segs)
-
-
-def _speak_segments_for_duration(text: str, now: float, duration: float
-                                 ) -> tuple[float, tuple[tuple[float, float], ...]]:
-    """Like _speak_segments, but the per-sentence open/close schedule is stretched to fill exactly
-    `duration` — the real synthesized-audio length — so the jaw stops the instant the sound does.
-    Each sentence's span is apportioned by its word count; SPEAK_GAP_S closed pauses sit between
-    sentences (dropped if they alone would exceed the audio). Returns an empty window for a
-    non-positive duration (caller then falls back to the text-timed pantomime)."""
-    if duration <= 0:
-        return now, ()
-    sentences = _split_sentences(text) or ["…"]
-    n = len(sentences)
-    gap = SPEAK_GAP_S if SPEAK_GAP_S * (n - 1) < duration else 0.0
-    speak_total = duration - gap * (n - 1)
-    words = [max(1, len(s.split())) for s in sentences]
-    total_words = sum(words)
-    segs: list[tuple[float, float]] = []
-    t = 0.0
-    for i, w in enumerate(words):
-        dur = speak_total * (w / total_words)
-        segs.append((t, t + dur))
-        t += dur + (gap if i < n - 1 else 0.0)
-    return now, tuple(segs)
-
-
-def speaking_openness_at(now: float, start: float | None,
-                         segments: tuple[tuple[float, float], ...]) -> float | None:
-    """Jaw openness in [0, SPEAK_AMP] at time `now`, or None when the reply is finished /
-    not started. Within a sentence the mouth ramps open, holds, then ramps closed
-    (a trapezoid); between sentences it returns 0.0 (closed but still 'speaking')."""
-    if start is None or not segments:
-        return None
-    t = now - start
-    if t < 0 or t >= segments[-1][1]:
-        return None
-    for s0, s1 in segments:
-        if s0 <= t < s1:
-            dur     = s1 - s0
-            open_t  = min(SPEAK_OPEN_S, dur / 2.0)
-            close_t = min(SPEAK_CLOSE_S, dur / 2.0)
-            local   = t - s0
-            if open_t > 0 and local < open_t:
-                env = local / open_t
-            elif close_t > 0 and local > dur - close_t:
-                env = (dur - local) / close_t
-            else:
-                env = 1.0
-            return SPEAK_AMP * max(0.0, min(1.0, env))
-    return 0.0  # in a between-sentence pause — mouth closed, still mid-reply
-
-
-def load_persona() -> str:
-    """Read persona.txt fresh on every call — cheap relative to STT+LLM latency, and gives
-    free 'edits apply on the next turn' behavior with no file-watcher or caching needed.
-    Falls back to _DEFAULT_PERSONA on any read failure or empty content — must never hard-fail."""
-    try:
-        content = PERSONA_PATH.read_text().strip()
-    except OSError as exc:
-        print(f"[voice_assistant] WARNING: could not read {PERSONA_PATH} ({exc}) — using default persona")
-        return _DEFAULT_PERSONA
-    if not content:
-        print(f"[voice_assistant] WARNING: {PERSONA_PATH} is empty — using default persona")
-        return _DEFAULT_PERSONA
-    return content
-
-
-def build_chat_messages(system_prompt: str, history: list[dict], user_text: str) -> list[dict]:
-    """Pure helper: system prompt + capped rolling history + new user turn."""
-    capped = history[-(MAX_HISTORY_TURNS * 2):]
-    return [{"role": "system", "content": system_prompt}, *capped, {"role": "user", "content": user_text}]
-
-
-# Ollama reports its own per-request timings, in nanoseconds, on every non-streamed response.
-# They were being discarded, which is what made "Kai feels slow" unactionable: these three numbers
-# are the only thing that tells the causes apart, and each has a different fix.
-#   prompt_eval_*  — how long the PROMPT took to evaluate. Large means the KV cache prefix is being
-#                    invalidated every turn (see the context placement note in _call_ollama).
-#   eval_*         — token generation. A tok/s well under the GPU figure means the model got placed
-#                    on CPU (see ensure_llm_warm / log_model_placement).
-#   load_duration  — non-zero means the model was evicted and reloaded, which is ~48 s on this box.
-_NS_PER_MS = 1_000_000
-
-
-def _tok_per_s(count, duration_ns) -> float:
-    """Tokens per second from Ollama's (count, nanoseconds) pair. 0.0 when either is missing or
-    zero — this only ever feeds a log line, so it must not raise on a partial response."""
-    try:
-        return (count / (duration_ns / 1e9)) if count and duration_ns else 0.0
-    except (TypeError, ZeroDivisionError):
-        return 0.0
-
-
-def _log_llm_timings(data: dict, label: str = "turn") -> dict:
-    """Log Ollama's own timings for one response and return them as milliseconds.
-
-    Best-effort and never raises: a mocked or partial response (no timing fields at all) logs
-    nothing and returns zeros, so this can sit on the hot path without being able to cost a reply."""
-    if not isinstance(data, dict):
-        return {}
-    prompt_n  = data.get("prompt_eval_count") or 0
-    prompt_ns = data.get("prompt_eval_duration") or 0
-    gen_n     = data.get("eval_count") or 0
-    gen_ns    = data.get("eval_duration") or 0
-    load_ns   = data.get("load_duration") or 0
-    out = {
-        "llm_prompt_ms": int(prompt_ns // _NS_PER_MS),
-        "llm_gen_ms":    int(gen_ns // _NS_PER_MS),
-        "llm_load_ms":   int(load_ns // _NS_PER_MS),
-        "llm_prompt_tokens": int(prompt_n),
-        "llm_gen_tokens":    int(gen_n),
-        "llm_tok_s":         round(_tok_per_s(gen_n, gen_ns), 1),
-    }
-    if not (prompt_ns or gen_ns):
-        return out          # nothing measured (e.g. a stubbed response) — don't print an empty line
-    # The load line is separate and only printed when it fires: a reload is a different event from a
-    # slow turn, and burying it in the common case is how it stayed invisible.
-    if out["llm_load_ms"]:
-        print(f"[llm] MODEL RELOADED: {out['llm_load_ms']}ms — placement was re-decided, "
-              f"check `ollama ps` for the GPU/CPU split", flush=True)
-    if not OLLAMA_LOG_TIMINGS:
-        return out          # the reload warning above stays regardless — it is rare and actionable
-    print(f"[llm] {label}: prompt {out['llm_prompt_tokens']} tok in {out['llm_prompt_ms']}ms "
-          f"({_tok_per_s(prompt_n, prompt_ns):.0f} tok/s) | "
-          f"gen {out['llm_gen_tokens']} tok in {out['llm_gen_ms']}ms "
-          f"({out['llm_tok_s']:.1f} tok/s)", flush=True)
-    return out
-
-
-def _ollama_request(messages: list[dict]) -> dict:
-    """POST to Ollama's chat endpoint and return the parsed response body. Raises RuntimeError with
-    a human-readable message on failure.
-
-    Returns the decoded JSON rather than the Response object so callers read the body — and the
-    timing fields above — exactly once."""
-    options = {"num_ctx": OLLAMA_NUM_CTX}
-    if OLLAMA_NUM_GPU is not None:      # None = let Ollama auto-decide the GPU/CPU split (fast path)
-        options["num_gpu"] = OLLAMA_NUM_GPU
-    if OLLAMA_NUM_PREDICT is not None:  # bound the reply: unbounded generation was paid for twice,
-        options["num_predict"] = OLLAMA_NUM_PREDICT   # once generating and again synthesizing it
-    try:
-        resp = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": messages,
-                "stream": False,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-                "options": options,
-            },
-            timeout=OLLAMA_TIMEOUT_S,
-        )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(
-            f"Ollama unavailable — check `ollama pull {OLLAMA_MODEL}` "
-            f"and that the service is running ({exc})"
-        ) from exc
-    return resp.json()
-
-
-def log_model_placement() -> dict:
-    """Log whether Ollama actually put the model on the GPU, by asking `/api/ps`.
-
-    This is the failure config/voice.py already documents but nothing ever reported: Ollama decides
-    the CPU/GPU split at LOAD time from whatever memory is free, OLLAMA_KEEP_ALIVE=-1 then pins that
-    choice for the life of the service, and after hours of uptime GPU fragmentation produces a
-    partial offload that runs at roughly half speed. From the outside that is indistinguishable from
-    "Kai is being slow today", which is exactly why it needs a line in the log.
-
-    Purely diagnostic and entirely best-effort — every failure path returns {} after at most a
-    warning, so this can never affect a reply. Returns the parsed size/size_vram pair when known."""
-    # Derived from OLLAMA_URL so there is one host to configure, not two. The chat endpoint is
-    # ".../api/chat"; the process list is its sibling.
-    ps_url = OLLAMA_URL.rsplit("/", 1)[0] + "/ps"
-    try:
-        resp = requests.get(ps_url, timeout=OLLAMA_PS_TIMEOUT_S)
-        resp.raise_for_status()
-        models = resp.json().get("models") or []
-    except (requests.exceptions.RequestException, ValueError, AttributeError) as exc:
-        print(f"[llm] could not read model placement from {ps_url} ({exc})", flush=True)
-        return {}
-    entry = next((m for m in models if m.get("name", "").startswith(OLLAMA_MODEL.split(":")[0])),
-                 None)
-    if entry is None:
-        print(f"[llm] {OLLAMA_MODEL} is not loaded — the next reply pays the model load", flush=True)
-        return {}
-    total = entry.get("size") or 0
-    vram  = entry.get("size_vram") or 0
-    if not total:
-        return {}
-    pct = 100.0 * vram / total
-    mb = 1024 * 1024
-    if pct >= 99.0:
-        print(f"[llm] {entry.get('name')} fully on GPU ({vram // mb} MB VRAM)", flush=True)
-    else:
-        # The actionable half: this is the ~2x slowdown, and the fix is a restart/reboot to
-        # defragment, not a config change.
-        print(f"[llm] WARNING: {entry.get('name')} is only {pct:.0f}% on GPU "
-              f"({vram // mb} of {total // mb} MB) — generation will run roughly half speed. "
-              f"Restart ollama (or reboot) to defragment GPU memory before relying on it.",
-              flush=True)
-    return {"size": total, "size_vram": vram, "gpu_pct": round(pct, 1)}
-
-
-def _classify_device(name: str) -> str:
-    """Bucket an input device by its name: 'i2s' (the preferred INMP441/APE mic), 'usb' (the
-    fallback), or 'other'. Case-insensitive substring match; I2S is checked before USB."""
-    lowered = (name or "").lower()
-    if any(hint.lower() in lowered for hint in I2S_MIC_NAME_HINTS):
-        return "i2s"
-    if any(hint.lower() in lowered for hint in USB_MIC_NAME_HINTS):
-        return "usb"
-    return "other"
-
-
-def _capture_rates_for(kind: str, advertised: int) -> tuple[int, ...]:
-    """Capture rates to try for a device, in order. Every one of them is usable by the pipeline.
-
-    The I2S mic is pinned: the route runs I2S2 at a fixed clock and the advertised rate is a lie
-    (the real APE device reports 44100 while the route runs at 48 kHz), so there is exactly one
-    candidate and it comes from config.
-
-    For everything else the filter is arithmetic. MicStream resamples with an integer-ratio
-    decimator, so a rate that does not divide SAMPLE_RATE is not merely suboptimal — it fails at
-    Decimator construction and takes the whole session down (see FALLBACK_CAPTURE_RATES in
-    config/voice.py for the incident). The advertised rate is therefore offered ONLY when it is
-    divisible, and it goes first when it is, because opening a device at its native rate avoids a
-    driver-side resample. The rest of the list follows as fallbacks, and the liveness probe — which
-    opens the device for real — is what decides which of them the hardware actually accepts.
-    """
-    if kind == "i2s" and I2S_CAPTURE_RATE:
-        return (I2S_CAPTURE_RATE,)
-    rates = [r for r in FALLBACK_CAPTURE_RATES if r > 0 and r % SAMPLE_RATE == 0]
-    if advertised > 0 and advertised % SAMPLE_RATE == 0 and advertised not in rates:
-        rates.insert(0, advertised)
-    elif advertised in rates:
-        rates.insert(0, rates.pop(rates.index(advertised)))
-    return tuple(rates)
-
-
-def _capture_channels_for(kind: str) -> int:
-    """How many channels to open for a device kind — the INMP441 must be captured in stereo
-    (real audio is only in the left slot); everything else is mono."""
-    return I2S_CAPTURE_CHANNELS if kind == "i2s" else CHANNELS
-
-
-def _candidate_input_devices(devices: list[dict]) -> list[int]:
-    """Distinct input-capable devices to probe, in preference order: I2S (INMP441) first, then
-    USB, then everything else — with the system default heading the 'other' bucket. Keeps one
-    representative per underlying ALSA card (avoids probing 20+ duplicate subdevice entries some
-    cards expose). When no I2S/USB device is present this collapses to 'default first, then cards
-    in order' — the historical behavior."""
-    buckets: dict[str, list[int]] = {"i2s": [], "usb": [], "other": []}
-    seen: set[int] = set()
-
-    try:
-        default_idx = sd.default.device[0]
-    except Exception:
-        default_idx = None
-    # Seed 'other' with the system default so it leads the non-preferred devices.
-    if isinstance(default_idx, int) and default_idx >= 0:
-        buckets["other"].append(default_idx)
-        seen.add(default_idx)
-
-    seen_cards: set[str] = set()
-    for idx, dev in enumerate(devices):
-        if dev.get("max_input_channels", 0) <= 0 or idx in seen:
-            continue
-        m = _HW_CARD_RE.search(dev.get("name", ""))
-        if m:
-            card = m.group(1)
-            if card in seen_cards:
-                continue
-            seen_cards.add(card)
-        buckets[_classify_device(dev.get("name", ""))].append(idx)
-        seen.add(idx)
-    return buckets["i2s"] + buckets["usb"] + buckets["other"]
-
-
-def _probe_is_live(device: int, rate: int, channels: int = CHANNELS,
-                   take_channel: int = 0, retries: int = 0) -> bool:
-    """Record a brief burst and check for real signal — silent/disconnected inputs read as zero.
-
-    `retries` re-reads a device that came back SILENT, up to that many extra times. It exists for
-    the I2S mic, which can return exact digital silence on the first capture after its route is
-    applied and read normally moments later (see I2S_PROBE_SILENT_RETRIES in config/voice.py).
-    Silence is the only outcome worth retrying: a device that refuses to open, or that hangs, has
-    given a definite answer, and re-asking costs a multiple of LIVE_PROBE_TIMEOUT_S on the session
-    start path for no gain. Defaults to 0 so every other caller keeps the old single-read behavior.
-    """
-    for attempt in range(max(0, retries) + 1):
-        if attempt:
-            time.sleep(I2S_PROBE_RETRY_DELAY_S)
-        live, silent = _probe_once(device, rate, channels, take_channel)
-        if live:
-            if attempt:
-                print(f"[mic] device {device} came back on retry {attempt} — the first read was "
-                      f"taken before the mic was delivering samples", flush=True)
-            return True
-        if not silent:
-            return False        # refused to open, or hung: a definite answer, not a warm-up
-    return False
-
-
-def _probe_once(device: int, rate: int, channels: int = CHANNELS,
-                take_channel: int = 0) -> tuple[bool, bool]:
-    """One liveness read. Returns (live, was_silent) — the second flag separates "this device
-    delivered nothing but zeros" from "this device would not give us samples at all", which is what
-    lets the caller retry only the former.
-
-    Captures `channels` channels (a mono open of the stereo-only INMP441 device fails outright)
-    and measures RMS on `take_channel` only, so the mic's silent right channel can't dilute it."""
-    result: dict = {}
-
-    def _capture() -> None:
-        try:
-            rec = sd.rec(int(LIVE_PROBE_DURATION_S * rate), samplerate=rate,
-                          channels=channels, dtype="int16", device=device)
-            sd.wait()
-        except Exception as exc:
-            # RECORDED, not swallowed. This was a bare `return`, which made "the device refused to
-            # open" indistinguishable from "the mic is silent" — both produced `i2s=False` with no
-            # reason anywhere in the log. On 2026-08-07 that cost a full hardware investigation to
-            # establish the mic was fine and startup contention had simply lost the probe. The
-            # timeout path below already logs; this one has to as well.
-            result["error"] = f"{type(exc).__name__}: {exc}"
-            return                       # no "rec" key — reads as "not live" below
-        result["rec"] = rec
-
-    # Bounded on its own thread: sd.wait() has no timeout, and a device that opens but never
-    # delivers frames blocks it forever rather than raising, so the except above cannot catch it.
-    # See LIVE_PROBE_TIMEOUT_S — a hang here strands the whole session start.
-    probe = threading.Thread(target=_capture, daemon=True, name="kai-mic-probe")
-    probe.start()
-    probe.join(LIVE_PROBE_TIMEOUT_S)
-    if probe.is_alive():
-        try:
-            sd.stop()                    # abort the wedged stream so the thread can unwind
-        except Exception:
-            pass
-        probe.join(1.0)
-        print(f"[mic] WARNING: live probe on device {device} did not return within "
-              f"{LIVE_PROBE_TIMEOUT_S:.0f}s — treating it as not live", flush=True)
-        return False, False
-
-    rec = result.get("rec")
-    if rec is None:
-        print(f"[mic] device {device} rejected the probe "
-              f"({rate} Hz x{channels}): {result.get('error', 'unknown error')}", flush=True)
-        return False, False
-    if rec.ndim > 1 and rec.shape[1] > take_channel:
-        rec = rec[:, take_channel]
-    rms = float(np.sqrt(np.mean(rec.astype(np.float64) ** 2)))
-    # Both outcomes logged, at one line per candidate device. "Read as silent" and "refused to open"
-    # are different problems with different fixes (check the wiring vs. check what holds the card),
-    # and telling them apart afterwards is only possible if the log said which happened.
-    if rms <= LIVE_PROBE_RMS_THRESHOLD:
-        print(f"[mic] device {device} read as silent "
-              f"(rms={rms:.1f} <= {LIVE_PROBE_RMS_THRESHOLD})", flush=True)
-        return False, True
-    return True, False
-
-
-def apply_i2s_route() -> bool:
-    """Bring up the ALSA XBAR/I2S2 capture route the INMP441 needs (see mictest/RESULTS.md), so
-    the mic works on every app start without the external i2s-mic-route.service or a manual SSH
-    session. Runs the exact `amixer` control sequence from config. Best-effort and never raises:
-    if `amixer` or the APE card is missing (dev box, or before the device-tree overlay loads) it
-    logs and returns False, and resolve_input_device() falls back to the USB mic. Returns True
-    only if the full route applied."""
-    if not I2S_APPLY_ROUTE_ON_STARTUP:
-        return False
-    for name, value in I2S_ROUTE_CONTROLS:
-        try:
-            subprocess.run(
-                ["amixer", "-c", I2S_ROUTE_CARD, "cset", f"name={name}", value],
-                check=True, capture_output=True, text=True, timeout=MIXER_TIMEOUT_S,
-            )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            # The dominant failure is "no APE card / no amixer" — one control failing means the
-            # rest will too, so stop after the first instead of emitting nine warnings.
-            print(f"[voice_assistant] WARNING: could not apply I2S capture route "
-                  f"('{name}' on card {I2S_ROUTE_CARD}: {exc}) — I2S mic may be unavailable; "
-                  f"selection will fall back to the USB/default mic")
-            return False
-    print(f"[voice_assistant] applied I2S capture route on card {I2S_ROUTE_CARD}")
-    return True
-
-
-def _pactl_suspend(source: str, on: bool) -> None:
-    """Suspend/resume a pulseaudio source via pactl. Best-effort; raises nothing.
-
-    Bounded by a timeout because an unresponsive pulseaudio would otherwise block here forever, and
-    this now runs on every mic open AND on every watchdog reopen — not just once per turn."""
-    try:
-        subprocess.run(["pactl", "suspend-source", source, "1" if on else "0"],
-                       check=True, capture_output=True, text=True, timeout=MIXER_TIMEOUT_S)
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        print(f"[voice_assistant] WARNING: pactl suspend-source {source} "
-              f"{'1' if on else '0'} failed ({exc})")
-
-
-def _pactl_source_names() -> list[str]:
-    """Every pulseaudio capture source, monitors excluded. Empty if pactl/pulse is unavailable.
-
-    Monitors are skipped deliberately: they are taps on an OUTPUT and hold no capture hardware, so
-    suspending them would gain nothing and would break anything listening to what Kai plays.
-    """
-    try:
-        out = subprocess.run(["pactl", "list", "short", "sources"], check=True,
-                             capture_output=True, text=True, timeout=MIXER_TIMEOUT_S).stdout
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        return []
-    names = []
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2 and not parts[1].endswith(".monitor"):
-            names.append(parts[1])
-    return names
-
-
-def free_i2s_device() -> None:
-    """Release the capture cards from pulseaudio so the app can open a raw hw device directly at its
-    true rate. pulse otherwise locks the APE card to 44100 and injects noise that garbles speech
-    (Whisper hears nothing). No-op if disabled or pactl/pulse is absent.
-
-    Every source is released, not just the I2S one: a source pulse holds makes the liveness probe of
-    that device block until it times out, and a timed-out probe reads as "not live" — which is enough
-    to skip the real mic and fall back to a 44.1 kHz pulse device that cannot be resampled to 16 kHz.
-    See PULSE_SUSPEND_ALL_SOURCES in config/voice.py.
-    """
-    # I2S_SUSPEND_PULSE stays the master switch: it is documented as the way to opt out entirely (e.g.
-    # pulse is not installed), so nothing here may touch pactl when it is False.
-    if not I2S_SUSPEND_PULSE:
-        return
-    _pactl_suspend(I2S_PULSE_SOURCE, True)
-    if PULSE_SUSPEND_ALL_SOURCES:
-        for src in _pactl_source_names():
-            if src != I2S_PULSE_SOURCE:
-                _pactl_suspend(src, True)
-
-
-def resume_pulse_source() -> None:
-    """Hand the card back to pulseaudio — used when we end up NOT capturing from the raw I2S device
-    (fallback to USB/system default), so the pulse-backed path isn't left muted."""
-    if I2S_SUSPEND_PULSE:
-        _pactl_suspend(I2S_PULSE_SOURCE, False)
-
-
-def resolve_input_device() -> MicChoice:
-    """Find a mic that actually captures signal, preferring the INMP441 I2S mic, then a USB mic,
-    then the system default. Returns how to open it. NOTE: for the raw I2S device to probe live,
-    pulseaudio must already be suspended (see free_i2s_device) — ensure_input_resolved does this."""
-    try:
-        devices = sd.query_devices()
-    except Exception:
-        return MicChoice(None, SAMPLE_RATE, CHANNELS, 0, "int16", False)
-    for idx in _candidate_input_devices(devices):
-        kind     = _classify_device(devices[idx].get("name", ""))
-        channels = _capture_channels_for(kind)
-        advertised = int(devices[idx].get("default_samplerate") or SAMPLE_RATE)
-        # Every rate here is one MicStream can actually resample; a device that opens at none of
-        # them is skipped rather than returned. Returning an unusable rate is what took the session
-        # down on 2026-08-09 — see _capture_rates_for and FALLBACK_CAPTURE_RATES.
-        # Only the I2S mic gets the silence retries: it is the one device with a warm-up, and it is
-        # also the preferred one, so a single mistimed read there costs the whole session its best
-        # mic. Silence from the USB/default devices is taken at face value.
-        retries = I2S_PROBE_SILENT_RETRIES if kind == "i2s" else 0
-        for rate in _capture_rates_for(kind, advertised):
-            if _probe_is_live(idx, rate, channels, I2S_TAKE_CHANNEL, retries):
-                return MicChoice(idx, rate, channels, I2S_TAKE_CHANNEL, "int16", kind == "i2s")
-    print("[voice_assistant] WARNING: every candidate input device read as silent or refused every "
-          "usable rate — falling back to system default mic (recordings may be empty)")
-    return MicChoice(None, SAMPLE_RATE, CHANNELS, 0, "int16", False)
 
 
 class VoiceAssistant:
@@ -806,6 +200,14 @@ class VoiceAssistant:
             )
             print(f"[voice_assistant] wake-scan model loaded: {WAKE_WHISPER_SCAN_MODEL}"
                   f"/{WHISPER_COMPUTE}", flush=True)
+
+    @property
+    def stt_ready(self) -> bool:
+        """True once the turn model is loaded, so a wake can be answered rather than looking like a
+        hang. ai/session.py's `ready` folds this in; before this existed it read _whisper_model
+        directly, which is the kind of reach-through that makes a stub in a test guess at internals.
+        """
+        return self._whisper_model is not None
 
     @property
     def scan_ready(self) -> bool:
@@ -1265,12 +667,16 @@ class VoiceAssistant:
             if gen == self._speech_gen:
                 self._tts_active = False
 
-    def _speak_wav(self, wav: Path, jaw_text: str, epoch: int | None = None) -> None:
+    def speak_wav(self, wav: Path, jaw_text: str, epoch: int | None = None) -> None:
         """Speak an already-synthesized WAV (see tts.prewarm_canned) with the jaw synced to it.
 
         Used for the wake acknowledgement, where live synthesis would put 0.5-1.5 s of dead air
         between "Hey Kai" and "Yes?". Deliberately does NOT touch _status or _response: routing the
-        ack through say() would make the dashboard post a "Kai: Yes?" chat bubble on every wake."""
+        ack through say() would make the dashboard post a "Kai: Yes?" chat bubble on every wake.
+
+        Public because ai/session.py is its caller — every canned line, every filler line and the
+        ack all arrive here. Anything spoken that is NOT a turn goes through this method or
+        speak_text(), never through say()."""
         def _worker() -> None:
             try:
                 duration = tts.wav_duration(wav)
@@ -1289,6 +695,15 @@ class VoiceAssistant:
 
         gen = self._begin_speech()
         threading.Thread(target=_worker, daemon=True, name="kai-tts-canned").start()
+
+    def speak_text(self, text: str, epoch: int | None = None) -> None:
+        """Say `text` aloud with the jaw synced to it, without touching turn status.
+
+        The fallback sibling of speak_wav(), for when a canned line was never synthesized and
+        ai/session.py has to fall back to live synthesis. Same contract: no _status, no _response,
+        so no chat bubble. Do not use it for a reply — that is what say() and process_utterance()
+        are for, and they are what the dashboard's transcript is built from."""
+        self._speak(text, epoch=epoch)
 
     def transcribe_async(self, audio: np.ndarray, rate: int, on_done, token=None,
                          log_language: bool = True) -> None:

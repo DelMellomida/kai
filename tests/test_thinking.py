@@ -1,15 +1,15 @@
 """The "thinking" pan sweep maths.
 
 Everything under test is pure: the randomness lives in a SweepShape the caller draws, so these run
-with no servo, no camera, no clock and no seeding. Importing face_track costs ~13 s (MediaPipe,
-onnxruntime) and constructs nothing hardware-bound; see tests/test_web.py.
+with no servo, no camera, no clock and no seeding — and now without importing MediaPipe either,
+since the sweep lives in app/control_loop.py rather than in face_track.py.
 """
 
 import math
 import random
 import unittest
 
-import face_track
+from app import control_loop
 from config.servo import SERVO_MAX, SERVO_MIN
 from config.thinking import (
     THINKING_SWEEP_AMP_JITTER, THINKING_SWEEP_DEG, THINKING_SWEEP_PERIOD_JITTER,
@@ -18,9 +18,9 @@ from config.thinking import (
 )
 from config.tracking import CONTROL_FPS, PAN_MAX_STEP, PAN_SCALE
 
-offset = face_track._thinking_offset
-ease = face_track._ease_toward
-draw = face_track._draw_sweep
+offset = control_loop.thinking_offset
+ease = control_loop.ease_toward
+draw = control_loop.draw_sweep
 
 
 def every_shape(n=200, seed=1234):
@@ -33,7 +33,7 @@ def every_shape(n=200, seed=1234):
     for a, p in ((amp_hi, per_lo), (amp_lo, per_hi), (amp_hi, per_hi), (amp_lo, per_lo)):
         amp = THINKING_SWEEP_DEG * a
         period = THINKING_SWEEP_PERIOD_S * p
-        shapes.append(face_track.SweepShape(
+        shapes.append(control_loop.SweepShape(
             main_amp=amp * (1.0 - THINKING_SWEEP_WANDER_FRAC), main_period=period,
             wander_amp=amp * THINKING_SWEEP_WANDER_FRAC,
             wander_period=period * THINKING_SWEEP_WANDER_RATIO, direction=1.0))

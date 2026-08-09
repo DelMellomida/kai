@@ -5,13 +5,13 @@ Central home for Kai's **tunable** settings — one file per subsystem:
 | File          | Tunes                                                             | Used by |
 |---------------|------------------------------------------------------------------|---------|
 | `servo.py`    | serial port/baud, send rates, servo angle limits, deadband       | `servo/` |
-| `tracking.py` | inference fps, EMA/PD smoothing, jaw range, slew cap, web port    | `face_track.py` |
+| `tracking.py` | inference fps, EMA/PD smoothing, jaw range, slew cap, web port    | `face_track.py`, `app/`, `web/server.py` |
 | `gesture.py`  | nod / shake / proximity / mouth thresholds and windows           | `vision/gesture.py` |
 | `camera.py`   | capture + processing resolution, network/stream ports            | `vision/` |
-| `voice.py`    | Whisper + Ollama models, context size, jaw-speaking envelope     | `ai/voice_assistant.py` |
-| `wake.py`     | wake engine chain, always-open capture, VAD turn-end, session timeouts, phrase matching | `ai/audio.py`, `ai/session.py`, `ai/wake_phrase.py` |
+| `voice.py`    | Whisper + Ollama models, context size, jaw-speaking envelope     | `ai/voice_assistant.py`, `ai/llm.py`, `ai/transcript.py`, `ai/speak_envelope.py`, `ai/mic_device.py` |
+| `wake.py`     | wake engine chain, always-open capture, VAD turn-end, session timeouts, phrase matching | `ai/audio.py`, `ai/mic_stream.py`, `ai/session.py`, `ai/wake_phrase.py` |
 | `rag.py`      | embedding model, chunking, top-k, similarity threshold, fuzzy "DEVCON" matching, entity gazetteer, lexical fallback, DEVCON failsafe chain | `ai/rag.py`, `ai/query_alias.py`, `ai/index_documents.py` |
-| `thinking.py` | the "thinking" expression — pan sweep amplitude/period, the "hmm" delay | `face_track.py`, `ai/session.py` |
+| `thinking.py` | the "thinking" expression — pan sweep amplitude/period, the "hmm" delay | `app/control_loop.py`, `ai/session.py` |
 | `filler.py`   | the filler bank — 20 openers + 20 stalls in tl/ceb/en, and the 2 s dead-air ceiling | `ai/filler.py`, `ai/session.py` |
 
 `voice.py` covers a turn once the audio exists; `wake.py` covers everything that decides *when* Kai

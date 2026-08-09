@@ -1,7 +1,8 @@
 """The "thinking" expression — what Kai does during the 2-3 s of STT + LLM.
 
 Every tunable for the feature lives here, so the whole thing is easy to find and easy to delete.
-Consumed by settings.py (the two defaults), face_track.py (the sweep) and ai/session.py (the sound).
+Consumed by settings.py (the two defaults), app/control_loop.py (the sweep) and ai/session.py
+(the sound).
 
 Both halves are independent dashboard toggles, not config edits, because nobody knows yet how they
 feel in the room — see the reverting notes at the bottom.

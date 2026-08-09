@@ -13,7 +13,8 @@ SEND_INTERVAL     = 0.10
 JAW_SEND_INTERVAL = 0.05   # 20 Hz for the jaw-only channel — smoother speech, own gate
 SERVO_MIN     = 10     # keep away from physical stop (Tower Pro SG90 overshoots at 0)
 SERVO_MAX     = 170    # keep away from physical stop (Tower Pro SG90 overshoots at 180)
-SEND_DEADBAND = 3      # degrees — the JAW channel's threshold. Real filtering is in face_track.py.
+SEND_DEADBAND = 3      # degrees — the JAW channel's threshold. Real filtering is in face_track.py
+                       # (the jaw EMA) and app/control_loop.py (the pan slew clamp).
 
 # Pan/tilt gets its own, smaller threshold, because the deadband was never meant to filter MOTION and
 # on pan it was doing exactly that. During slow tracking the PD asks for ~1 degree per tick; at 3 those

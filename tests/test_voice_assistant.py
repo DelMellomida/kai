@@ -6,36 +6,12 @@ import requests
 
 from ai import voice_assistant
 from ai.tts import clean_for_speech
+from config.voice import OLLAMA_MODEL
 from ai.voice_assistant import (
     VoiceAssistant,
     MicChoice,
     WHISPER_BEAM_SIZE, WHISPER_INITIAL_PROMPT,
-    apply_i2s_route,
-    free_i2s_device,
-    resume_pulse_source,
-    build_chat_messages,
-    latin_letter_ratio,
-    load_persona,
-    resolve_input_device,
-    transcript_rejection,
-    speaking_openness_at,
-    _best_allowed_language,
-    _candidate_input_devices,
-    _capture_rates_for,
-    _classify_device,
-    _probe_is_live,
-    _speak_segments,
-    _speak_segments_for_duration,
-    _split_sentences,
-    _DEFAULT_PERSONA,
-    MAX_HISTORY_TURNS,
     NO_SPEECH_RESPONSE,
-    OLLAMA_MODEL,
-    SPEAK_AMP,
-    SPEAK_GAP_S,
-    SPEAK_MAX_S,
-    SPEAK_MIN_SENTENCE_S,
-    SPEAK_SEC_PER_WORD,
     STATUS_DONE,
     STATUS_ERROR,
     STATUS_IDLE,
@@ -53,196 +29,12 @@ def make_segment(text: str):
     return seg
 
 
-class TestBuildChatMessages(unittest.TestCase):
-    def test_system_prompt_first(self):
-        msgs = build_chat_messages("sys", [], "hello")
-        self.assertEqual(msgs[0], {"role": "system", "content": "sys"})
+class TestEnsureInputResolved(unittest.TestCase):
+    """The assistant's own use of ai/mic_device — ordering and the pulse hand-back.
 
-    def test_appends_user_turn_last(self):
-        msgs = build_chat_messages("sys", [], "hello")
-        self.assertEqual(msgs[-1], {"role": "user", "content": "hello"})
-
-    def test_includes_history_in_order(self):
-        history = [
-            {"role": "user", "content": "a"},
-            {"role": "assistant", "content": "b"},
-        ]
-        msgs = build_chat_messages("sys", history, "c")
-        self.assertEqual(msgs, [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "a"},
-            {"role": "assistant", "content": "b"},
-            {"role": "user", "content": "c"},
-        ])
-
-    def test_truncates_to_max_history_turns(self):
-        history = []
-        for i in range(MAX_HISTORY_TURNS + 5):
-            history.append({"role": "user", "content": f"u{i}"})
-            history.append({"role": "assistant", "content": f"a{i}"})
-        msgs = build_chat_messages("sys", history, "new")
-        # system + capped history + new user turn
-        self.assertEqual(len(msgs), 1 + MAX_HISTORY_TURNS * 2 + 1)
-
-
-class TestLoadPersona(unittest.TestCase):
-    def test_reads_custom_content(self):
-        mock_path = MagicMock()
-        mock_path.read_text.return_value = "Custom persona text.\n"
-        with patch("ai.voice_assistant.PERSONA_PATH", mock_path):
-            self.assertEqual(load_persona(), "Custom persona text.")
-
-    def test_missing_file_falls_back_to_default(self):
-        mock_path = MagicMock()
-        mock_path.read_text.side_effect = OSError("no such file")
-        with patch("ai.voice_assistant.PERSONA_PATH", mock_path):
-            self.assertEqual(load_persona(), _DEFAULT_PERSONA)
-
-    def test_empty_file_falls_back_to_default(self):
-        mock_path = MagicMock()
-        mock_path.read_text.return_value = "   \n"
-        with patch("ai.voice_assistant.PERSONA_PATH", mock_path):
-            self.assertEqual(load_persona(), _DEFAULT_PERSONA)
-
-
-class TestCandidateInputDevices(unittest.TestCase):
-    def test_default_device_listed_first(self):
-        devices = [
-            {"name": "card0 (hw:0,0)", "max_input_channels": 2},
-            {"name": "card1 (hw:1,0)", "max_input_channels": 2},
-        ]
-        with patch("ai.voice_assistant.sd.default") as mock_default:
-            mock_default.device = [1, 1]
-            candidates = _candidate_input_devices(devices)
-        self.assertEqual(candidates[0], 1)
-
-    def test_dedupes_duplicate_subdevices_of_same_card(self):
-        devices = [
-            {"name": "APE (hw:1,0)", "max_input_channels": 16},
-            {"name": "APE (hw:1,1)", "max_input_channels": 16},
-            {"name": "APE (hw:1,2)", "max_input_channels": 16},
-            {"name": "USB Mic (hw:0,0)", "max_input_channels": 2},
-        ]
-        with patch("ai.voice_assistant.sd.default") as mock_default:
-            mock_default.device = [-1, -1]
-            candidates = _candidate_input_devices(devices)
-        # only one representative for card 1, plus card 0 — not all 3 hw:1,* duplicates
-        card_1_hits = [i for i in candidates if i in (0, 1, 2)]
-        self.assertEqual(len(card_1_hits), 1)
-        self.assertIn(3, candidates)
-
-    def test_skips_output_only_devices(self):
-        devices = [
-            {"name": "HDMI out (hw:0,3)", "max_input_channels": 0},
-            {"name": "Mic (hw:1,0)", "max_input_channels": 2},
-        ]
-        with patch("ai.voice_assistant.sd.default") as mock_default:
-            mock_default.device = [-1, -1]
-            candidates = _candidate_input_devices(devices)
-        self.assertNotIn(0, candidates)
-        self.assertIn(1, candidates)
-
-
-class TestPulseSuspend(unittest.TestCase):
-    def test_free_i2s_device_suspends_source(self):
-        from ai.voice_assistant import I2S_PULSE_SOURCE
-        with patch("ai.voice_assistant.I2S_SUSPEND_PULSE", True), \
-             patch("ai.voice_assistant.PULSE_SUSPEND_ALL_SOURCES", False), \
-             patch("ai.voice_assistant.subprocess.run") as mock_run:
-            free_i2s_device()
-        args, _ = mock_run.call_args
-        self.assertEqual(args[0], ["pactl", "suspend-source", I2S_PULSE_SOURCE, "1"])
-
-    def test_every_capture_source_is_released_not_just_i2s(self):
-        # A source pulse holds makes that device's liveness probe time out, which reads as "not live" —
-        # enough to skip the real mic and fall back to a 44.1 kHz pulse device that cannot be resampled
-        # to 16 kHz. Reachable once pulseaudio started at boot and held the USB card.
-        from ai.voice_assistant import I2S_PULSE_SOURCE
-        listing = (f"0\t{I2S_PULSE_SOURCE}\tmodule-alsa-card.c\ts16le 2ch 44100Hz\tSUSPENDED\n"
-                   "1\talsa_input.usb-C-Media_Audio-00.mono-fallback\tmodule-alsa-card.c\t"
-                   "s16le 1ch 44100Hz\tIDLE\n"
-                   "2\talsa_output.usb-C-Media_Audio-00.analog-stereo.monitor\tmodule-alsa-card.c\t"
-                   "s16le 2ch 44100Hz\tIDLE\n")
-
-        def run(cmd, **kw):
-            out = MagicMock()
-            out.stdout = listing if cmd[:3] == ["pactl", "list", "short"] else ""
-            return out
-
-        with patch("ai.voice_assistant.I2S_SUSPEND_PULSE", True), \
-             patch("ai.voice_assistant.PULSE_SUSPEND_ALL_SOURCES", True), \
-             patch("ai.voice_assistant.subprocess.run", side_effect=run) as mock_run:
-            free_i2s_device()
-
-        suspended = [c.args[0][2] for c in mock_run.call_args_list
-                     if c.args[0][:2] == ["pactl", "suspend-source"]]
-        self.assertIn(I2S_PULSE_SOURCE, suspended)
-        self.assertIn("alsa_input.usb-C-Media_Audio-00.mono-fallback", suspended)
-        self.assertEqual(len(suspended), 2, "the I2S source must not be suspended twice")
-        self.assertFalse([s for s in suspended if s.endswith(".monitor")],
-                         "monitors are output taps and hold no capture hardware")
-
-    def test_missing_pactl_while_enumerating_does_not_raise(self):
-        with patch("ai.voice_assistant.I2S_SUSPEND_PULSE", True), \
-             patch("ai.voice_assistant.PULSE_SUSPEND_ALL_SOURCES", True), \
-             patch("ai.voice_assistant.subprocess.run", side_effect=FileNotFoundError("no pactl")):
-            free_i2s_device()   # must not raise
-
-    def test_resume_pulse_source_unsuspends(self):
-        from ai.voice_assistant import I2S_PULSE_SOURCE
-        with patch("ai.voice_assistant.I2S_SUSPEND_PULSE", True), \
-             patch("ai.voice_assistant.subprocess.run") as mock_run:
-            resume_pulse_source()
-        args, _ = mock_run.call_args
-        self.assertEqual(args[0], ["pactl", "suspend-source", I2S_PULSE_SOURCE, "0"])
-
-    def test_disabled_toggle_skips_pactl(self):
-        with patch("ai.voice_assistant.I2S_SUSPEND_PULSE", False), \
-             patch("ai.voice_assistant.subprocess.run") as mock_run:
-            free_i2s_device()
-            resume_pulse_source()
-        mock_run.assert_not_called()
-
-    def test_missing_pactl_does_not_raise(self):
-        with patch("ai.voice_assistant.I2S_SUSPEND_PULSE", True), \
-             patch("ai.voice_assistant.subprocess.run", side_effect=FileNotFoundError("no pactl")):
-            free_i2s_device()      # must not raise
-            resume_pulse_source()  # must not raise
-
-
-class TestApplyI2SRoute(unittest.TestCase):
-    def test_applies_every_control_when_amixer_succeeds(self):
-        from ai.voice_assistant import I2S_ROUTE_CONTROLS
-        with patch("ai.voice_assistant.I2S_APPLY_ROUTE_ON_STARTUP", True), \
-             patch("ai.voice_assistant.subprocess.run") as mock_run:
-            ok = apply_i2s_route()
-        self.assertTrue(ok)
-        self.assertEqual(mock_run.call_count, len(I2S_ROUTE_CONTROLS))
-        # each invocation is a non-shell amixer cset on the configured card
-        args, kwargs = mock_run.call_args
-        self.assertEqual(args[0][0], "amixer")
-        self.assertTrue(kwargs.get("check"))
-
-    def test_disabled_toggle_skips_amixer(self):
-        with patch("ai.voice_assistant.I2S_APPLY_ROUTE_ON_STARTUP", False), \
-             patch("ai.voice_assistant.subprocess.run") as mock_run:
-            ok = apply_i2s_route()
-        self.assertFalse(ok)
-        mock_run.assert_not_called()
-
-    def test_missing_amixer_returns_false_without_raising(self):
-        with patch("ai.voice_assistant.I2S_APPLY_ROUTE_ON_STARTUP", True), \
-             patch("ai.voice_assistant.subprocess.run", side_effect=FileNotFoundError("no amixer")):
-            self.assertFalse(apply_i2s_route())   # must not raise
-
-    def test_failed_control_stops_early(self):
-        import subprocess as _sp
-        with patch("ai.voice_assistant.I2S_APPLY_ROUTE_ON_STARTUP", True), \
-             patch("ai.voice_assistant.subprocess.run",
-                   side_effect=_sp.CalledProcessError(1, "amixer")) as mock_run:
-            ok = apply_i2s_route()
-        self.assertFalse(ok)
-        self.assertEqual(mock_run.call_count, 1)   # bails after the first failure, no 9x spam
+    Patched on ai.voice_assistant, not ai.mic_device: ensure_input_resolved() calls these by bare
+    name, so it resolves them through this module's globals (they are re-exported there).
+    """
 
     def test_ensure_input_resolved_frees_card_before_probing(self):
         va = make_assistant()
@@ -269,395 +61,6 @@ class TestApplyI2SRoute(unittest.TestCase):
                    return_value=MicChoice(None, 16000, 1, 0, "int16", False)):
             va.ensure_input_resolved()
         mock_resume.assert_called_once()
-
-
-class TestClassifyDevice(unittest.TestCase):
-    def test_i2s_matches_ape_and_tegra_dlink(self):
-        self.assertEqual(_classify_device("APE (hw:APE,0)"), "i2s")
-        self.assertEqual(_classify_device("tegra-dlink-0 (hw:1,0)"), "i2s")
-
-    def test_usb_match(self):
-        self.assertEqual(_classify_device("Some USB Audio (hw:0,0)"), "usb")
-
-    def test_case_insensitive(self):
-        self.assertEqual(_classify_device("my usb mic"), "usb")
-        self.assertEqual(_classify_device("Tegra-DLink capture"), "i2s")
-
-    def test_other_when_no_hint_matches(self):
-        self.assertEqual(_classify_device("Generic onboard analog"), "other")
-
-    def test_i2s_wins_over_usb_when_both_present(self):
-        # Contrived name containing both hints — I2S is checked first.
-        self.assertEqual(_classify_device("APE USB bridge"), "i2s")
-
-
-class TestResolveInputDevice(unittest.TestCase):
-    def test_prefers_live_i2s_over_usb(self):
-        devices = [
-            {"name": "USB Mic (hw:0,0)", "max_input_channels": 2, "default_samplerate": 44100.0},
-            # Real Jetson APE reports a misleading default_samplerate (44100) but the hw device is
-            # locked to its 48 kHz route rate — resolution must ignore the advertised rate.
-            {"name": "NVIDIA Jetson Orin Nano APE: - (hw:1,0)", "max_input_channels": 16, "default_samplerate": 44100.0},
-        ]
-        # Both live; the I2S device must be probed first and win.
-        with patch("ai.voice_assistant.sd.query_devices", return_value=devices), \
-             patch("ai.voice_assistant.sd.default") as mock_default, \
-             patch("ai.voice_assistant._probe_is_live", return_value=True):
-            mock_default.device = [-1, -1]
-            choice = resolve_input_device()
-        self.assertEqual(choice.device, 1)         # the APE/I2S device
-        self.assertEqual(choice.rate, 48000)       # pinned to the I2S clock rate (pulse suspended)
-        self.assertEqual(choice.channels, 2)       # captured stereo
-        self.assertEqual(choice.take_channel, 0)   # left slot
-        self.assertTrue(choice.is_i2s)
-
-    def test_falls_back_to_usb_when_i2s_silent(self):
-        devices = [
-            {"name": "APE tegra-dlink-0 (hw:APE,0)", "max_input_channels": 16, "default_samplerate": 48000.0},
-            {"name": "USB Mic (hw:0,0)", "max_input_channels": 2, "default_samplerate": 44100.0},
-        ]
-        # I2S (probed first) reads silent, USB is live.
-        with patch("ai.voice_assistant.sd.query_devices", return_value=devices), \
-             patch("ai.voice_assistant.sd.default") as mock_default, \
-             patch("ai.voice_assistant._probe_is_live", side_effect=[False, True]):
-            mock_default.device = [-1, -1]
-            choice = resolve_input_device()
-        self.assertEqual(choice.device, 1)         # the USB device
-        # NOT 44100, which is what this device advertises. 44100 does not divide into SAMPLE_RATE,
-        # so MicStream cannot build a decimator for it and the session dies on open — the whole
-        # point of _capture_rates_for. Only divisible rates are ever offered.
-        self.assertEqual(choice.rate % 16000, 0)
-        self.assertEqual(choice.channels, 1)       # mono
-        self.assertEqual(choice.take_channel, 0)
-        self.assertFalse(choice.is_i2s)
-
-    def test_usb_that_rejects_16k_is_opened_at_48k_not_its_advertised_44100(self):
-        """The 2026-08-09 robot failure, end to end.
-
-        The C-Media dongle advertises default_samplerate=44100 and its hw params are
-        `S16_LE mono, RATE: [44100 48000]` — so 16 kHz cannot be opened at all and 44100 cannot be
-        resampled. The old code took the advertised rate and handed back 44100, and MicStream.open()
-        died on `decimation needs an integer ratio, got 44100 -> 16000`, which took hands-free AND
-        push-to-talk down. 48000 was available the entire time.
-        """
-        devices = [
-            {"name": "USB Audio Device: - (hw:0,0)", "max_input_channels": 1,
-             "default_samplerate": 44100.0},
-        ]
-
-        def probe(device, rate, channels, take_channel, retries=0):
-            return rate in (44100, 48000)      # exactly what this dongle supports
-
-        with patch("ai.voice_assistant.sd.query_devices", return_value=devices), \
-             patch("ai.voice_assistant.sd.default") as mock_default, \
-             patch("ai.voice_assistant._probe_is_live", side_effect=probe):
-            mock_default.device = [-1, -1]
-            choice = resolve_input_device()
-        self.assertEqual(choice.device, 0)
-        self.assertEqual(choice.rate, 48000)       # the one rate that both opens and resamples
-        self.assertFalse(choice.is_i2s)
-
-    def test_device_that_opens_at_no_usable_rate_is_skipped_not_returned(self):
-        """A 44.1-kHz-only device must be passed over, not handed back.
-
-        Returning it is strictly worse than falling through: it looks like success and then fails
-        at Decimator construction, where the only recovery is the session refusing to start.
-        """
-        devices = [
-            {"name": "Fussy Mic (hw:1,0)", "max_input_channels": 1, "default_samplerate": 44100.0},
-        ]
-        with patch("ai.voice_assistant.sd.query_devices", return_value=devices), \
-             patch("ai.voice_assistant.sd.default") as mock_default, \
-             patch("ai.voice_assistant._probe_is_live", return_value=False):
-            mock_default.device = [-1, -1]
-            choice = resolve_input_device()
-        self.assertIsNone(choice.device)
-        self.assertEqual(choice.rate, 16000)
-
-
-class TestCaptureRatesFor(unittest.TestCase):
-    def test_i2s_is_pinned_to_the_route_rate_and_ignores_the_advertised_one(self):
-        # The real APE device advertises 44100 while the route runs at 48 kHz. Trusting the
-        # advertised rate here would garble speech even when it happened to be divisible.
-        self.assertEqual(_capture_rates_for("i2s", 44100), (48000,))
-
-    def test_every_offered_rate_divides_into_the_pipeline_rate(self):
-        for kind in ("usb", "other"):
-            for advertised in (0, 8000, 44100, 48000, 96000):
-                for rate in _capture_rates_for(kind, advertised):
-                    self.assertEqual(rate % 16000, 0,
-                                     f"{rate} from kind={kind} advertised={advertised}")
-
-    def test_indivisible_advertised_rate_is_dropped_entirely(self):
-        self.assertNotIn(44100, _capture_rates_for("usb", 44100))
-
-    def test_divisible_advertised_rate_leads_so_the_native_rate_is_tried_first(self):
-        # Opening a device at its own rate avoids a driver-side resample, so prefer it — but only
-        # because it passed the divisibility filter, never on the strength of being advertised.
-        self.assertEqual(_capture_rates_for("usb", 48000)[0], 48000)
-        self.assertEqual(_capture_rates_for("other", 32000)[0], 32000)
-
-    def test_no_duplicate_rates_so_no_device_is_probed_twice_at_one_rate(self):
-        for advertised in (16000, 32000, 44100, 48000):
-            rates = _capture_rates_for("usb", advertised)
-            self.assertEqual(len(rates), len(set(rates)))
-
-    def test_default_is_last_resort(self):
-        # No I2S/USB present: an 'other' device that's live is chosen, captured mono.
-        devices = [
-            {"name": "Generic onboard (hw:1,0)", "max_input_channels": 2, "default_samplerate": 48000.0},
-        ]
-        with patch("ai.voice_assistant.sd.query_devices", return_value=devices), \
-             patch("ai.voice_assistant.sd.default") as mock_default, \
-             patch("ai.voice_assistant._probe_is_live", return_value=True):
-            mock_default.device = [-1, -1]
-            choice = resolve_input_device()
-        self.assertEqual(choice.device, 0)
-        self.assertEqual(choice.channels, 1)
-
-    def test_falls_back_when_nothing_is_live(self):
-        devices = [
-            {"name": "Silent onboard (hw:1,0)", "max_input_channels": 2, "default_samplerate": 48000.0},
-        ]
-        with patch("ai.voice_assistant.sd.query_devices", return_value=devices), \
-             patch("ai.voice_assistant.sd.default") as mock_default, \
-             patch("ai.voice_assistant._probe_is_live", return_value=False):
-            mock_default.device = [-1, -1]
-            choice = resolve_input_device()
-        self.assertIsNone(choice.device)
-        self.assertEqual(choice.rate, 16000)
-        self.assertEqual(choice.channels, 1)
-
-    def test_falls_back_when_query_raises(self):
-        with patch("ai.voice_assistant.sd.query_devices", side_effect=OSError("no audio subsystem")):
-            choice = resolve_input_device()
-        self.assertIsNone(choice.device)
-        self.assertEqual(choice.rate, 16000)
-
-
-class TestProbeIsLive(unittest.TestCase):
-    def test_returns_true_above_threshold(self):
-        with patch("ai.voice_assistant.sd.rec", return_value=np.full((100, 1), 100, dtype="int16")), \
-             patch("ai.voice_assistant.sd.wait"):
-            self.assertTrue(_probe_is_live(0, 16000, 1, 0))
-
-    def test_returns_false_on_silence(self):
-        with patch("ai.voice_assistant.sd.rec", return_value=np.zeros((100, 1), dtype="int16")), \
-             patch("ai.voice_assistant.sd.wait"):
-            self.assertFalse(_probe_is_live(0, 16000, 1, 0))
-
-    def test_returns_false_on_exception(self):
-        with patch("ai.voice_assistant.sd.rec", side_effect=OSError("busy")):
-            self.assertFalse(_probe_is_live(0, 16000, 1, 0))
-
-    def test_stereo_measures_only_the_taken_channel(self):
-        # INMP441 shape: left (col 0) loud, right (col 1) digital silence -> live on channel 0.
-        rec = np.zeros((100, 2), dtype="int16")
-        rec[:, 0] = 100
-        with patch("ai.voice_assistant.sd.rec", return_value=rec), \
-             patch("ai.voice_assistant.sd.wait"):
-            self.assertTrue(_probe_is_live(0, 48000, 2, 0))
-
-    def test_a_silent_first_read_is_retried_and_the_device_can_come_back(self):
-        """The INMP441 warm-up: silent on the first capture after the route is applied, live after.
-
-        Before the retry, that single early read condemned the preferred mic for the whole life of
-        the process and Kai ran the entire session on the fallback USB mic.
-        """
-        silent = np.zeros((100, 2), dtype="int16")
-        live = np.zeros((100, 2), dtype="int16")
-        live[:, 0] = 100
-        with patch("ai.voice_assistant.sd.rec", side_effect=[silent, silent, live]), \
-             patch("ai.voice_assistant.sd.wait"), \
-             patch("ai.voice_assistant.time.sleep"):
-            self.assertTrue(_probe_is_live(5, 48000, 2, 0, retries=3))
-
-    def test_retries_are_bounded_and_a_dead_device_still_reads_dead(self):
-        with patch("ai.voice_assistant.sd.rec", return_value=np.zeros((100, 2), dtype="int16")) as rec, \
-             patch("ai.voice_assistant.sd.wait"), \
-             patch("ai.voice_assistant.time.sleep"):
-            self.assertFalse(_probe_is_live(5, 48000, 2, 0, retries=3))
-        self.assertEqual(rec.call_count, 4)      # the first read plus exactly three retries
-
-    def test_a_device_that_refuses_to_open_is_not_retried(self):
-        """An open failure is a definite answer. Retrying it burns LIVE_PROBE_TIMEOUT_S multiples on
-        the session start path — which is the hang the timeout exists to prevent."""
-        with patch("ai.voice_assistant.sd.rec", side_effect=OSError("busy")) as rec, \
-             patch("ai.voice_assistant.time.sleep"):
-            self.assertFalse(_probe_is_live(5, 48000, 2, 0, retries=3))
-        self.assertEqual(rec.call_count, 1)
-
-    def test_retries_default_to_off_so_other_devices_are_read_once(self):
-        with patch("ai.voice_assistant.sd.rec", return_value=np.zeros((100, 1), dtype="int16")) as rec, \
-             patch("ai.voice_assistant.sd.wait"):
-            self.assertFalse(_probe_is_live(0, 48000, 1, 0))
-        self.assertEqual(rec.call_count, 1)
-
-    def test_only_the_i2s_device_is_retried_during_resolution(self):
-        devices = [
-            {"name": "APE tegra-dlink-0 (hw:APE,0)", "max_input_channels": 16,
-             "default_samplerate": 44100.0},
-            {"name": "USB Mic (hw:0,0)", "max_input_channels": 1, "default_samplerate": 44100.0},
-        ]
-        seen = []
-
-        def probe(device, rate, channels, take_channel, retries=0):
-            seen.append((device, retries))
-            return device == 1 and rate == 48000
-
-        with patch("ai.voice_assistant.sd.query_devices", return_value=devices), \
-             patch("ai.voice_assistant.sd.default") as mock_default, \
-             patch("ai.voice_assistant._probe_is_live", side_effect=probe):
-            mock_default.device = [-1, -1]
-            resolve_input_device()
-        self.assertTrue(all(r > 0 for d, r in seen if d == 0), seen)   # I2S retried
-        self.assertTrue(all(r == 0 for d, r in seen if d == 1), seen)  # USB read once per rate
-
-    def test_stereo_silent_on_taken_channel_reads_dead(self):
-        # Signal only in the untaken channel -> the taken (left) channel is silent -> not live.
-        rec = np.zeros((100, 2), dtype="int16")
-        rec[:, 1] = 100
-        with patch("ai.voice_assistant.sd.rec", return_value=rec), \
-             patch("ai.voice_assistant.sd.wait"):
-            self.assertFalse(_probe_is_live(0, 48000, 2, 0))
-
-
-class _Seg:
-    """A faster-whisper segment, only the fields the sanity gate reads."""
-
-    def __init__(self, text="hello", avg_logprob=-0.2, no_speech_prob=0.05):
-        self.text = text
-        self.avg_logprob = avg_logprob
-        self.no_speech_prob = no_speech_prob
-
-
-class TestLatinLetterRatio(unittest.TestCase):
-    def test_plain_english(self):
-        self.assertEqual(latin_letter_ratio("what time is it"), 1.0)
-
-    def test_tagalog_with_accents_is_latin(self):
-        # Tagalog's only extras are ñ and Spanish loanword accents — all Latin. This must never
-        # be mistaken for a foreign script.
-        for text in ("anong oras na", "magandáng umaga", "señor", "kumustá ka"):
-            with self.subTest(text=text):
-                self.assertEqual(latin_letter_ratio(text), 1.0)
-
-    def test_cjk_is_not_latin(self):
-        self.assertEqual(latin_letter_ratio("嘿哀"), 0.0)
-
-    def test_punctuation_digits_and_emoji_are_ignored(self):
-        # They are not alphabetic, so they can neither trip the check nor dilute a bad transcript
-        # into passing it.
-        self.assertEqual(latin_letter_ratio("set a timer for 5 minutes — ok? 🎉"), 1.0)
-        self.assertEqual(latin_letter_ratio("123 !?, —"), 1.0)
-
-    def test_no_letters_at_all_is_treated_as_fine(self):
-        self.assertEqual(latin_letter_ratio(""), 1.0)
-        self.assertEqual(latin_letter_ratio("..."), 1.0)
-
-    def test_mixed_script_is_proportional(self):
-        self.assertAlmostEqual(latin_letter_ratio("hey嘿"), 3 / 4)
-
-
-class TestTranscriptRejection(unittest.TestCase):
-    """The hole this closes: WHISPER_LANGUAGES restricts the detected-language LABEL only. A clip
-    labelled 'en' is never re-transcribed, so a decode that emitted '嘿哀' — or invented a sentence out
-    of fan noise — reached the LLM and was answered as though someone had asked it."""
-
-    def test_good_transcript_is_kept(self):
-        self.assertEqual(transcript_rejection("what time is it", [_Seg()]), "")
-
-    def test_foreign_script_is_rejected(self):
-        reason = transcript_rejection("嘿哀", [_Seg(text="嘿哀")])
-        self.assertIn("Latin", reason)
-
-    def test_the_measured_real_world_hallucination(self):
-        # Observed on the robot: "hey kai" decoded as these. The first is caught by script; the
-        # second is Latin and must fall to the confidence gate instead, not slip through.
-        self.assertNotEqual(transcript_rejection("嘿哀", [_Seg(text="嘿哀")]), "")
-        self.assertNotEqual(
-            transcript_rejection("Hẹc gai!", [_Seg(text="Hẹc gai!", avg_logprob=-1.6)]), "")
-
-    def test_low_confidence_is_rejected_even_in_english(self):
-        reason = transcript_rejection("open the door", [_Seg(avg_logprob=-2.0)])
-        self.assertIn("unintelligible", reason)
-
-    def test_the_worst_segment_decides(self):
-        # One confidently-wrong stretch is enough to make the transcript a different question than
-        # the one that was asked, so the minimum governs — not the mean.
-        segs = [_Seg(avg_logprob=-0.1), _Seg(avg_logprob=-3.0), _Seg(avg_logprob=-0.1)]
-        self.assertNotEqual(transcript_rejection("a b c", segs), "")
-
-    def test_words_decoded_out_of_silence_are_rejected(self):
-        reason = transcript_rejection("Thank you.", [_Seg(text="Thank you.", no_speech_prob=0.95)])
-        self.assertIn("no_speech_prob", reason)
-
-    def test_empty_text_is_not_a_rejection(self):
-        # Empty is handled upstream as "didn't catch that"; calling it a rejection would double-log.
-        self.assertEqual(transcript_rejection("", [_Seg(avg_logprob=-9.0)]), "")
-
-    def test_missing_fields_disable_only_that_gate(self):
-        # A faster-whisper version that renames or omits a field must degrade to "gate off", never
-        # to a TypeError that fails every turn.
-        class Bare:
-            text = "what time is it"
-
-        self.assertEqual(transcript_rejection("what time is it", [Bare()]), "")
-
-    def test_non_numeric_fields_are_ignored_rather_than_compared(self):
-        self.assertEqual(
-            transcript_rejection("hello", [_Seg(avg_logprob=MagicMock(),
-                                                no_speech_prob=MagicMock())]), "")
-
-    def test_numpy_floats_are_honoured(self):
-        # np.float64 is a numbers.Real, so it must NOT be skipped as "not a number".
-        segs = [_Seg(avg_logprob=np.float64(-2.5))]
-        self.assertNotEqual(transcript_rejection("hello", segs), "")
-
-    def test_script_guard_can_be_switched_off(self):
-        with patch("ai.voice_assistant.TRANSCRIPT_SCRIPT_GUARD", False):
-            self.assertEqual(transcript_rejection("嘿哀", [_Seg(text="嘿哀")]), "")
-
-    def test_each_gate_can_be_disabled_with_none(self):
-        with patch("ai.voice_assistant.TRANSCRIPT_MIN_AVG_LOGPROB", None):
-            self.assertEqual(transcript_rejection("hello", [_Seg(avg_logprob=-9.0)]), "")
-        with patch("ai.voice_assistant.TRANSCRIPT_MAX_NO_SPEECH_PROB", None):
-            self.assertEqual(transcript_rejection("hello", [_Seg(no_speech_prob=0.99)]), "")
-
-
-class TestProbeExplainsItself(unittest.TestCase):
-    """A rejected probe must say WHY, and the two reasons must be distinguishable.
-
-    Both used to return a bare False. "The device refused to open" and "the mic is silent" then
-    looked identical from the log — just `i2s=False` with no reason — and on 2026-08-07 that turned a
-    startup race into a hardware investigation. They need different fixes (check what is holding the
-    card vs. check the wiring), so the log has to say which one happened.
-    """
-
-    def test_open_failure_reports_the_exception(self):
-        with patch("ai.voice_assistant.sd.rec", side_effect=OSError("Device unavailable")), \
-             patch("builtins.print") as out:
-            self.assertFalse(_probe_is_live(5, 48000, 2, 0))
-        logged = " ".join(str(c) for c in out.call_args_list)
-        self.assertIn("rejected the probe", logged)
-        self.assertIn("Device unavailable", logged, "the real reason must survive to the log")
-        self.assertIn("OSError", logged)
-
-    def test_silence_is_reported_as_silence_not_as_an_error(self):
-        with patch("ai.voice_assistant.sd.rec", return_value=np.zeros((100, 1), dtype="int16")), \
-             patch("ai.voice_assistant.sd.wait"), patch("builtins.print") as out:
-            self.assertFalse(_probe_is_live(5, 48000, 1, 0))
-        logged = " ".join(str(c) for c in out.call_args_list)
-        self.assertIn("read as silent", logged)
-        self.assertNotIn("rejected the probe", logged, "silence is not an open failure")
-
-    def test_a_live_device_stays_quiet(self):
-        # One line per REJECTED candidate; the success path must not add noise to every startup.
-        with patch("ai.voice_assistant.sd.rec",
-                   return_value=np.full((100, 1), 100, dtype="int16")), \
-             patch("ai.voice_assistant.sd.wait"), patch("builtins.print") as out:
-            self.assertTrue(_probe_is_live(5, 48000, 1, 0))
-        self.assertEqual(out.call_args_list, [])
 
 
 class TestStateMachine(unittest.TestCase):
@@ -861,7 +264,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             result = va._call_ollama("hello")
         self.assertEqual(result, "reply")
         _, kwargs = mock_post.call_args
@@ -881,7 +284,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
              patch("ai.voice_assistant.rag.retrieve_context", return_value="CONTEXT_TEXT"), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va._call_ollama("hello")
         messages = mock_post.call_args[1]["json"]["messages"]
         system_msg, user_msg = messages[0], messages[-1]
@@ -901,7 +304,7 @@ class TestCallOllama(unittest.TestCase):
         with patch("ai.voice_assistant.RAG_CONTEXT_PLACEMENT", "system"), \
              patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
              patch("ai.voice_assistant.rag.retrieve_context", return_value="CONTEXT_TEXT"), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va._call_ollama("hello")
         messages = mock_post.call_args[1]["json"]["messages"]
         self.assertIn("PERSONA_TEXT", messages[0]["content"])
@@ -915,7 +318,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.rag.retrieve_context", return_value="CONTEXT_TEXT"), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp), \
+             patch("ai.llm.requests.post", return_value=mock_resp), \
              patch.object(va, "_transcribe", return_value="hello"), \
              patch.object(va, "_speak"):
             va._process(np.zeros(16000, dtype=np.int16), rate=16000)
@@ -930,7 +333,7 @@ class TestCallOllama(unittest.TestCase):
             "eval_count": 40, "eval_duration": 2_000_000_000,                # 2 s -> 20 tok/s
         }
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp):
+             patch("ai.llm.requests.post", return_value=mock_resp):
             va._call_ollama("hello")
         t = va.stage_timings()
         self.assertEqual(t["llm_prompt_ms"], 200)
@@ -945,7 +348,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp):
+             patch("ai.llm.requests.post", return_value=mock_resp):
             self.assertEqual(va._call_ollama("hello"), "reply")
         self.assertEqual(va.stage_timings()["llm_tok_s"], 0.0)
 
@@ -955,7 +358,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
              patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va._call_ollama("hello")
         messages = mock_post.call_args[1]["json"]["messages"]
         self.assertEqual(messages[0]["content"], "PERSONA_TEXT")
@@ -966,7 +369,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va._call_ollama("hello")
         _, kwargs = mock_post.call_args
         self.assertIn("timeout", kwargs)
@@ -977,7 +380,7 @@ class TestCallOllama(unittest.TestCase):
     def test_connection_error_raises_runtime_error(self):
         va = make_assistant()
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", side_effect=requests.exceptions.ConnectionError()):
+             patch("ai.llm.requests.post", side_effect=requests.exceptions.ConnectionError()):
             with self.assertRaises(RuntimeError):
                 va._call_ollama("hello")
 
@@ -985,7 +388,7 @@ class TestCallOllama(unittest.TestCase):
 class TestEnsureLlmWarm(unittest.TestCase):
     def test_swallows_connection_error(self):
         va = make_assistant()
-        with patch("ai.voice_assistant.requests.post", side_effect=requests.exceptions.ConnectionError()):
+        with patch("ai.llm.requests.post", side_effect=requests.exceptions.ConnectionError()):
             va.ensure_llm_warm()  # must not raise
 
     def test_posts_a_trivial_request(self):
@@ -995,7 +398,7 @@ class TestEnsureLlmWarm(unittest.TestCase):
         # log_model_placement patched out: it is diagnostics-only, and unpatched it would reach for a
         # real Ollama on localhost from the test suite.
         with patch("ai.voice_assistant.log_model_placement"), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va.ensure_llm_warm()
         mock_post.assert_called_once()
 
@@ -1006,128 +409,17 @@ class TestEnsureLlmWarm(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "hi"}}
         with patch("ai.voice_assistant.log_model_placement") as mock_ps, \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp):
+             patch("ai.llm.requests.post", return_value=mock_resp):
             va.ensure_llm_warm()
         mock_ps.assert_called_once()
 
     def test_skips_placement_probe_when_warm_up_failed(self):
         va = make_assistant()
         with patch("ai.voice_assistant.log_model_placement") as mock_ps, \
-             patch("ai.voice_assistant.requests.post",
+             patch("ai.llm.requests.post",
                    side_effect=requests.exceptions.ConnectionError()):
             va.ensure_llm_warm()
         mock_ps.assert_not_called()
-
-
-class TestLogModelPlacement(unittest.TestCase):
-    def _resp(self, payload):
-        r = MagicMock()
-        r.json.return_value = payload
-        return r
-
-    def test_reports_a_full_gpu_offload(self):
-        payload = {"models": [{"name": f"{OLLAMA_MODEL}", "size": 2000, "size_vram": 2000}]}
-        with patch("ai.voice_assistant.requests.get", return_value=self._resp(payload)):
-            out = voice_assistant.log_model_placement()
-        self.assertEqual(out["gpu_pct"], 100.0)
-
-    def test_reports_a_partial_offload(self):
-        """The ~2x slowdown this whole probe exists to make visible."""
-        payload = {"models": [{"name": f"{OLLAMA_MODEL}", "size": 2000, "size_vram": 900}]}
-        with patch("ai.voice_assistant.requests.get", return_value=self._resp(payload)):
-            out = voice_assistant.log_model_placement()
-        self.assertEqual(out["gpu_pct"], 45.0)
-
-    def test_never_raises_when_ollama_is_unreachable(self):
-        with patch("ai.voice_assistant.requests.get",
-                   side_effect=requests.exceptions.ConnectionError()):
-            self.assertEqual(voice_assistant.log_model_placement(), {})
-
-    def test_handles_model_not_loaded(self):
-        with patch("ai.voice_assistant.requests.get", return_value=self._resp({"models": []})):
-            self.assertEqual(voice_assistant.log_model_placement(), {})
-
-
-class TestSplitSentences(unittest.TestCase):
-    def test_splits_on_terminal_punctuation(self):
-        self.assertEqual(_split_sentences("Hi there. How are you?"), ["Hi there.", "How are you?"])
-
-    def test_no_punctuation_is_one_sentence(self):
-        self.assertEqual(_split_sentences("didn't catch that"), ["didn't catch that"])
-
-    def test_empty_returns_empty(self):
-        self.assertEqual(_split_sentences("   "), [])
-
-
-class TestSpeakSegments(unittest.TestCase):
-    def test_one_segment_per_sentence(self):
-        _, segs = _speak_segments("First one. Second one here.", 0.0)
-        self.assertEqual(len(segs), 2)
-
-    def test_short_sentence_hits_min_floor(self):
-        _, segs = _speak_segments("Hi.", 0.0)
-        self.assertAlmostEqual(segs[0][1] - segs[0][0], SPEAK_MIN_SENTENCE_S)
-
-    def test_gap_between_sentences(self):
-        _, segs = _speak_segments("One two three. Four five six.", 0.0)
-        gap = segs[1][0] - segs[0][1]
-        self.assertAlmostEqual(gap, SPEAK_GAP_S)
-
-    def test_longer_sentence_stays_open_longer(self):
-        _, short = _speak_segments("Hi there now.", 0.0)
-        _, long  = _speak_segments("Hi there now this is a much longer sentence indeed.", 0.0)
-        self.assertLess(short[0][1] - short[0][0], long[0][1] - long[0][0])
-
-    def test_runaway_reply_capped_at_max(self):
-        text = ". ".join(["word " * 5 for _ in range(100)])
-        _, segs = _speak_segments(text, 0.0)
-        self.assertLessEqual(segs[-1][1], SPEAK_MAX_S)
-
-    def test_empty_text_still_produces_a_segment(self):
-        _, segs = _speak_segments("", 0.0)
-        self.assertEqual(len(segs), 1)
-
-
-class TestSpeakingOpennessAt(unittest.TestCase):
-    def test_none_when_no_schedule(self):
-        self.assertIsNone(speaking_openness_at(5.0, None, ()))
-        self.assertIsNone(speaking_openness_at(5.0, 0.0, ()))
-
-    def test_none_before_start(self):
-        _, segs = _speak_segments("Hello there friend.", 10.0)
-        self.assertIsNone(speaking_openness_at(9.0, 10.0, segs))
-
-    def test_none_after_last_sentence(self):
-        _, segs = _speak_segments("Hello there friend.", 0.0)
-        end = segs[-1][1]
-        self.assertIsNone(speaking_openness_at(end, 0.0, segs))
-        self.assertIsNone(speaking_openness_at(end + 1.0, 0.0, segs))
-
-    def test_openness_within_bounds(self):
-        _, segs = _speak_segments("Hello there friend. Nice to meet you.", 0.0)
-        t = 0.0
-        while t < segs[-1][1]:
-            o = speaking_openness_at(t, 0.0, segs)
-            self.assertIsNotNone(o)
-            self.assertGreaterEqual(o, 0.0)
-            self.assertLessEqual(o, SPEAK_AMP + 1e-9)
-            t += 0.02
-
-    def test_opens_at_start_holds_then_closes(self):
-        # A single long sentence: closed-ish at the very edges, wide open in the middle.
-        _, segs = _speak_segments("This is one nice long spoken sentence for testing.", 0.0)
-        s0, s1 = segs[0]
-        mid   = speaking_openness_at((s0 + s1) / 2.0, 0.0, segs)
-        start = speaking_openness_at(s0 + 0.001, 0.0, segs)
-        end   = speaking_openness_at(s1 - 0.001, 0.0, segs)
-        self.assertAlmostEqual(mid, SPEAK_AMP)   # held fully open through the middle
-        self.assertLess(start, mid * 0.5)         # ramps open from ~closed
-        self.assertLess(end, mid * 0.5)           # ramps closed at the end
-
-    def test_mouth_closed_between_sentences(self):
-        _, segs = _speak_segments("First sentence here. Second sentence here.", 0.0)
-        gap_t = (segs[0][1] + segs[1][0]) / 2.0   # midpoint of the between-sentence pause
-        self.assertEqual(speaking_openness_at(gap_t, 0.0, segs), 0.0)
 
 
 class TestSpeakingIntegration(unittest.TestCase):
@@ -1143,7 +435,7 @@ class TestSpeakingIntegration(unittest.TestCase):
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""):
             mock_resp = MagicMock()
             mock_resp.json.return_value = {"message": {"content": "hello there friend"}}
-            with patch("ai.voice_assistant.requests.post", return_value=mock_resp), \
+            with patch("ai.llm.requests.post", return_value=mock_resp), \
                  patch.object(va, "_transcribe", return_value="hi"):
                 va._process(np.zeros((10, 1), dtype="int16"))
         self.assertEqual(va.get_status()["voice_status"], STATUS_DONE)
@@ -1156,42 +448,6 @@ class TestSpeakingIntegration(unittest.TestCase):
             va._process(np.zeros((10, 1), dtype="int16"))
         self.assertEqual(va.get_status()["voice_response"], NO_SPEECH_RESPONSE)
         self.assertTrue(va.get_status()["voice_speaking"])
-
-
-class TestSpeakSegmentsForDuration(unittest.TestCase):
-    def test_fills_requested_duration_exactly(self):
-        _, segs = _speak_segments_for_duration("One two. Three four.", 0.0, 5.0)
-        self.assertAlmostEqual(segs[-1][1], 5.0, places=6)
-
-    def test_one_segment_per_sentence(self):
-        _, segs = _speak_segments_for_duration("A here. B here. C here.", 0.0, 3.0)
-        self.assertEqual(len(segs), 3)
-
-    def test_longer_sentence_gets_more_time(self):
-        _, segs = _speak_segments_for_duration("Hi. This one is quite a bit longer indeed.", 0.0, 6.0)
-        self.assertLess(segs[0][1] - segs[0][0], segs[1][1] - segs[1][0])
-
-    def test_gap_between_sentences_and_still_fills_duration(self):
-        _, segs = _speak_segments_for_duration("One two three. Four five six.", 0.0, 4.0)
-        self.assertAlmostEqual(segs[1][0] - segs[0][1], SPEAK_GAP_S, places=6)
-        self.assertAlmostEqual(segs[-1][1], 4.0, places=6)
-
-    def test_zero_duration_is_empty(self):
-        _, segs = _speak_segments_for_duration("Hello.", 0.0, 0.0)
-        self.assertEqual(segs, ())
-
-    def test_negative_duration_is_empty(self):
-        _, segs = _speak_segments_for_duration("Hello.", 0.0, -2.0)
-        self.assertEqual(segs, ())
-
-    def test_empty_text_single_segment_filling_duration(self):
-        _, segs = _speak_segments_for_duration("   ", 0.0, 2.0)
-        self.assertEqual(len(segs), 1)
-        self.assertAlmostEqual(segs[-1][1], 2.0, places=6)
-
-    def test_start_time_is_passed_through(self):
-        start, _ = _speak_segments_for_duration("Hello there.", 12.5, 2.0)
-        self.assertEqual(start, 12.5)
 
 
 class _InlineThread:
@@ -1419,21 +675,6 @@ def _info(language, probs=None, prob=0.9):
     info.language_probability = prob
     info.all_language_probs = probs
     return info
-
-
-class TestBestAllowedLanguage(unittest.TestCase):
-    def test_picks_the_highest_scoring_allowed_language(self):
-        info = _info("cy", [("cy", 0.5), ("tl", 0.3), ("en", 0.1), ("nn", 0.05)])
-        self.assertEqual(_best_allowed_language(info, ("en", "tl")), "tl")
-
-    def test_ignores_disallowed_languages_however_confident(self):
-        info = _info("nn", [("nn", 0.99), ("en", 0.001)])
-        self.assertEqual(_best_allowed_language(info, ("en", "tl")), "en")
-
-    def test_falls_back_to_the_first_allowed_when_probs_are_missing(self):
-        # Older faster-whisper builds don't populate all_language_probs; guess nothing.
-        self.assertEqual(_best_allowed_language(_info("cy", None), ("en", "tl")), "en")
-        self.assertEqual(_best_allowed_language(_info("cy", []), ("tl", "en")), "tl")
 
 
 class TestLanguageRestriction(unittest.TestCase):
@@ -2096,9 +1337,9 @@ class TestSpeechOwnership(unittest.TestCase):
              patch("ai.voice_assistant.tts.play"), \
              patch("ai.voice_assistant.tts.stop") as mock_stop, \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/kai_canned_filler_op_tl_0.wav", "opener", epoch=va.epoch)
+            va.speak_wav("/tmp/kai_canned_filler_op_tl_0.wav", "opener", epoch=va.epoch)
             mock_stop.reset_mock()
-            va._speak_wav("/tmp/kai_canned_ack.wav", "Yes?", epoch=va.epoch)
+            va.speak_wav("/tmp/kai_canned_ack.wav", "Yes?", epoch=va.epoch)
         mock_stop.assert_called_once()
 
 
@@ -2110,7 +1351,7 @@ class TestSpeakWav(unittest.TestCase):
         with patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
              patch("ai.voice_assistant.tts.play") as mock_play, \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/kai_ack/kai_canned_ack.wav", "Yes?", epoch=va.epoch)
+            va.speak_wav("/tmp/kai_ack/kai_canned_ack.wav", "Yes?", epoch=va.epoch)
         mock_play.assert_called_once_with("/tmp/kai_ack/kai_canned_ack.wav")
         self.assertIsNotNone(va._speak_start)
         self.assertAlmostEqual(va._speak_segments[-1][1], 0.6, places=6)
@@ -2121,7 +1362,7 @@ class TestSpeakWav(unittest.TestCase):
              patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
              patch("ai.voice_assistant.tts.play"), \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/x.wav", "Yes?")
+            va.speak_wav("/tmp/x.wav", "Yes?")
         mock_synth.assert_not_called()
 
     def test_leaves_status_and_response_untouched(self):
@@ -2130,7 +1371,7 @@ class TestSpeakWav(unittest.TestCase):
         with patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
              patch("ai.voice_assistant.tts.play"), \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/x.wav", "Yes?")
+            va.speak_wav("/tmp/x.wav", "Yes?")
         status = va.get_status()
         self.assertEqual(status["voice_status"], STATUS_IDLE)
         self.assertEqual(status["voice_response"], "")
@@ -2142,7 +1383,7 @@ class TestSpeakWav(unittest.TestCase):
         with patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
              patch("ai.voice_assistant.tts.play") as mock_play, \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/x.wav", "Yes?", epoch=epoch)
+            va.speak_wav("/tmp/x.wav", "Yes?", epoch=epoch)
         mock_play.assert_not_called()
 
 
