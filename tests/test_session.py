@@ -114,7 +114,7 @@ class FakeVoice:
 
     def __init__(self):
         self._epoch = 0
-        self._whisper_model = object()      # "warm"
+        self.stt_ready = True               # the turn model is loaded
         self.scan_ready = True              # the tiny wake-scan model is pre-warmed
         self.speaking = False
         self.gate_open = True               # mic_muted() returns `not gate_open`
@@ -169,11 +169,11 @@ class FakeVoice:
     def mic_muted(self, now=None):
         return not self.gate_open
 
-    def _speak(self, text, epoch=None):
+    def speak_text(self, text, epoch=None):
         self.spoken.append(text)
         self.speaking = True
 
-    def _speak_wav(self, wav, jaw_text, epoch=None):
+    def speak_wav(self, wav, jaw_text, epoch=None):
         self.spoken_wavs.append((wav, jaw_text))
         self.speaking = True
 
@@ -437,7 +437,7 @@ class TestWakeAcceptance(SessionCase):
     def test_wake_before_whisper_is_warm_is_ignored(self):
         # Otherwise the first wake looks like a hang and blows every timer.
         s = self.make()
-        self.voice._whisper_model = None
+        self.voice.stt_ready = False
         self.assertFalse(s.on_wake(T0))
         self.assertEqual(s.state, STATE_IDLE)
         self.assertEqual(s.get_status()["sess_wake_rejected_not_ready"], 1)
@@ -1075,7 +1075,7 @@ class TestReady(SessionCase):
 
     def test_not_ready_before_whisper_loads(self):
         s = self.make()
-        self.voice._whisper_model = None
+        self.voice.stt_ready = False
         self.assertFalse(s.ready)
 
     def test_not_ready_when_the_wake_word_failed_but_hands_free_is_on(self):
@@ -1565,7 +1565,7 @@ class TestFiller(SessionCase):
         # CACHED keys alone (filler is never synthesised live), so a cold bank here would make
         # every test below silently exercise the "Hmm" fallback while appearing to test the bank.
         s._canned.update({k: f"/tmp/{k}.wav" for k in filler.canned_lines()})
-        # FakeVoice latches speaking=True in _speak_wav and nothing in a tick loop ever clears it,
+        # FakeVoice latches speaking=True in speak_wav and nothing in a tick loop ever clears it,
         # so a fake left to itself reports the opener still playing forever and no stall could
         # follow it. Driving speech_in_flight from the same flag as is_playing keeps the two
         # consistent; the one test that needs them to DISAGREE says so explicitly.
@@ -1653,7 +1653,7 @@ class TestFiller(SessionCase):
 
     def test_the_overlap_guard_covers_the_gap_before_playback_starts(self):
         # Bug 3, heard on the robot as fillers talking over each other. The loop used to guard on
-        # tts.is_playing(), which only goes true once a playback PROCESS exists -- and _speak_wav
+        # tts.is_playing(), which only goes true once a playback PROCESS exists -- and speak_wav
         # hands off to a worker thread first. At 20 Hz that left several ticks where a line had been
         # started but was not yet "playing", and every one of them started another. So this is the
         # one case where the two seams must DISAGREE: nothing is playing, speech is in flight, and

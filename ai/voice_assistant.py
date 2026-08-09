@@ -202,6 +202,14 @@ class VoiceAssistant:
                   f"/{WHISPER_COMPUTE}", flush=True)
 
     @property
+    def stt_ready(self) -> bool:
+        """True once the turn model is loaded, so a wake can be answered rather than looking like a
+        hang. ai/session.py's `ready` folds this in; before this existed it read _whisper_model
+        directly, which is the kind of reach-through that makes a stub in a test guess at internals.
+        """
+        return self._whisper_model is not None
+
+    @property
     def scan_ready(self) -> bool:
         """True when wake-phrase spotting can run without paying a model load inside the check."""
         return self._scan_model is not None or self._whisper_model is not None
@@ -659,12 +667,16 @@ class VoiceAssistant:
             if gen == self._speech_gen:
                 self._tts_active = False
 
-    def _speak_wav(self, wav: Path, jaw_text: str, epoch: int | None = None) -> None:
+    def speak_wav(self, wav: Path, jaw_text: str, epoch: int | None = None) -> None:
         """Speak an already-synthesized WAV (see tts.prewarm_canned) with the jaw synced to it.
 
         Used for the wake acknowledgement, where live synthesis would put 0.5-1.5 s of dead air
         between "Hey Kai" and "Yes?". Deliberately does NOT touch _status or _response: routing the
-        ack through say() would make the dashboard post a "Kai: Yes?" chat bubble on every wake."""
+        ack through say() would make the dashboard post a "Kai: Yes?" chat bubble on every wake.
+
+        Public because ai/session.py is its caller — every canned line, every filler line and the
+        ack all arrive here. Anything spoken that is NOT a turn goes through this method or
+        speak_text(), never through say()."""
         def _worker() -> None:
             try:
                 duration = tts.wav_duration(wav)
@@ -683,6 +695,15 @@ class VoiceAssistant:
 
         gen = self._begin_speech()
         threading.Thread(target=_worker, daemon=True, name="kai-tts-canned").start()
+
+    def speak_text(self, text: str, epoch: int | None = None) -> None:
+        """Say `text` aloud with the jaw synced to it, without touching turn status.
+
+        The fallback sibling of speak_wav(), for when a canned line was never synthesized and
+        ai/session.py has to fall back to live synthesis. Same contract: no _status, no _response,
+        so no chat bubble. Do not use it for a reply — that is what say() and process_utterance()
+        are for, and they are what the dashboard's transcript is built from."""
+        self._speak(text, epoch=epoch)
 
     def transcribe_async(self, audio: np.ndarray, rate: int, on_done, token=None,
                          log_language: bool = True) -> None:

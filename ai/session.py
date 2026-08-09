@@ -946,7 +946,7 @@ class ConversationSession:
         itself makes the wait it is covering longer. Silence is the correct degradation."""
         wav = self._canned.get(key)
         if wav is not None:
-            self._voice._speak_wav(wav, filler.text_for(key), epoch=self._epoch)
+            self._voice.speak_wav(wav, filler.text_for(key), epoch=self._epoch)
 
     def _tick_filler(self, now: float, elapsed: float) -> bool:
         """Caller holds the lock. Drive the filler for one tick of a BUSY turn. True if the filler
@@ -1015,7 +1015,7 @@ class ConversationSession:
         # speaking — that is what would turn two lines into one garbled overlap.
         #
         # speech_in_flight(), NOT tts.is_playing(). is_playing() only goes true once a playback
-        # PROCESS exists, and _speak_wav hands off to a worker thread first; at 20 Hz that leaves
+        # PROCESS exists, and speak_wav hands off to a worker thread first; at 20 Hz that leaves
         # several ticks where a line has been started but is not yet "playing", and each of those
         # ticks happily started another one. That is the overlap heard on the robot — three stalls
         # talking over each other. speech_in_flight covers the whole span from before synthesis to
@@ -1044,9 +1044,9 @@ class ConversationSession:
         post a spurious "Kai: Yes?" chat bubble on every single wake."""
         wav = self._canned.get(key)
         if wav is not None:
-            self._voice._speak_wav(wav, fallback, epoch=self._epoch)
+            self._voice.speak_wav(wav, fallback, epoch=self._epoch)
         else:
-            self._voice._speak(fallback, epoch=self._epoch)
+            self._voice.speak_text(fallback, epoch=self._epoch)
 
     # ── state + timers ──────────────────────────────────────────────────────
 
@@ -1294,7 +1294,7 @@ class ConversationSession:
             return False
         if self.enabled and not self._mic.wake.ready:
             return False
-        return self._voice._whisper_model is not None
+        return self._voice.stt_ready
 
     @property
     def state(self) -> str:

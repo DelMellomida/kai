@@ -1337,9 +1337,9 @@ class TestSpeechOwnership(unittest.TestCase):
              patch("ai.voice_assistant.tts.play"), \
              patch("ai.voice_assistant.tts.stop") as mock_stop, \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/kai_canned_filler_op_tl_0.wav", "opener", epoch=va.epoch)
+            va.speak_wav("/tmp/kai_canned_filler_op_tl_0.wav", "opener", epoch=va.epoch)
             mock_stop.reset_mock()
-            va._speak_wav("/tmp/kai_canned_ack.wav", "Yes?", epoch=va.epoch)
+            va.speak_wav("/tmp/kai_canned_ack.wav", "Yes?", epoch=va.epoch)
         mock_stop.assert_called_once()
 
 
@@ -1351,7 +1351,7 @@ class TestSpeakWav(unittest.TestCase):
         with patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
              patch("ai.voice_assistant.tts.play") as mock_play, \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/kai_ack/kai_canned_ack.wav", "Yes?", epoch=va.epoch)
+            va.speak_wav("/tmp/kai_ack/kai_canned_ack.wav", "Yes?", epoch=va.epoch)
         mock_play.assert_called_once_with("/tmp/kai_ack/kai_canned_ack.wav")
         self.assertIsNotNone(va._speak_start)
         self.assertAlmostEqual(va._speak_segments[-1][1], 0.6, places=6)
@@ -1362,7 +1362,7 @@ class TestSpeakWav(unittest.TestCase):
              patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
              patch("ai.voice_assistant.tts.play"), \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/x.wav", "Yes?")
+            va.speak_wav("/tmp/x.wav", "Yes?")
         mock_synth.assert_not_called()
 
     def test_leaves_status_and_response_untouched(self):
@@ -1371,7 +1371,7 @@ class TestSpeakWav(unittest.TestCase):
         with patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
              patch("ai.voice_assistant.tts.play"), \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/x.wav", "Yes?")
+            va.speak_wav("/tmp/x.wav", "Yes?")
         status = va.get_status()
         self.assertEqual(status["voice_status"], STATUS_IDLE)
         self.assertEqual(status["voice_response"], "")
@@ -1383,7 +1383,7 @@ class TestSpeakWav(unittest.TestCase):
         with patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
              patch("ai.voice_assistant.tts.play") as mock_play, \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
-            va._speak_wav("/tmp/x.wav", "Yes?", epoch=epoch)
+            va.speak_wav("/tmp/x.wav", "Yes?", epoch=epoch)
         mock_play.assert_not_called()
 
 
