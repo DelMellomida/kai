@@ -27,6 +27,7 @@ import numpy as np
 import sounddevice as sd
 from scipy.signal import resample_poly
 
+from ai import delivery
 from ai import rag
 from ai import tts
 from ai.audio import normalize_for_asr
@@ -561,7 +562,9 @@ class VoiceAssistant:
         the mouth still moves. MUST be called OUTSIDE self._lock — it acquires the lock itself.
 
         NOTE: `reply` (with emoji) is what the UI shows; the SPOKEN text has emoji/symbols stripped
-        (tts.clean_for_speech) so they aren't read aloud, and the jaw is timed to that spoken text.
+        (tts.clean_for_speech) and is then delivery-shaped (ai/delivery.shape — breaths, an occasional
+        opener) so it is not read out flat. The UI text is never shaped; the jaw is timed to the
+        spoken text, which is why the shaping happens before the segments are built.
 
         `epoch` versions the whole worker. Synthesis takes 0.5-1.5 s and playback can take many
         seconds, so a session can end mid-flight; without the checks below this reply would be spoken
@@ -573,7 +576,10 @@ class VoiceAssistant:
         (the say()/canned paths, which have no turn behind them) just skips the measurement."""
         # Clamp only what gets SPOKEN — the dashboard still shows the whole reply. Kai is deaf while
         # talking (barge-in is off), so an over-long reply is an over-long deaf spell.
-        spoken = tts.clamp_for_speech(tts.clean_for_speech(reply), TTS_MAX_SPOKEN_CHARS)
+        # Shape BEFORE the clamp so the added commas/opener count against the spoken-character
+        # budget rather than sneaking past it, and so the clamp still cuts at a sentence end.
+        spoken = tts.clamp_for_speech(
+            delivery.shape(tts.clean_for_speech(reply)), TTS_MAX_SPOKEN_CHARS)
         jaw_text = spoken or reply           # if a reply is emoji-only, still mime to the original
 
         def _pantomime() -> None:
@@ -588,7 +594,7 @@ class VoiceAssistant:
             tts.stop()                       # cut off any previous reply still playing
             try:
                 synth_t0 = time.monotonic()
-                wav = tts.synthesize(spoken)
+                wav = tts.synthesize(spoken, length_scale=delivery.length_scale(spoken))
                 if turn_t0 is not None:
                     with self._lock:
                         self._stage_ms["tts_synth_ms"] = int((time.monotonic() - synth_t0) * 1000)

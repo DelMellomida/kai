@@ -510,7 +510,41 @@ class TestSpeak(unittest.TestCase):
              patch("ai.voice_assistant.tts.play"), \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
             va._speak("Hello there! 😀🎉")
-        mock_synth.assert_called_once_with("Hello there!")
+        # Positional arg only: _speak also passes the per-reply tempo jitter (ai/delivery), which is
+        # not what this test is about. Two words, so no delivery shaping applies to the text itself.
+        mock_synth.assert_called_once()
+        self.assertEqual(mock_synth.call_args.args[0], "Hello there!")
+
+    def test_spoken_text_is_delivery_shaped_but_the_ui_text_is_not(self):
+        # The shaping (ai/delivery) exists because the voice model cannot be improved on this board —
+        # see docs/expressive-voice-plan.md. It must reach Piper and stop there: the dashboard shows
+        # what the LLM actually said, exactly as with the emoji stripping above.
+        va = make_assistant()
+        reply = "The DEVCON program runs all year long but the internships open in March."
+        with patch("ai.voice_assistant.tts.enabled", return_value=True), \
+             patch("ai.voice_assistant.tts.stop"), \
+             patch("ai.voice_assistant.tts.synthesize", return_value="/tmp/kai_tts.wav") as mock_synth, \
+             patch("ai.voice_assistant.tts.wav_duration", return_value=2.0), \
+             patch("ai.voice_assistant.tts.play"), \
+             patch("ai.voice_assistant.delivery.shape", return_value="SHAPED") as mock_shape, \
+             patch("ai.voice_assistant.threading.Thread", _InlineThread):
+            va._speak(reply)
+        mock_shape.assert_called_once_with(reply)
+        self.assertEqual(mock_synth.call_args.args[0], "SHAPED")
+
+    def test_shaping_off_passes_no_length_scale_override(self):
+        # Shaping off must be byte-identical to the behaviour before ai/delivery existed: no scale
+        # argument at all, so ai/tts._run_piper goes on reading the live dashboard rate itself.
+        va = make_assistant()
+        with patch("ai.voice_assistant.tts.enabled", return_value=True), \
+             patch("ai.voice_assistant.tts.stop"), \
+             patch("ai.voice_assistant.tts.synthesize", return_value="/tmp/kai_tts.wav") as mock_synth, \
+             patch("ai.voice_assistant.tts.wav_duration", return_value=2.0), \
+             patch("ai.voice_assistant.tts.play"), \
+             patch("ai.voice_assistant.delivery.enabled", return_value=False), \
+             patch("ai.voice_assistant.threading.Thread", _InlineThread):
+            va._speak("The DEVCON program runs all year long and takes volunteers.")
+        self.assertIsNone(mock_synth.call_args.kwargs["length_scale"])
 
 
 class TestCleanForSpeech(unittest.TestCase):
@@ -1264,7 +1298,7 @@ class TestSpeakStaleEpoch(unittest.TestCase):
         va = make_assistant()
         epoch = va.epoch
 
-        def synth(text):
+        def synth(text, length_scale=None):
             va.bump_epoch()
             return "/tmp/kai_tts.wav"
 

@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 from config.thinking import THINKING_SOUNDS, THINKING_SWEEP
-from config.voice import TTS_ENABLED, TTS_LENGTH_SCALE, TTS_VOLUME
+from config.voice import DELIVERY_ENABLED, TTS_ENABLED, TTS_LENGTH_SCALE, TTS_VOLUME
 from config.wake import HANDS_FREE_ENABLED, VAD_RMS_FLOOR, WAKE_SENSITIVITIES
 
 # Module constant, not a config knob: tests patch it. Kept out of config/ deliberately — this file's
@@ -75,6 +75,10 @@ _SPECS: dict[str, Spec] = {
     "tts_enabled":      Spec("bool",   TTS_ENABLED),
     "tts_volume":       Spec("float",  TTS_VOLUME,       lo=0.0,  hi=2.0),
     "tts_length_scale": Spec("float",  TTS_LENGTH_SCALE, lo=0.5,  hi=2.0),
+    # Delivery shaping (ai/delivery.py) — breaths, opener, per-reply tempo jitter. PULL-read once per
+    # reply, and live on purpose: it is a change only an ear can judge, so it has to be flippable
+    # mid-conversation to A/B against the unshaped voice.
+    "delivery_shaping": Spec("bool",   DELIVERY_ENABLED),
     "vad_rms_floor":    Spec("float",  VAD_RMS_FLOOR,    lo=50.0, hi=5000.0),
     "wake_sensitivity": Spec("float",  WAKE_SENSITIVITIES[0] if WAKE_SENSITIVITIES else 0.5,
                              lo=0.0, hi=1.0),
