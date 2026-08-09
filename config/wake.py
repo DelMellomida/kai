@@ -218,6 +218,24 @@ ACK_PRESYNTH   = True
 CANNED_NO_SPEECH = "Sorry, I didn't catch that."
 CANNED_ERROR     = "Sorry, something went wrong."
 
+# ── Startup greeting ─────────────────────────────────────────────────────────────
+# Said ONCE per process, shortly after the service comes up (ai/session._warm_all). Two jobs, and
+# the second is the reason it earns its place: it tells whoever is standing there that this is Kai
+# and how to address it — the wake phrase is not discoverable by looking at the robot — and it is
+# an end-to-end proof that Piper, sox, the USB dongle and the amp are all working, at the moment
+# where that is cheapest to notice. Before this, the first evidence that audio was alive at all was
+# someone saying "Hey Kai" into a robot that then failed silently (see TTS_ASSERT_CARD_PROFILE in
+# config/voice.py for how invisible that failure mode is).
+#
+# Spoken through speak_text(), NOT say(): no LLM call, no turn status, and so no chat bubble on the
+# dashboard — this is Kai talking to the room, not a turn anybody took.
+GREETING_ENABLED = True
+# Keep it short and keep the wake phrase in it. It is synthesized live (once, so caching it would
+# only mean re-synthesising it on every voice change for a line that will never be said again), and
+# it plays while the filler bank is still cold — so a long greeting is dead air the robot cannot
+# fill. Set GREETING_ENABLED False for a silent boot (a demo table, a quiet room).
+GREETING_TEXT = "Hi, I'm Kai. Say Hey Kai, and ask me anything about DEVCON."
+
 # ── Always-open capture ──────────────────────────────────────────────────────────
 # 1536 = 3 x WAKE_FRAME_LENGTH: at I2S_CAPTURE_RATE (48 kHz) each callback decimates to exactly one
 # 512-sample Porcupine frame at 16 kHz, so there is no partial-frame buffering anywhere. 32 ms of

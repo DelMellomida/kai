@@ -30,8 +30,14 @@ line is unbearable:
 
 | Tier | Count | Length | Played |
 |---|---|---|---|
-| **Openers** (`FILLER_OPENERS`) | 20 | 1–2 sentences | exactly one per turn, first |
-| **Stalls** (`FILLER_STALLS`) | 20 | 1–4 words | on a loop after the opener, as many times as needed |
+| **Openers** (`FILLER_OPENERS`) | 20 (tl 12 / ceb 4 / en 4) | 1–2 sentences | exactly one per turn, first |
+| **Stalls** (`FILLER_STALLS`) | 32 (tl 12 / ceb 10 / en 10) | 1–4 words | on a loop after the opener, as many times as needed |
+
+The stalls do not follow the openers' 60/20/20 split, and that asymmetry is deliberate. An opener
+is drawn once per turn, so its per-language count only has to outlast a *conversation*. Stalls
+loop until the answer lands — a ~10 s wait spends three or four — so what governs whether a line
+repeats is the size of **one language's pool**, not the bank total. At four lines, `ceb` and `en`
+lapped inside a single wait.
 
 Openers are long enough to buy several seconds and to carry a real fact about Kai, so the wait
 teaches the audience something instead of just filling air. Stalls carry nothing — they exist
@@ -60,8 +66,9 @@ order twice in a row is exactly what makes canned audio read as canned.
   spoken in this conversation, and excluding the previous turn's line even after that history is
   cleared.
 - **Stalls** — the language's list is *shuffled once per turn* and consumed in that order,
-  refilling when exhausted. A plain per-gap random draw repeats far more often than it feels
-  like it should; shuffling is what makes a long wait cycle through varied phrases.
+  refilling when exhausted, and never re-opening with the line that just played. A plain per-gap
+  random draw repeats far more often than it feels like it should; shuffling is what makes a long
+  wait cycle through varied phrases.
 - **Timing** — the pre-opener delay and every inter-stall gap are drawn fresh from
   `FILLER_DELAY_JITTER_S` and `FILLER_STALL_GAP_JITTER_S`. A constant delay makes the opener
   land like a timer going off, and the ear picks that up immediately. Draws happen once per
@@ -91,6 +98,33 @@ to repeat once everything has been heard would trade a small tell for the exact 
 module exists to prevent. An exhausted set quietly starts a second lap. The *warm* filter is not
 relaxed that way — an uncached line plays nothing at all, so selecting one would put a gap
 exactly where the ceiling forbids it.
+
+### What the second lap costs, and the three guards on it
+
+Heard on the robot, 2026-08-09: **the same stall twice inside one exchange**. Not a selection bug
+on its own — three things had to line up, and each is now guarded separately.
+
+1. **The lap boundary was unguarded.** `pick_opener` has always excluded the previous line;
+   `stall_queue` had no equivalent, and the session pops from the *end* of the shuffled list. So
+   when a lap ended, the shuffle was free to put the line still ringing in the room next in the
+   queue's mouth — a 1-in-N back-to-back repeat at every boundary. `stall_queue(avoid=…)` now
+   rotates that key to the front instead. Rotated, not dropped: dropping would cost the lap a
+   line to protect the one gap it is least likely to be heard in.
+2. **One `used` set collapsed too early.** It is conversation-scoped, so from turn two of a
+   conversation that had been through the bank it was permanently full — every turn started on
+   the fallback lap with no preference left at all. The soft filter is now a **ladder**:
+   conversation-spent first, then `_filler_turn_stalls` (cleared by `_arm_filler`), then the full
+   bank. The weaker promise that survives an exhausted conversation is *nothing twice inside one
+   wait*, which is where the ear actually catches it.
+3. **The pools were too small to lap slowly.** `ceb` and `en` held four stalls each against a
+   wait that spends three or four. Both are now ten. No amount of selection logic fixes a pool
+   that a single wait can drain — the guards above only choose *which* line repeats.
+
+The length cap makes this worse invisibly: `_within_length_cap` drops any stall over
+`FILLER_MAX_STALL_S` at prewarm, so a written pool of ten can reach the robot as a pool of six.
+`_prewarm_bank` therefore prints the surviving pool **per language and per tier**, not just the
+bank total — `filler bank: 41/52 lines cached (pass 1, +41) [tl 12op/12st, ceb 4op/7st, en 4op/6st]`.
+The total was never the number that governs repeats.
 
 ## The ceiling and the floor are both enforced
 
@@ -138,7 +172,7 @@ it whenever a line changes.
 
 | File | Holds |
 |---|---|
-| `config/filler.py` | the 40 lines, the language keys, the timing constants, the switches |
+| `config/filler.py` | the 52 lines, the language keys, the timing constants, the switches |
 | `ai/filler.py` | the choosing — pure, no audio, no clock, injected `Random` |
 | `ai/session.py` | `_arm_filler` / `_tick_filler`, and the bank in `_canned_lines` |
 | `tests/test_filler.py` | bank shape, speakability, the silence ceiling, selection |
@@ -203,8 +237,8 @@ for every stall, so a turn cannot switch language halfway through.
 
 ### Cost, and the switches
 
-Prewarming is 44 Piper runs instead of 4, but **not in one burst and not all at startup**. The
-four core lines go first and fast; the 40 bank lines then warm one at a time on the same thread,
+Prewarming is 56 Piper runs instead of 4, but **not in one burst and not all at startup**. The
+four core lines go first and fast; the 52 bank lines then warm one at a time on the same thread,
 each gated on nothing else speaking, over minutes rather than seconds. The burst version is what
 put a second Piper on the CPU beside a live reply, made `tts.stop()` kill the wrong process, and
 cost a turn 24.6 s to first audio — see `docs/filler-responses-wip.md`.

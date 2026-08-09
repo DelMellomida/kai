@@ -20,6 +20,7 @@ from config.filler import (
 )
 from config.thinking import THINKING_SOUND_DELAY_S, THINKING_SOUND_TEXT
 from config.wake import (
+    GREETING_TEXT,
     MAX_UTTERANCE_S, MIN_UTTERANCE_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
     SESSION_MAX_NO_SPEECH_STREAK, SESSION_NO_FACE_S, SESSION_NO_SPEECH_S,
     SESSION_START_ATTEMPTS, SESSION_START_BACKOFF_S, WAKE_ACK_MAX_S,
@@ -222,15 +223,23 @@ class SessionCase(unittest.TestCase):
             setattr(self, f"mock_{name}", p.start())
             self.addCleanup(p.stop)
         # _prewarm_bank paces itself with REAL sleeps: 0.3 s between lines, and up to 40 x 0.25 s
-        # waiting for quiet, across 40 lines x 3 passes. That pacing exists to keep Piper off the
+        # waiting for quiet, across 52 lines x 3 passes. That pacing exists to keep Piper off the
         # CPU the vision loop and Ollama share; against a mocked synth it buys nothing and costs
         # ~36 s per test that reaches a re-warm, which is most of what made this module take
         # twenty minutes. Patched here rather than per-test so no future test pays it either.
         for name, value in (("BANK_SYNTH_GAP_S", 0.0), ("BANK_QUIET_POLL_S", 0.0),
-                            ("BANK_QUIET_WAIT_TRIES", 1)):
+                            ("BANK_QUIET_WAIT_TRIES", 1), ("GREETING_POLL_S", 0.0)):
             p = patch(f"ai.session.{name}", value)
             p.start()
             self.addCleanup(p.stop)
+        # The startup greeting is OFF for every test that doesn't ask for it. _speak_greeting waits
+        # for the audio to finish, and FakeVoice.speak_text latches `speaking` True with nothing to
+        # clear it — so leaving it on would park _warm_all for GREETING_QUIET_WAIT_S and then hand
+        # _prewarm_bank a session that never looks quiet. TestGreeting turns it on and drives the
+        # flag itself.
+        p = patch("ai.session.GREETING_ENABLED", False)
+        p.start()
+        self.addCleanup(p.stop)
 
     def make(self, wake_ready=True, visible=False, is_fresh=True, enabled=True, canned=True,
              wake_kind="frame"):
@@ -1128,6 +1137,102 @@ class TestStart(SessionCase):
         self.assertIsNone(self.voice.attached)
 
 
+class TestGreeting(SessionCase):
+    """"Hi, I'm Kai" on boot: once per process, on the warm thread, and out of the bank's way."""
+
+    def setUp(self):
+        super().setUp()
+        # On, and with the post-speech wait collapsed — the wait is exercised on its own below.
+        for name, value in (("GREETING_ENABLED", True), ("GREETING_QUIET_WAIT_S", 0.0)):
+            p = patch(f"ai.session.{name}", value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_the_greeting_is_spoken(self):
+        s = self.make()
+        s._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_it_is_spoken_once_per_process(self):
+        # start() is re-entered by reresolve_mic() every time an operator retries a mic that failed
+        # to come up at boot, which on this robot is a normal thing to do more than once. Greeting
+        # the room again on each attempt would turn a recovery button into a talking one.
+        s = self.make()
+        s._speak_greeting()
+        s._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_disabling_it_boots_silently(self):
+        s = self.make()
+        with patch("ai.session.GREETING_ENABLED", False):
+            s._speak_greeting()
+        self.assertEqual(self.voice.spoken, [])
+
+    def test_blank_text_is_treated_as_off(self):
+        s = self.make()
+        with patch("ai.session.GREETING_TEXT", "   "):
+            s._speak_greeting()
+        self.assertEqual(self.voice.spoken, [])
+
+    def test_it_never_posts_a_chat_bubble(self):
+        # speak_text, not say(): nobody took this turn, so it must not appear in the dashboard
+        # transcript — the same contract the ack and the filler lines hold to.
+        s = self.make()
+        s._speak_greeting()
+        self.assertEqual(self.voice.said, [])
+
+    def test_it_lands_between_the_core_lines_and_the_bank(self):
+        # Not before the core lines (a wake during the greeting still needs "Yes?" on disk), and not
+        # after the bank, which runs for minutes — a hello that late is not a greeting.
+        order = []
+        s = self.make()
+        s._canned = {}
+        self.mock_prewarm_canned.side_effect = (
+            lambda lines, *a, **kw: order.append("warm:" + ",".join(lines)) or {})
+        self.voice.speak_text = lambda text, epoch=None: order.append("greet")
+        s._warm_all()
+        self.assertEqual(order[:2], ["warm:ack,no_speech,error,thinking", "greet"])
+        self.assertTrue(all(o.startswith("warm:filler_") for o in order[2:]))
+
+    def test_it_waits_for_the_audio_before_the_bank_synthesises(self):
+        # tts has ONE synth slot and _begin_speech cuts whatever is playing, so returning while the
+        # greeting is still going would have the bank's first line kill it mid-sentence.
+        polls = []
+
+        def _still_playing():
+            polls.append(1)
+            return len(polls) < 3
+
+        s = self.make()
+        self.voice.speech_in_flight = _still_playing
+        with patch("ai.session.GREETING_QUIET_WAIT_S", 5.0):
+            s._speak_greeting()
+        self.assertEqual(len(polls), 3)
+
+    def test_the_wait_is_bounded(self):
+        # A playback that never reports done costs the bank a delay, not the whole warm.
+        s = self.make()
+        self.voice.speech_in_flight = lambda: True
+        s._speak_greeting()          # GREETING_QUIET_WAIT_S is 0.0 here — must return, not hang
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_the_warm_thread_runs_even_with_presynth_off(self):
+        # ACK_PRESYNTH is a debugging switch for the CANNED lines; turning it off must not also
+        # silence the greeting, which is not cached at all.
+        s = self.make()
+        with patch("ai.session.ACK_PRESYNTH", False), \
+             patch("ai.session.threading.Thread") as thread:
+            s.start()
+        self.assertIn("kai-ack-warm", [c.kwargs.get("name") for c in thread.call_args_list])
+
+    def test_presynth_off_greets_without_warming_anything(self):
+        s = self.make()
+        with patch("ai.session.ACK_PRESYNTH", False):
+            s._warm_all()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+        self.assertEqual(self.mock_prewarm_canned.call_args_list, [])
+
+
 class TestWhisperTierScan(SessionCase):
     """The utterance tier: capture in idle, transcribe, match, and only then wake. Every guard here
     exists to stop a room full of conversation from costing a Whisper run per sentence."""
@@ -1694,6 +1799,27 @@ class TestFiller(SessionCase):
         stalls = [w[0] for w in self._filler_wavs() if "filler_st_" in w[0]]
         first_pass = stalls[:min(len(stalls), 4)]
         self.assertEqual(len(set(first_pass)), len(first_pass))
+
+    def test_a_lap_never_reopens_with_the_line_that_just_played(self):
+        # The robot bug of 2026-08-09, walked end to end: the same short filler twice in one
+        # exchange. A pool small enough to lap inside one wait is the trigger -- ceb and en each
+        # held four lines against a wait that spends three or four -- and at the boundary the
+        # rebuilt queue could put the line still ringing in the room next out. Three warm stalls
+        # here so the boundary is crossed many times in one turn rather than at most once.
+        s = self.make()
+        keep = {"filler_op_tl_0", "filler_st_tl_0", "filler_st_tl_1", "filler_st_tl_2"}
+        s._canned = {k: v for k, v in s._canned.items()
+                     if not k.startswith("filler_") or k in keep}
+        at = self._busy(s)
+        # Bisaya has nothing warm here, and a turn that latched onto it would go silent and test
+        # nothing. The share is a product choice, not part of this contract.
+        with patch("ai.filler.FILLER_CEB_SHARE", 0.0):
+            for i in range(800):
+                s.tick(at + i * 0.05)
+        stalls = [w[0] for w in self._filler_wavs() if "filler_st_" in w[0]]
+        self.assertGreater(len(stalls), 6, "the pool never lapped, so nothing was tested")
+        self.assertTrue(all(a != b for a, b in zip(stalls, stalls[1:])),
+                        f"a stall repeated back to back: {stalls}")
 
     # the gap floor ------------------------------------------------------------
 

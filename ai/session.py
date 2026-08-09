@@ -49,7 +49,8 @@ from config.voice import SAMPLE_RATE
 from config.wake import (
     ACK_PRESYNTH, ACK_WAV_DIR, CANNED_ERROR, CANNED_NO_SPEECH,
     DEBUG_CAPTURE_DIR, DEBUG_CAPTURE_ENABLED,
-    DEBUG_CAPTURE_KINDS, DEBUG_CAPTURE_MAX_FILES, DEBUG_CAPTURE_MAX_MB, HANDS_FREE_ENABLED,
+    DEBUG_CAPTURE_KINDS, DEBUG_CAPTURE_MAX_FILES, DEBUG_CAPTURE_MAX_MB, GREETING_ENABLED,
+    GREETING_TEXT, HANDS_FREE_ENABLED,
     MAX_UTTERANCE_S, MIC_LEGACY_CAPTURE,
     MIN_UTTERANCE_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
     SESSION_MAX_NO_SPEECH_STREAK, SESSION_NO_FACE_S, SESSION_NO_SPEECH_S,
@@ -96,6 +97,14 @@ _SCAN_STATES = (STATE_SCAN_SPEECH, STATE_SCAN_CHECK)
 REWARM_QUIET_WAIT_S = 20.0   # give a long reply time to finish before re-synthesising
 REWARM_RETRY_S = 1.5         # one retry if the ack still got cancelled
 
+# The greeting is spoken on the same warm thread that synthesises the bank, so the thread waits for
+# it to finish playing before starting the next Piper run — otherwise the bank's first line lands on
+# tts's single synth slot mid-greeting and _begin_speech's stop() kills one of the two. Bounded, for
+# the same reason REWARM_QUIET_WAIT_S is: a playback that never reports done must not park the warm
+# thread forever, and the bank is best-effort anyway.
+GREETING_QUIET_WAIT_S = 20.0
+GREETING_POLL_S = 0.25
+
 
 class ConversationSession:
     """The hands-free state machine: wake word in, spoken reply out, and a session that ends itself.
@@ -117,6 +126,11 @@ class ConversationSession:
         )
         self._gate = SpeechGate(rate=SAMPLE_RATE)
         self._canned: dict[str, object] = {}
+        # The startup greeting is once per PROCESS, not once per start(). start() is re-entered by
+        # reresolve_mic() whenever the operator retries a mic that failed to come up at boot — which
+        # on this robot is a normal thing to do more than once (see reresolve_mic) — and greeting the
+        # room again on each attempt would turn a recovery button into a talking one.
+        self._greeted = False
 
         self._state = STATE_DISABLED
         self._state_since = 0.0
@@ -137,12 +151,22 @@ class ConversationSession:
         self._filler_queue: list[str] = []
         self._filler_next_at: float | None = None  # None = waiting for playback to end
         self._filler_last_opener = ""              # so the same opener never lands back to back
+        self._filler_last_stall = ""               # the same, for stalls; see the note below
         # Every filler key already spent in THIS conversation, cleared by _begin_session. Scoped to
         # the conversation rather than the turn because the stall queue is rebuilt per turn and a
         # fresh shuffle knows nothing about the last one's — without these, "Sandali ha" could
         # comfortably open the stalls of three turns running and the bank would sound half its size.
         self._filler_used_openers: set[str] = set()
         self._filler_used_stalls: set[str] = set()
+        # Stalls spent in THIS turn, cleared by _arm_filler. The conversation set above is the
+        # stronger preference but it empties permanently once a conversation has been through the
+        # bank, and a single set going empty used to mean the full bank came straight back — the
+        # line that just played included. This is the weaker promise that survives that: nothing
+        # twice inside one wait, which is where the ear actually notices. Heard on the robot
+        # 2026-08-09 as the same stall twice in one exchange, on the small ceb/en banks that lap
+        # inside a single wait. _filler_last_stall guards the seam neither set can: the very first
+        # pop after a rebuild. It deliberately survives _arm_filler, exactly like _filler_last_opener.
+        self._filler_turn_stalls: set[str] = set()
 
         # Per-session facts, reset on every accepted wake.
         self._face_ever_seen = False
@@ -230,7 +254,7 @@ class ConversationSession:
         with self._lock:
             self._set_state(STATE_IDLE if self._wake_live() else STATE_DISABLED, time.monotonic())
 
-        if ACK_PRESYNTH:
+        if ACK_PRESYNTH or GREETING_ENABLED:
             threading.Thread(target=self._warm_all, daemon=True, name="kai-ack-warm").start()
 
         self._stop.clear()
@@ -306,7 +330,7 @@ class ConversationSession:
         """The four lines that MUST be on disk for the session to behave. Single source of truth so
         _rewarm_when_quiet can check what it actually got against what it asked for.
 
-        Deliberately NOT the filler bank. The bank is 40 more lines and warms separately, one line
+        Deliberately NOT the filler bank. The bank is 52 more lines and warms separately, one line
         at a time between turns (_prewarm_bank), because synthesising it in one burst put a second
         Piper on the CPU next to a live reply — measured on the robot 2026-08-07 as a 12.3 s synth
         on a turn that should take ~1 s, plus a corrupted output WAV. A missing filler line costs
@@ -332,10 +356,42 @@ class ConversationSession:
             print(f"[session] cached spoken lines: {', '.join(sorted(got))}", flush=True)
 
     def _warm_all(self) -> None:
-        """The four core lines first and fast, then the bank slowly. Strict ordering, one thread:
-        the bank must never be synthesising while "Yes?" still is not on disk."""
-        self._prewarm_canned()
-        self._prewarm_bank()
+        """The four core lines first and fast, then the greeting, then the bank slowly. Strict
+        ordering, one thread: the bank must never be synthesising while "Yes?" still is not on disk.
+
+        The greeting sits between the two halves rather than at either end, and both sides of that
+        are deliberate. Not before the core lines: a wake arriving during the greeting must still
+        find "Yes?" on disk. Not after the bank: the bank runs for MINUTES, and a hello that arrives
+        five minutes after the robot booted is not a greeting."""
+        if ACK_PRESYNTH:
+            self._prewarm_canned()
+        self._speak_greeting()
+        if ACK_PRESYNTH:
+            self._prewarm_bank()
+
+    def _speak_greeting(self) -> None:
+        """Say hello to the room, once per process, then wait for the audio to finish.
+
+        The wait is what makes this safe to call on the warm thread: tts has ONE synth slot and
+        _begin_speech cuts whatever is playing, so returning while the greeting is still going would
+        have _prewarm_bank's first line kill it mid-sentence. Bounded by GREETING_QUIET_WAIT_S so a
+        playback that never reports done costs the bank a delay, not the whole warm.
+
+        Best-effort in every direction: a failed synth just means no greeting (VoiceAssistant._speak
+        falls back to the silent jaw pantomime), and nothing downstream depends on it having played.
+        """
+        if not (GREETING_ENABLED and GREETING_TEXT.strip()):
+            return
+        with self._lock:
+            if self._greeted:
+                return
+            self._greeted = True
+        print(f"[session] greeting: {GREETING_TEXT}", flush=True)
+        self._voice.speak_text(GREETING_TEXT)
+        deadline = time.monotonic() + GREETING_QUIET_WAIT_S
+        while time.monotonic() < deadline and (tts.is_playing()
+                                               or self._voice.speech_in_flight()):
+            time.sleep(GREETING_POLL_S)
 
     def _within_length_cap(self, key: str, wav) -> bool:
         """True if the synthesised line is short enough to cache. Rejected lines are never cached,
@@ -401,10 +457,16 @@ class ConversationSession:
                 # and Ollama are also on.
                 time.sleep(BANK_SYNTH_GAP_S)
             with self._lock:
-                warm = sum(1 for k in self._canned if k.startswith("filler_"))
-            print(f"[session] filler bank: {warm}/{len(lines)} lines cached "
-                  f"(pass {attempt + 1}, +{done})", flush=True)
-            if warm >= len(lines):
+                cached = {k for k in self._canned if k.startswith("filler_")}
+            # Per language, not just the total: a turn draws stalls from ONE language, so a healthy
+            # total can still hide a two-line pool that repeats inside a single wait — which is
+            # exactly what was heard on the robot before the queue grew its back-to-back guard.
+            # The length cap drops lines silently, so this is the only place the real pool shows up.
+            pools = ", ".join(f"{lang} {ops}op/{sts}st"
+                              for lang, (ops, sts) in filler.warm_counts(cached).items())
+            print(f"[session] filler bank: {len(cached)}/{len(lines)} lines cached "
+                  f"(pass {attempt + 1}, +{done}) [{pools}]", flush=True)
+            if len(cached) >= len(lines):
                 return
 
     def reprewarm_canned(self) -> None:
@@ -903,6 +965,8 @@ class ConversationSession:
         self._filler_opened = False
         self._filler_queue = []
         self._filler_next_at = None
+        # NOT _filler_last_stall, which has to survive the turn boundary to guard the seam.
+        self._filler_turn_stalls.clear()
 
     def _filler_gap(self, jitter: tuple[float, float]) -> float:
         """One drawn silence, clamped into [FILLER_MIN_GAP_S, ceiling]. The single place both
@@ -1030,10 +1094,14 @@ class ConversationSession:
             if not self._filler_queue:
                 warm = {k for k in self._canned if k.startswith("filler_")}
                 self._filler_queue = filler.stall_queue(self._filler_lang, self._filler_rng,
-                                                        have=warm, used=self._filler_used_stalls)
+                                                        have=warm, used=self._filler_used_stalls,
+                                                        turn_used=self._filler_turn_stalls,
+                                                        avoid=self._filler_last_stall)
             if self._filler_queue:
                 key = self._filler_queue.pop()
                 self._filler_used_stalls.add(key)
+                self._filler_turn_stalls.add(key)
+                self._filler_last_stall = key
                 self._speak_filler(key)
             self._filler_next_at = None
         return True
