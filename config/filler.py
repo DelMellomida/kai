@@ -201,6 +201,27 @@ BANK_SYNTH_GAP_S = 0.3
 # retry budget for lines that kept losing the race, not three times the work.
 BANK_PASSES = 3
 
+# Immediate retries for a line whose synthesis STARTED and then died -- taken on the spot instead
+# of waiting for the next pass.
+#
+# This exists because deferring to the next pass is not a neutral delay, and the bias it creates is
+# measurable. Robot log, 2026-08-09: openers failed 11 times across 20 lines (55%), stalls 5 times
+# across 32 (16%). Openers lose because they are the longest lines -- tts publishes ONE _synth_proc
+# and stop() kills whatever is in it when a turn starts, so an 8 s opener is a far wider target
+# than a 0.3 s stall. A killed line then sat out the rest of the pass, and a pass is minutes long
+# (52 lines, each willing to wait BANK_QUIET_WAIT_TRIES x BANK_QUIET_POLL_S for quiet).
+#
+# The audible result was the tier inversion this constant fixes: pass 1 ending at "ceb 1op/10st,
+# en 2op/10st", so for minutes after every restart a Bisaya or English turn had no opener to play
+# and went straight from the "Hmm" to the short stalls. The long line the turn is supposed to open
+# with simply was not on disk yet.
+#
+# Only a dead SYNTHESIS is retried. A line that never found a quiet window is not: the robot is
+# busy right now, so re-waiting immediately is just as futile and would spend the budget where it
+# cannot help. A line rejected by the length cap is not retried either -- that is deterministic and
+# would fail identically every time.
+BANK_LINE_RETRIES = 2
+
 # ── The length cap ────────────────────────────────────────────────────────────
 # HARD CEILING on how long any single filler line may take to say. A line that runs longer stops
 # being filler and becomes a monologue the listener has to sit through, and — worse — it keeps

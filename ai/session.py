@@ -39,7 +39,7 @@ from ai.voice_assistant import (
 )
 from ai.wake_phrase import match_wake_phrase
 from config.filler import (
-    BANK_PASSES, BANK_QUIET_POLL_S, BANK_QUIET_WAIT_TRIES, BANK_SYNTH_GAP_S,
+    BANK_LINE_RETRIES, BANK_PASSES, BANK_QUIET_POLL_S, BANK_QUIET_WAIT_TRIES, BANK_SYNTH_GAP_S,
     FILLER_DEFAULT_LANG, FILLER_DELAY_JITTER_S, FILLER_ENABLED, FILLER_MAX_LINE_S,
     FILLER_MAX_SILENCE_S, FILLER_MAX_STALL_S, FILLER_MIN_GAP_S, FILLER_PLAYBACK_START_BUDGET_S,
     FILLER_PREWARM, FILLER_STALL_GAP_JITTER_S,
@@ -422,6 +422,35 @@ class ConversationSession:
         with self._lock:
             return self._state not in (STATE_BUSY, STATE_SPEAKING, STATE_ACK)
 
+    def _warm_one(self, key: str, text: str) -> str:
+        """Caller does NOT hold the lock. One attempt at warming one bank line. Returns what the
+        caller should do about it, which is the whole reason this is separate from _prewarm_bank:
+
+          "cached" — on disk, measured, selectable.
+          "retry"  — synthesis was reached and did not produce a file. Worth trying again NOW: we
+                     had a quiet window a moment ago, and the overwhelmingly common cause is a
+                     turn starting and tts.stop() killing the one _synth_proc. That is transient
+                     and it is not evenly distributed — the longer the line, the wider the target.
+          "skip"   — nothing to be gained by trying again in this pass. Two very different cases
+                     that share an answer: no quiet window ever came (the robot is busy right now,
+                     so an immediate retry is just as futile), or the line synthesised fine and
+                     the length cap rejected it (deterministic — it will measure the same forever).
+        """
+        for _ in range(BANK_QUIET_WAIT_TRIES):
+            if self._quiet_for_synth():
+                break
+            time.sleep(BANK_QUIET_POLL_S)
+        else:
+            return "skip"
+        got = tts.prewarm_canned({key: text}, ACK_WAV_DIR)
+        if not got:
+            return "retry"
+        if not self._within_length_cap(key, got[key]):
+            return "skip"
+        with self._lock:
+            self._canned.update(got)
+        return "cached"
+
     def _prewarm_bank(self) -> None:
         """Warm the filler bank in the background, ONE line at a time, only while nothing is
         speaking. Runs for minutes rather than seconds, and that is the point.
@@ -442,20 +471,19 @@ class ConversationSession:
                 with self._lock:
                     if key in self._canned:
                         continue
-                for _ in range(BANK_QUIET_WAIT_TRIES):
-                    if self._quiet_for_synth():
+                # Retried HERE rather than by the next pass, because a pass is minutes long and
+                # the wait is not spent evenly: the longest lines are the likeliest to be killed
+                # mid-synthesis, so deferring them systematically empties the opener tier while
+                # the stalls fill up. See BANK_LINE_RETRIES for the measurement.
+                for _ in range(BANK_LINE_RETRIES + 1):
+                    outcome = self._warm_one(key, text)
+                    # A breath between attempts, so a long warm never monopolises the CPU the
+                    # vision loop and Ollama are also on.
+                    time.sleep(BANK_SYNTH_GAP_S)
+                    if outcome == "cached":
+                        done += 1
+                    if outcome != "retry":
                         break
-                    time.sleep(BANK_QUIET_POLL_S)
-                else:
-                    continue      # busy for a long stretch; a later pass picks this line up
-                got = tts.prewarm_canned({key: text}, ACK_WAV_DIR)
-                if got and self._within_length_cap(key, got[key]):
-                    with self._lock:
-                        self._canned.update(got)
-                    done += 1
-                # A breath between lines, so a long warm never monopolises the CPU the vision loop
-                # and Ollama are also on.
-                time.sleep(BANK_SYNTH_GAP_S)
             with self._lock:
                 cached = {k for k in self._canned if k.startswith("filler_")}
             # Per language, not just the total: a turn draws stalls from ONE language, so a healthy
