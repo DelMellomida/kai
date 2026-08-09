@@ -38,7 +38,8 @@ class WebCase(unittest.TestCase):
                                    str(Path(self._tmp.name) / "settings.json"))
         self._patch.start()
         self.client = face_track._flask_app.test_client()
-        face_track._cam_set_state(reason="starting up", mode="auto", locked=False, next_probe_at=0.0)
+        face_track._camera.set_state(reason="starting up", mode="auto", locked=False,
+                                     next_probe_at=0.0)
 
     def tearDown(self):
         self._patch.stop()
@@ -90,14 +91,14 @@ class TestPostSettings(WebCase):
     def test_camera_mode_locked_by_cli_is_refused_with_the_reason(self):
         # --no-camera declares this machine's hardware situation for the run; a browser must not be
         # able to re-enable hardware the operator disabled at launch.
-        face_track._cam_set_state(locked=True)
+        face_track._camera.set_state(locked=True)
         res = self.client.post('/settings', json={"camera_mode": "auto"})
         self.assertEqual(res.status_code, 400)
         self.assertIn("--no-camera", res.get_json()["error"])
         self.assertIn("camera_mode", self.client.get('/settings').get_json()["locked"])
 
     def test_other_settings_still_work_while_camera_mode_is_locked(self):
-        face_track._cam_set_state(locked=True)
+        face_track._camera.set_state(locked=True)
         self.assertEqual(self.client.post('/settings', json={"tts_volume": 0.5}).status_code, 200)
 
     def test_a_save_failure_is_still_a_success_with_a_warning(self):
@@ -121,10 +122,11 @@ class TestResetSettings(WebCase):
 
 class TestCameraProbe(WebCase):
     def test_wakes_the_supervisor(self):
-        face_track._cam_probe_now.clear()
+        cam = face_track._camera
+        cam._probe_now.clear()
         self.assertEqual(self.client.post('/camera/probe').status_code, 200)
-        self.assertTrue(face_track._cam_probe_now.is_set())
-        face_track._cam_probe_now.clear()
+        self.assertTrue(cam.probe_pending())
+        cam._probe_now.clear()
 
 
 class TestRestart(WebCase):
@@ -229,7 +231,7 @@ class TestParamsSnapshot(WebCase):
         # a camera that does not exist. _publish_status runs on every loop iteration instead.
         with face_track._web_lock:
             face_track._web_params = {}
-        face_track._cam_set_state(reason="no /dev/video* device and no --network host")
+        face_track._camera.set_state(reason="no /dev/video* device and no --network host")
         face_track._publish_status(_FakeCamThread("none"), _FakeServo(), 0.0)
 
         snap = face_track._params_snapshot()
@@ -239,7 +241,7 @@ class TestParamsSnapshot(WebCase):
         self.assertNotIn("face_visible", snap, "no frame means no face data, not stale face data")
 
     def test_a_live_camera_reports_no_reason(self):
-        face_track._cam_set_state(reason="")
+        face_track._camera.set_state(reason="")
         face_track._publish_status(_FakeCamThread("csi"), _FakeServo(), 0.0)
         snap = face_track._params_snapshot()
         self.assertEqual(snap["cam_source"], "csi")

@@ -14,7 +14,6 @@ import argparse
 import json
 import math
 import os
-import queue
 import random
 import socket
 import threading
@@ -35,7 +34,8 @@ except ImportError:
     print("[face_track] WARNING: flask not installed — web dashboard disabled. Run: pip3 install flask")
 
 from app               import lifecycle
-from vision.camera      import CameraThread, NullCamera, device_signature, try_open_camera
+from app.camera_supervisor import CameraSupervisor
+from vision.camera      import CameraThread, NullCamera
 from vision.controller  import EMAFilter, PDAxis, TrackingTarget
 from vision.face_params import FaceParams, NOSE_TIP, PROCESS_W, PROCESS_H, compute_face_params, classify_emotion
 from vision.gesture     import GestureDetector
@@ -75,21 +75,16 @@ from config.thinking import (
     THINKING_SWEEP_PERIOD_S, THINKING_SWEEP_RETURN_DPS, THINKING_SWEEP_START_S,
     THINKING_SWEEP_WANDER_FRAC, THINKING_SWEEP_WANDER_RATIO,
 )
-from config.camera import (
-    CAMERA_RETRY_INTERVAL_S, CAMERA_RETRY_MAX_S, CAMERA_STALL_S,
-    CSI_FIRST_FRAME_S, CSI_FIRST_FRAME_RETRY_S,
-)
 
 INFERENCE_INTERVAL = 1.0 / INFERENCE_FPS   # derived from INFERENCE_FPS
 CONTROL_INTERVAL   = 1.0 / CONTROL_FPS     # servo control-loop period (decoupled from inference)
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Thread-safe camera swap signal: ("video", VideoFileCamera), ("live", None), or
-# ("live_source", camera) from the camera supervisor when a real camera appears or is released.
-# Depth 3, not 1: an upload and a supervisor swap can be in flight together, and with depth 1 the
-# drop-oldest replace in _replace_cam_swap would silently evict one before CameraThread applied it.
-_cam_swap: queue.Queue = queue.Queue(maxsize=3)
+# The live camera's owner: probing, hot-swap, release, and the state the dashboard reads. Built at
+# import time (the routes need something to talk to before run() has parsed the CLI) and given the
+# CLI facts by configure() in run().
+_camera = CameraSupervisor()
 
 # ── Web state ─────────────────────────────────────────────────────────────────
 # _web_raw_frame holds the latest *un-encoded* frame; the /video generator encodes it on
@@ -246,14 +241,14 @@ if _FLASK_OK:
             warnings.append(f"Resolution {cam.width}×{cam.height} below recommended 640×480")
         if cam.fps < 15:
             warnings.append(f"FPS {cam.fps:.1f} below recommended 15")
-        _replace_cam_swap(("video", cam))
+        _camera.play_video(cam)
         return {"status": "ok", "fps": cam.fps, "width": cam.width,
                 "height": cam.height, "frame_count": cam.frame_count,
                 "warnings": warnings}
 
     @_flask_app.route('/stop_video', methods=['POST'])
     def _stop_video():
-        _replace_cam_swap(("live", None))
+        _camera.stop_video()
         return {"status": "ok"}
 
     @_flask_app.route('/settings')
@@ -261,7 +256,7 @@ if _FLASK_OK:
         # The values are already on /params as set_*; this exists so the specs and the valid ranges are
         # discoverable with curl over ssh, the same reason /voice/wake accepts a text payload.
         return {"values": settings.snapshot(), "defaults": settings.defaults(),
-                "specs": settings.describe(), "locked": _settings_locked(),
+                "specs": settings.describe(), "locked": _camera.settings_locked(),
                 "persist_error": settings.persist_error(),
                 "supervised": lifecycle.supervised()}
 
@@ -270,7 +265,7 @@ if _FLASK_OK:
         data = request.get_json(silent=True) or {}
         if not isinstance(data, dict) or not data:
             return {"error": "expected a JSON object of setting -> value"}, 400
-        locked = _settings_locked()
+        locked = _camera.settings_locked()
         for name in data:
             if name in locked:
                 return {"error": f"{name}: {locked[name]}"}, 400
@@ -349,7 +344,7 @@ if _FLASK_OK:
         # Wakes the supervisor so a camera just plugged in is picked up now rather than after the
         # backoff. The outcome arrives on /params as cam_source/cam_reason, like every other async
         # result in this app.
-        _cam_probe_now.set()
+        _camera.probe_now()
         return {"status": "ok"}
 
 
@@ -366,45 +361,10 @@ def _voice_capture_stop() -> dict:
     return _voice.stop_recording()
 
 
-# ── Camera + servo availability ───────────────────────────────────────────────
-# Written by the camera supervisor thread, read by _publish_status on the tracking loop. Same
-# lock-guarded-holder shape as vision/controller.py's TrackingTarget.
-_cam_lock  = threading.Lock()
-_cam_state = {"reason": "starting up", "mode": "auto", "locked": False, "next_probe_at": 0.0}
-_cam_probe_now = threading.Event()      # set by POST /camera/probe to skip the backoff wait
-
-_cam_live = False        # is the live source a real camera (vs a NullCamera)?
-_cam_last_reason = None  # last reason we logged, so a stuck robot doesn't spam the log
-_cam_thread = None       # the live CameraThread, so the supervisor can check frame staleness
-
-
-def _set_cam_thread(thread) -> None:
-    global _cam_thread
-    _cam_thread = thread
-
+# ── Servo availability ────────────────────────────────────────────────────────
 # Set once by _open_servo; the dashboard shows it so an unplugged Arduino is visible rather than
 # just silently motionless.
 _servo_state = {"ok": True, "reason": ""}
-
-
-def _settings_locked() -> dict:
-    """Settings a CLI flag has taken away for this run -> why.
-
-    The dashboard disables those controls and shows the reason, rather than accepting a click that
-    silently does nothing.
-    """
-    cam = _cam_snapshot()
-    return {"camera_mode": "locked off by --no-camera"} if cam["locked"] else {}
-
-
-def _cam_set_state(**kw) -> None:
-    with _cam_lock:
-        _cam_state.update(kw)
-
-
-def _cam_snapshot() -> dict:
-    with _cam_lock:
-        return dict(_cam_state)
 
 
 def _open_servo(port: str):
@@ -422,130 +382,6 @@ def _open_servo(port: str):
         print(f"[servo] WARNING: serial port unavailable ({exc}) — running without servos; "
               f"the dashboard, voice and wake word are unaffected", flush=True)
         return _NullServo()
-
-
-def _effective_camera_mode(args: argparse.Namespace) -> str:
-    """"auto" or "off". --no-camera wins over the stored setting.
-
-    Like --no-servo, --no-camera declares this machine's hardware situation for this run, so a remote
-    browser must not be able to re-enable hardware the operator disabled at launch. The dashboard is
-    told (cam_mode_locked) so it can disable the control and say why instead of accepting a click that
-    does nothing. scripts/autostart.sh does not pass --no-camera, so in production the setting rules.
-    """
-    if args.no_camera:
-        return "off"
-    return settings.get("camera_mode")
-
-
-def _camera_supervisor(args: argparse.Namespace, stop_evt: threading.Event) -> None:
-    """Keep the live camera in sync with what is actually plugged in and what the operator asked for.
-
-    Runs for the whole process rather than exiting once a camera is found, because camera_mode can be
-    flipped to "off" later, and a USB camera can be unplugged and replugged. Parked cost is one
-    settings lookup per interval.
-
-    Backoff applies only to *expensive* failures. When there is no device node at all, try_open_camera
-    returns in microseconds, so those attempts stay at the base interval — there is nothing to spare
-    the machine from.
-    """
-    interval = CAMERA_RETRY_INTERVAL_S
-    first    = True
-    while not stop_evt.is_set():
-        mode   = _effective_camera_mode(args)
-        locked = bool(args.no_camera)
-        _cam_set_state(mode=mode, locked=locked)
-
-        if mode == "off":
-            if _cam_live:
-                _release_camera("camera off (settings)" if not locked
-                                else "locked off by --no-camera")
-            elif locked:
-                _cam_set_state(reason="locked off by --no-camera", next_probe_at=0.0)
-            else:
-                _cam_set_state(reason="camera off (settings)", next_probe_at=0.0)
-            interval = CAMERA_RETRY_INTERVAL_S
-        elif _cam_live:
-            # Parked on a live camera — but verify it is still DELIVERING. A camera unplugged mid-run
-            # (or a wedged CSI pipeline) just returns no frames forever, which is indistinguishable
-            # from a healthy idle camera unless we time it. Without this the dashboard goes on
-            # reporting cam_source="csi" at 0 fps, claiming a feed that no longer exists.
-            last = _cam_thread.last_frame_t if _cam_thread is not None else 0.0
-            if (_cam_thread is not None and _cam_thread.showing_live and last
-                    and (time.monotonic() - last) > CAMERA_STALL_S):
-                _release_camera(f"camera stopped delivering frames "
-                                f"({CAMERA_STALL_S:g}s with none) — looking for it again")
-                interval = CAMERA_RETRY_INTERVAL_S
-        else:
-            # A shorter Argus budget on retries than at startup: a node that just appeared is warm,
-            # and we would rather come back around than block this thread for 10s.
-            budget = CSI_FIRST_FRAME_S if first else CSI_FIRST_FRAME_RETRY_S
-            cheap  = not device_signature()
-            cam, reason = try_open_camera(args.camera, args.network, args.network_port,
-                                          csi_first_frame_s=budget,
-                                          force=_cam_probe_now.is_set())
-            first = False
-            if cam is not None:
-                _acquire_camera(cam)
-                interval = CAMERA_RETRY_INTERVAL_S
-            else:
-                _cam_report_failure(reason)
-                interval = (CAMERA_RETRY_INTERVAL_S if cheap
-                            else min(interval * 2, CAMERA_RETRY_MAX_S))
-
-        _cam_probe_now.clear()
-        _cam_set_state(next_probe_at=time.monotonic() + interval)
-        # Wake early for shutdown or for an explicit "Probe now".
-        deadline = time.monotonic() + interval
-        while not stop_evt.is_set() and not _cam_probe_now.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            stop_evt.wait(min(0.25, remaining))
-
-
-def _acquire_camera(cam) -> None:
-    global _cam_live, _cam_last_reason
-    _cam_live = True
-    _cam_last_reason = None
-    _cam_set_state(reason="")
-    if _cam_thread is not None:
-        # Start the staleness clock now, so a camera that takes a moment to produce its first frame
-        # is not immediately judged dead by the stall check.
-        _cam_thread.note_frame_time(time.monotonic())
-    _replace_cam_swap(("live_source", cam))
-    presence.reset()     # a hot-swap means the old presence history describes a different camera
-    print(f"[camera] live camera acquired: {cam.source_name}", flush=True)
-
-
-def _release_camera(reason: str) -> None:
-    global _cam_live, _cam_last_reason
-    _cam_live = False
-    _cam_last_reason = reason
-    _cam_set_state(reason=reason, next_probe_at=0.0)
-    _replace_cam_swap(("live_source", NullCamera(reason)))
-    presence.reset()
-    print(f"[camera] released the camera — {reason}", flush=True)
-
-
-def _cam_report_failure(reason: str) -> None:
-    """Record why there is no camera, logging only when the reason CHANGES — this runs on a timer for
-    the life of the process, and a fixed hardware fault would otherwise fill the log."""
-    global _cam_last_reason
-    _cam_set_state(reason=reason)
-    if reason != _cam_last_reason:
-        print(f"[camera] no camera — {reason}", flush=True)
-        _cam_last_reason = reason
-
-
-def _replace_cam_swap(item: tuple) -> None:
-    try:
-        _cam_swap.put_nowait(item)
-    except queue.Full:
-        try:
-            _cam_swap.get_nowait()
-        except queue.Empty:
-            pass
-        _cam_swap.put_nowait(item)
 
 
 # ── Run helpers ───────────────────────────────────────────────────────────────
@@ -864,7 +700,7 @@ def _publish_status(cam_thread, servo, last_status_t: float) -> float:
     if not _FLASK_OK or now - last_status_t < WEB_PUBLISH_INTERVAL:
         return last_status_t
 
-    cam    = _cam_snapshot()
+    cam    = _camera.snapshot()
     source = cam_thread.source_name
     status = {
         "pan": servo.last_pan, "tilt": servo.last_tilt, "jaw": servo.last_jaw,
@@ -942,12 +778,12 @@ def run(args: argparse.Namespace) -> None:
     settings.load()
     # Before the dashboard can be served, so a --no-camera run never briefly shows the camera control
     # as changeable.
-    _cam_set_state(mode=_effective_camera_mode(args), locked=bool(args.no_camera))
+    _camera.configure(args.camera, args.network, args.network_port, args.no_camera)
 
     servo       = _NullServo() if args.no_servo else _open_servo(args.port)
     camera      = NullCamera("starting up")
-    cam_thread  = CameraThread(camera, _cam_swap).start()   # reads frames off the tracking loop
-    _set_cam_thread(cam_thread)                             # so the supervisor can watch frame health
+    cam_thread  = CameraThread(camera, _camera.swap_queue).start()  # reads frames off the loop
+    _camera.attach_thread(cam_thread)                       # so the supervisor can watch frame health
     print(f"[face_track] flip={args.flip}  tilt={args.tilt}  lofi={args.lofi}  "
           f"ema={EMA_ALPHA}  infer={INFERENCE_FPS}fps")
 
@@ -1023,7 +859,7 @@ def run(args: argparse.Namespace) -> None:
 
     # LAST, and on its own thread: the only camera-dependent step. It probes, hot-swaps a real camera
     # in when one appears, and releases it when camera_mode goes to "off".
-    cam_thread_sup = threading.Thread(target=_camera_supervisor, args=(args, stop_evt),
+    cam_thread_sup = threading.Thread(target=_camera.run, args=(stop_evt,),
                                       daemon=True, name="kai-camera")
     cam_thread_sup.start()
 
