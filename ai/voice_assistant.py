@@ -19,15 +19,11 @@ request that was already in flight when it was cleared.
 from __future__ import annotations
 
 import math
-import numbers
-import re
 import threading
 import time
-import unicodedata
 from pathlib import Path
 
 import numpy as np
-import requests
 import sounddevice as sd
 from scipy.signal import resample_poly
 
@@ -40,6 +36,14 @@ from ai.audio import normalize_for_asr
 from ai.mic_device import (
     MicChoice, apply_i2s_route, free_i2s_device, resolve_input_device, resume_pulse_source,
 )
+# Three layers this class uses but does not own. Re-exported for the same reason as mic_device's
+# entry points: _call_ollama, ensure_llm_warm, _speak and _transcribe call them by bare name, so
+# they resolve through this module's globals — which is what a test patches.
+from ai.llm import (
+    _log_llm_timings, _ollama_request, build_chat_messages, load_persona, log_model_placement,
+)
+from ai.speak_envelope import _speak_segments, _speak_segments_for_duration, speaking_openness_at
+from ai.transcript import _best_allowed_language, transcript_rejection
 
 # ── Tuning ────────────────────────────────────────────────────────────────────
 # All tunable knobs (audio, Whisper, Ollama, history, jaw-speaking envelope) live in
@@ -50,108 +54,15 @@ from config.voice import (
     WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE, WHISPER_LANGUAGE, WHISPER_LANGUAGES,
     WHISPER_CPU_THREADS, WHISPER_BEAM_SIZE, WHISPER_INITIAL_PROMPT,
     ASR_NORMALIZE, ASR_NORMALIZE_MAX_GAIN, ASR_NORMALIZE_SCAN,
-    TRANSCRIPT_SCRIPT_GUARD, TRANSCRIPT_MIN_LATIN_RATIO, TRANSCRIPT_MIN_AVG_LOGPROB,
-    TRANSCRIPT_MAX_NO_SPEECH_PROB,
-    OLLAMA_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT_S, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX, OLLAMA_NUM_GPU,
-    OLLAMA_NUM_PREDICT, OLLAMA_PS_TIMEOUT_S, OLLAMA_LOG_TIMINGS, RAG_CONTEXT_PLACEMENT,
-    MAX_HISTORY_TURNS,
-    SPEAK_SEC_PER_WORD, SPEAK_MIN_SENTENCE_S, SPEAK_MAX_S, SPEAK_GAP_S,
-    SPEAK_AMP, SPEAK_OPEN_S, SPEAK_CLOSE_S,
+    RAG_CONTEXT_PLACEMENT, MAX_HISTORY_TURNS,
 )
 from config.wake import (
     CAPTURE_HARD_CAP_S, TTS_MAX_SPOKEN_CHARS, TTS_TAIL_MUTE_S,
     WAKE_WHISPER_SCAN_LANGUAGE, WAKE_WHISPER_SCAN_MODEL,
 )
 
-# Fallback only — the real, editable persona lives in persona.txt (see load_persona()) so it
-# can be tuned without touching code or restarting the service.
-_DEFAULT_PERSONA = (
-    "You are Kai, a small friendly companion robot built by Devcon Philippines. "
-    "You have a camera for eyes and a servo neck that lets you look toward whoever "
-    "is talking to you. Speak warmly and simply, like a curious, upbeat companion — "
-    "not like a generic assistant. Keep replies short: 1-3 sentences, plain "
-    "conversational text, no markdown, no lists, no code blocks."
-)
-PERSONA_PATH = Path(__file__).parent / "persona.txt"
 
 NO_SPEECH_RESPONSE = "(didn't catch that — try again)"
-
-
-def _best_allowed_language(info, allowed: tuple[str, ...]) -> str:
-    """Pick the most probable of `allowed` from a TranscriptionInfo's language scores.
-
-    `all_language_probs` is produced for free by any transcribe(language=None) call, so restricting
-    the language set costs nothing until it is actually needed. Falls back to the first allowed entry
-    when the field is missing (older faster-whisper) rather than guessing."""
-    probs = getattr(info, "all_language_probs", None) or ()
-    scores = {lang: p for lang, p in probs if lang in allowed}
-    if not scores:
-        return allowed[0]
-    return max(scores, key=scores.get)
-
-
-def latin_letter_ratio(text: str) -> float:
-    """Fraction of `text`'s ALPHABETIC characters that are Latin. 1.0 when there are no letters.
-
-    Only letters are counted: punctuation, digits, spaces and emoji are ignored, so they can neither
-    trip the check nor dilute a genuinely non-Latin transcript into passing it.
-    """
-    letters = [c for c in text if c.isalpha()]
-    if not letters:
-        return 1.0
-    latin = sum(1 for c in letters if "LATIN" in unicodedata.name(c, ""))
-    return latin / len(letters)
-
-
-def _segment_floats(segments, attr: str) -> list[float]:
-    """Collect a per-segment numeric field, skipping anything that isn't a real finite number.
-
-    Strict on purpose. A faster-whisper version that renames or omits one of these fields must
-    degrade to "this gate is off", exactly as _best_allowed_language degrades when
-    all_language_probs is missing — never to a TypeError that fails every turn. bool is excluded
-    because it is a Real and would silently read as 0/1.
-    """
-    out: list[float] = []
-    for seg in segments:
-        value = getattr(seg, attr, None)
-        if isinstance(value, numbers.Real) and not isinstance(value, bool):
-            as_float = float(value)
-            if math.isfinite(as_float):
-                out.append(as_float)
-    return out
-
-
-def transcript_rejection(text: str, segments) -> str:
-    """Why this transcript should be thrown away, or "" to keep it.
-
-    Exists because WHISPER_LANGUAGES only constrains the detected-language LABEL. A clip labelled
-    "en" is never re-transcribed, so a decode that emitted '嘿哀' — or invented a sentence out of fan
-    noise — reached the LLM unchallenged and got answered as though someone had asked it. Checking the
-    label is not the same as checking the output.
-
-    Returns a human-readable reason so the log says which gate fired and with what number; a silent
-    rejection would be indistinguishable from the mic being broken.
-    """
-    if not text:
-        return ""                     # empty is already handled upstream, and is not a rejection
-    if TRANSCRIPT_SCRIPT_GUARD:
-        ratio = latin_letter_ratio(text)
-        if ratio < TRANSCRIPT_MIN_LATIN_RATIO:
-            return (f"only {ratio:.0%} of letters are Latin "
-                    f"(< {TRANSCRIPT_MIN_LATIN_RATIO:.0%}) — not English or Tagalog")
-    # Both of these come per-segment; the worst segment is what matters, since one confidently-wrong
-    # stretch is enough to turn a transcript into a different question than the one that was asked.
-    if TRANSCRIPT_MIN_AVG_LOGPROB is not None:
-        logprobs = _segment_floats(segments, "avg_logprob")
-        if logprobs and min(logprobs) < TRANSCRIPT_MIN_AVG_LOGPROB:
-            return (f"decode confidence {min(logprobs):.2f} "
-                    f"(< {TRANSCRIPT_MIN_AVG_LOGPROB}) — unintelligible")
-    if TRANSCRIPT_MAX_NO_SPEECH_PROB is not None:
-        nsp = _segment_floats(segments, "no_speech_prob")
-        if nsp and max(nsp) > TRANSCRIPT_MAX_NO_SPEECH_PROB:
-            return (f"no_speech_prob {max(nsp):.2f} "
-                    f"(> {TRANSCRIPT_MAX_NO_SPEECH_PROB}) — words decoded out of silence")
-    return ""
 
 STATUS_IDLE         = "idle"
 STATUS_RECORDING    = "recording"
@@ -168,239 +79,6 @@ STATUS_ERROR        = "error"
 # sentences. face_track.py reads speaking_openness() each frame and maps the 0..1
 # result onto the jaw servo (overriding the human-mouth mirror during a reply).
 # The SPEAK_* envelope values are imported from config/voice.py (see the import block above).
-
-_SENTENCE_RE = re.compile(r"[^.!?]+[.!?]*")
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split a reply into sentences on . ! ? — falls back to the whole text as one."""
-    parts = [m.group().strip() for m in _SENTENCE_RE.finditer(text)]
-    parts = [p for p in parts if p]
-    if parts:
-        return parts
-    stripped = text.strip()
-    return [stripped] if stripped else []
-
-
-def _speak_segments(text: str, now: float) -> tuple[float, tuple[tuple[float, float], ...]]:
-    """Build the per-sentence open/close schedule. Returns (start, segments) where each
-    segment is (rel_start, rel_end) seconds from start — one per sentence, separated by
-    SPEAK_GAP_S closed pauses, and truncated so the whole reply never exceeds SPEAK_MAX_S."""
-    sentences = _split_sentences(text) or ["…"]
-    segs: list[tuple[float, float]] = []
-    t = 0.0
-    for s in sentences:
-        if t >= SPEAK_MAX_S:
-            break
-        words = max(1, len(s.split()))
-        dur   = max(SPEAK_MIN_SENTENCE_S, words * SPEAK_SEC_PER_WORD)
-        end   = min(t + dur, SPEAK_MAX_S)
-        segs.append((t, end))
-        t = end + SPEAK_GAP_S
-    return now, tuple(segs)
-
-
-def _speak_segments_for_duration(text: str, now: float, duration: float
-                                 ) -> tuple[float, tuple[tuple[float, float], ...]]:
-    """Like _speak_segments, but the per-sentence open/close schedule is stretched to fill exactly
-    `duration` — the real synthesized-audio length — so the jaw stops the instant the sound does.
-    Each sentence's span is apportioned by its word count; SPEAK_GAP_S closed pauses sit between
-    sentences (dropped if they alone would exceed the audio). Returns an empty window for a
-    non-positive duration (caller then falls back to the text-timed pantomime)."""
-    if duration <= 0:
-        return now, ()
-    sentences = _split_sentences(text) or ["…"]
-    n = len(sentences)
-    gap = SPEAK_GAP_S if SPEAK_GAP_S * (n - 1) < duration else 0.0
-    speak_total = duration - gap * (n - 1)
-    words = [max(1, len(s.split())) for s in sentences]
-    total_words = sum(words)
-    segs: list[tuple[float, float]] = []
-    t = 0.0
-    for i, w in enumerate(words):
-        dur = speak_total * (w / total_words)
-        segs.append((t, t + dur))
-        t += dur + (gap if i < n - 1 else 0.0)
-    return now, tuple(segs)
-
-
-def speaking_openness_at(now: float, start: float | None,
-                         segments: tuple[tuple[float, float], ...]) -> float | None:
-    """Jaw openness in [0, SPEAK_AMP] at time `now`, or None when the reply is finished /
-    not started. Within a sentence the mouth ramps open, holds, then ramps closed
-    (a trapezoid); between sentences it returns 0.0 (closed but still 'speaking')."""
-    if start is None or not segments:
-        return None
-    t = now - start
-    if t < 0 or t >= segments[-1][1]:
-        return None
-    for s0, s1 in segments:
-        if s0 <= t < s1:
-            dur     = s1 - s0
-            open_t  = min(SPEAK_OPEN_S, dur / 2.0)
-            close_t = min(SPEAK_CLOSE_S, dur / 2.0)
-            local   = t - s0
-            if open_t > 0 and local < open_t:
-                env = local / open_t
-            elif close_t > 0 and local > dur - close_t:
-                env = (dur - local) / close_t
-            else:
-                env = 1.0
-            return SPEAK_AMP * max(0.0, min(1.0, env))
-    return 0.0  # in a between-sentence pause — mouth closed, still mid-reply
-
-
-def load_persona() -> str:
-    """Read persona.txt fresh on every call — cheap relative to STT+LLM latency, and gives
-    free 'edits apply on the next turn' behavior with no file-watcher or caching needed.
-    Falls back to _DEFAULT_PERSONA on any read failure or empty content — must never hard-fail."""
-    try:
-        content = PERSONA_PATH.read_text().strip()
-    except OSError as exc:
-        print(f"[voice_assistant] WARNING: could not read {PERSONA_PATH} ({exc}) — using default persona")
-        return _DEFAULT_PERSONA
-    if not content:
-        print(f"[voice_assistant] WARNING: {PERSONA_PATH} is empty — using default persona")
-        return _DEFAULT_PERSONA
-    return content
-
-
-def build_chat_messages(system_prompt: str, history: list[dict], user_text: str) -> list[dict]:
-    """Pure helper: system prompt + capped rolling history + new user turn."""
-    capped = history[-(MAX_HISTORY_TURNS * 2):]
-    return [{"role": "system", "content": system_prompt}, *capped, {"role": "user", "content": user_text}]
-
-
-# Ollama reports its own per-request timings, in nanoseconds, on every non-streamed response.
-# They were being discarded, which is what made "Kai feels slow" unactionable: these three numbers
-# are the only thing that tells the causes apart, and each has a different fix.
-#   prompt_eval_*  — how long the PROMPT took to evaluate. Large means the KV cache prefix is being
-#                    invalidated every turn (see the context placement note in _call_ollama).
-#   eval_*         — token generation. A tok/s well under the GPU figure means the model got placed
-#                    on CPU (see ensure_llm_warm / log_model_placement).
-#   load_duration  — non-zero means the model was evicted and reloaded, which is ~48 s on this box.
-_NS_PER_MS = 1_000_000
-
-
-def _tok_per_s(count, duration_ns) -> float:
-    """Tokens per second from Ollama's (count, nanoseconds) pair. 0.0 when either is missing or
-    zero — this only ever feeds a log line, so it must not raise on a partial response."""
-    try:
-        return (count / (duration_ns / 1e9)) if count and duration_ns else 0.0
-    except (TypeError, ZeroDivisionError):
-        return 0.0
-
-
-def _log_llm_timings(data: dict, label: str = "turn") -> dict:
-    """Log Ollama's own timings for one response and return them as milliseconds.
-
-    Best-effort and never raises: a mocked or partial response (no timing fields at all) logs
-    nothing and returns zeros, so this can sit on the hot path without being able to cost a reply."""
-    if not isinstance(data, dict):
-        return {}
-    prompt_n  = data.get("prompt_eval_count") or 0
-    prompt_ns = data.get("prompt_eval_duration") or 0
-    gen_n     = data.get("eval_count") or 0
-    gen_ns    = data.get("eval_duration") or 0
-    load_ns   = data.get("load_duration") or 0
-    out = {
-        "llm_prompt_ms": int(prompt_ns // _NS_PER_MS),
-        "llm_gen_ms":    int(gen_ns // _NS_PER_MS),
-        "llm_load_ms":   int(load_ns // _NS_PER_MS),
-        "llm_prompt_tokens": int(prompt_n),
-        "llm_gen_tokens":    int(gen_n),
-        "llm_tok_s":         round(_tok_per_s(gen_n, gen_ns), 1),
-    }
-    if not (prompt_ns or gen_ns):
-        return out          # nothing measured (e.g. a stubbed response) — don't print an empty line
-    # The load line is separate and only printed when it fires: a reload is a different event from a
-    # slow turn, and burying it in the common case is how it stayed invisible.
-    if out["llm_load_ms"]:
-        print(f"[llm] MODEL RELOADED: {out['llm_load_ms']}ms — placement was re-decided, "
-              f"check `ollama ps` for the GPU/CPU split", flush=True)
-    if not OLLAMA_LOG_TIMINGS:
-        return out          # the reload warning above stays regardless — it is rare and actionable
-    print(f"[llm] {label}: prompt {out['llm_prompt_tokens']} tok in {out['llm_prompt_ms']}ms "
-          f"({_tok_per_s(prompt_n, prompt_ns):.0f} tok/s) | "
-          f"gen {out['llm_gen_tokens']} tok in {out['llm_gen_ms']}ms "
-          f"({out['llm_tok_s']:.1f} tok/s)", flush=True)
-    return out
-
-
-def _ollama_request(messages: list[dict]) -> dict:
-    """POST to Ollama's chat endpoint and return the parsed response body. Raises RuntimeError with
-    a human-readable message on failure.
-
-    Returns the decoded JSON rather than the Response object so callers read the body — and the
-    timing fields above — exactly once."""
-    options = {"num_ctx": OLLAMA_NUM_CTX}
-    if OLLAMA_NUM_GPU is not None:      # None = let Ollama auto-decide the GPU/CPU split (fast path)
-        options["num_gpu"] = OLLAMA_NUM_GPU
-    if OLLAMA_NUM_PREDICT is not None:  # bound the reply: unbounded generation was paid for twice,
-        options["num_predict"] = OLLAMA_NUM_PREDICT   # once generating and again synthesizing it
-    try:
-        resp = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": messages,
-                "stream": False,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
-                "options": options,
-            },
-            timeout=OLLAMA_TIMEOUT_S,
-        )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(
-            f"Ollama unavailable — check `ollama pull {OLLAMA_MODEL}` "
-            f"and that the service is running ({exc})"
-        ) from exc
-    return resp.json()
-
-
-def log_model_placement() -> dict:
-    """Log whether Ollama actually put the model on the GPU, by asking `/api/ps`.
-
-    This is the failure config/voice.py already documents but nothing ever reported: Ollama decides
-    the CPU/GPU split at LOAD time from whatever memory is free, OLLAMA_KEEP_ALIVE=-1 then pins that
-    choice for the life of the service, and after hours of uptime GPU fragmentation produces a
-    partial offload that runs at roughly half speed. From the outside that is indistinguishable from
-    "Kai is being slow today", which is exactly why it needs a line in the log.
-
-    Purely diagnostic and entirely best-effort — every failure path returns {} after at most a
-    warning, so this can never affect a reply. Returns the parsed size/size_vram pair when known."""
-    # Derived from OLLAMA_URL so there is one host to configure, not two. The chat endpoint is
-    # ".../api/chat"; the process list is its sibling.
-    ps_url = OLLAMA_URL.rsplit("/", 1)[0] + "/ps"
-    try:
-        resp = requests.get(ps_url, timeout=OLLAMA_PS_TIMEOUT_S)
-        resp.raise_for_status()
-        models = resp.json().get("models") or []
-    except (requests.exceptions.RequestException, ValueError, AttributeError) as exc:
-        print(f"[llm] could not read model placement from {ps_url} ({exc})", flush=True)
-        return {}
-    entry = next((m for m in models if m.get("name", "").startswith(OLLAMA_MODEL.split(":")[0])),
-                 None)
-    if entry is None:
-        print(f"[llm] {OLLAMA_MODEL} is not loaded — the next reply pays the model load", flush=True)
-        return {}
-    total = entry.get("size") or 0
-    vram  = entry.get("size_vram") or 0
-    if not total:
-        return {}
-    pct = 100.0 * vram / total
-    mb = 1024 * 1024
-    if pct >= 99.0:
-        print(f"[llm] {entry.get('name')} fully on GPU ({vram // mb} MB VRAM)", flush=True)
-    else:
-        # The actionable half: this is the ~2x slowdown, and the fix is a restart/reboot to
-        # defragment, not a config change.
-        print(f"[llm] WARNING: {entry.get('name')} is only {pct:.0f}% on GPU "
-              f"({vram // mb} of {total // mb} MB) — generation will run roughly half speed. "
-              f"Restart ollama (or reboot) to defragment GPU memory before relying on it.",
-              flush=True)
-    return {"size": total, "size_vram": vram, "gpu_pct": round(pct, 1)}
 
 
 class VoiceAssistant:

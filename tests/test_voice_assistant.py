@@ -6,27 +6,12 @@ import requests
 
 from ai import voice_assistant
 from ai.tts import clean_for_speech
+from config.voice import OLLAMA_MODEL
 from ai.voice_assistant import (
     VoiceAssistant,
     MicChoice,
     WHISPER_BEAM_SIZE, WHISPER_INITIAL_PROMPT,
-    build_chat_messages,
-    latin_letter_ratio,
-    load_persona,
-    transcript_rejection,
-    speaking_openness_at,
-    _best_allowed_language,
-    _speak_segments,
-    _speak_segments_for_duration,
-    _split_sentences,
-    _DEFAULT_PERSONA,
-    MAX_HISTORY_TURNS,
     NO_SPEECH_RESPONSE,
-    OLLAMA_MODEL,
-    SPEAK_AMP,
-    SPEAK_GAP_S,
-    SPEAK_MAX_S,
-    SPEAK_MIN_SENTENCE_S,
     STATUS_DONE,
     STATUS_ERROR,
     STATUS_IDLE,
@@ -42,161 +27,6 @@ def make_segment(text: str):
     seg = MagicMock()
     seg.text = text
     return seg
-
-
-class TestBuildChatMessages(unittest.TestCase):
-    def test_system_prompt_first(self):
-        msgs = build_chat_messages("sys", [], "hello")
-        self.assertEqual(msgs[0], {"role": "system", "content": "sys"})
-
-    def test_appends_user_turn_last(self):
-        msgs = build_chat_messages("sys", [], "hello")
-        self.assertEqual(msgs[-1], {"role": "user", "content": "hello"})
-
-    def test_includes_history_in_order(self):
-        history = [
-            {"role": "user", "content": "a"},
-            {"role": "assistant", "content": "b"},
-        ]
-        msgs = build_chat_messages("sys", history, "c")
-        self.assertEqual(msgs, [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "a"},
-            {"role": "assistant", "content": "b"},
-            {"role": "user", "content": "c"},
-        ])
-
-    def test_truncates_to_max_history_turns(self):
-        history = []
-        for i in range(MAX_HISTORY_TURNS + 5):
-            history.append({"role": "user", "content": f"u{i}"})
-            history.append({"role": "assistant", "content": f"a{i}"})
-        msgs = build_chat_messages("sys", history, "new")
-        # system + capped history + new user turn
-        self.assertEqual(len(msgs), 1 + MAX_HISTORY_TURNS * 2 + 1)
-
-
-class TestLoadPersona(unittest.TestCase):
-    def test_reads_custom_content(self):
-        mock_path = MagicMock()
-        mock_path.read_text.return_value = "Custom persona text.\n"
-        with patch("ai.voice_assistant.PERSONA_PATH", mock_path):
-            self.assertEqual(load_persona(), "Custom persona text.")
-
-    def test_missing_file_falls_back_to_default(self):
-        mock_path = MagicMock()
-        mock_path.read_text.side_effect = OSError("no such file")
-        with patch("ai.voice_assistant.PERSONA_PATH", mock_path):
-            self.assertEqual(load_persona(), _DEFAULT_PERSONA)
-
-    def test_empty_file_falls_back_to_default(self):
-        mock_path = MagicMock()
-        mock_path.read_text.return_value = "   \n"
-        with patch("ai.voice_assistant.PERSONA_PATH", mock_path):
-            self.assertEqual(load_persona(), _DEFAULT_PERSONA)
-
-
-class _Seg:
-    """A faster-whisper segment, only the fields the sanity gate reads."""
-
-    def __init__(self, text="hello", avg_logprob=-0.2, no_speech_prob=0.05):
-        self.text = text
-        self.avg_logprob = avg_logprob
-        self.no_speech_prob = no_speech_prob
-
-
-class TestLatinLetterRatio(unittest.TestCase):
-    def test_plain_english(self):
-        self.assertEqual(latin_letter_ratio("what time is it"), 1.0)
-
-    def test_tagalog_with_accents_is_latin(self):
-        # Tagalog's only extras are ñ and Spanish loanword accents — all Latin. This must never
-        # be mistaken for a foreign script.
-        for text in ("anong oras na", "magandáng umaga", "señor", "kumustá ka"):
-            with self.subTest(text=text):
-                self.assertEqual(latin_letter_ratio(text), 1.0)
-
-    def test_cjk_is_not_latin(self):
-        self.assertEqual(latin_letter_ratio("嘿哀"), 0.0)
-
-    def test_punctuation_digits_and_emoji_are_ignored(self):
-        # They are not alphabetic, so they can neither trip the check nor dilute a bad transcript
-        # into passing it.
-        self.assertEqual(latin_letter_ratio("set a timer for 5 minutes — ok? 🎉"), 1.0)
-        self.assertEqual(latin_letter_ratio("123 !?, —"), 1.0)
-
-    def test_no_letters_at_all_is_treated_as_fine(self):
-        self.assertEqual(latin_letter_ratio(""), 1.0)
-        self.assertEqual(latin_letter_ratio("..."), 1.0)
-
-    def test_mixed_script_is_proportional(self):
-        self.assertAlmostEqual(latin_letter_ratio("hey嘿"), 3 / 4)
-
-
-class TestTranscriptRejection(unittest.TestCase):
-    """The hole this closes: WHISPER_LANGUAGES restricts the detected-language LABEL only. A clip
-    labelled 'en' is never re-transcribed, so a decode that emitted '嘿哀' — or invented a sentence out
-    of fan noise — reached the LLM and was answered as though someone had asked it."""
-
-    def test_good_transcript_is_kept(self):
-        self.assertEqual(transcript_rejection("what time is it", [_Seg()]), "")
-
-    def test_foreign_script_is_rejected(self):
-        reason = transcript_rejection("嘿哀", [_Seg(text="嘿哀")])
-        self.assertIn("Latin", reason)
-
-    def test_the_measured_real_world_hallucination(self):
-        # Observed on the robot: "hey kai" decoded as these. The first is caught by script; the
-        # second is Latin and must fall to the confidence gate instead, not slip through.
-        self.assertNotEqual(transcript_rejection("嘿哀", [_Seg(text="嘿哀")]), "")
-        self.assertNotEqual(
-            transcript_rejection("Hẹc gai!", [_Seg(text="Hẹc gai!", avg_logprob=-1.6)]), "")
-
-    def test_low_confidence_is_rejected_even_in_english(self):
-        reason = transcript_rejection("open the door", [_Seg(avg_logprob=-2.0)])
-        self.assertIn("unintelligible", reason)
-
-    def test_the_worst_segment_decides(self):
-        # One confidently-wrong stretch is enough to make the transcript a different question than
-        # the one that was asked, so the minimum governs — not the mean.
-        segs = [_Seg(avg_logprob=-0.1), _Seg(avg_logprob=-3.0), _Seg(avg_logprob=-0.1)]
-        self.assertNotEqual(transcript_rejection("a b c", segs), "")
-
-    def test_words_decoded_out_of_silence_are_rejected(self):
-        reason = transcript_rejection("Thank you.", [_Seg(text="Thank you.", no_speech_prob=0.95)])
-        self.assertIn("no_speech_prob", reason)
-
-    def test_empty_text_is_not_a_rejection(self):
-        # Empty is handled upstream as "didn't catch that"; calling it a rejection would double-log.
-        self.assertEqual(transcript_rejection("", [_Seg(avg_logprob=-9.0)]), "")
-
-    def test_missing_fields_disable_only_that_gate(self):
-        # A faster-whisper version that renames or omits a field must degrade to "gate off", never
-        # to a TypeError that fails every turn.
-        class Bare:
-            text = "what time is it"
-
-        self.assertEqual(transcript_rejection("what time is it", [Bare()]), "")
-
-    def test_non_numeric_fields_are_ignored_rather_than_compared(self):
-        self.assertEqual(
-            transcript_rejection("hello", [_Seg(avg_logprob=MagicMock(),
-                                                no_speech_prob=MagicMock())]), "")
-
-    def test_numpy_floats_are_honoured(self):
-        # np.float64 is a numbers.Real, so it must NOT be skipped as "not a number".
-        segs = [_Seg(avg_logprob=np.float64(-2.5))]
-        self.assertNotEqual(transcript_rejection("hello", segs), "")
-
-    def test_script_guard_can_be_switched_off(self):
-        with patch("ai.voice_assistant.TRANSCRIPT_SCRIPT_GUARD", False):
-            self.assertEqual(transcript_rejection("嘿哀", [_Seg(text="嘿哀")]), "")
-
-    def test_each_gate_can_be_disabled_with_none(self):
-        with patch("ai.voice_assistant.TRANSCRIPT_MIN_AVG_LOGPROB", None):
-            self.assertEqual(transcript_rejection("hello", [_Seg(avg_logprob=-9.0)]), "")
-        with patch("ai.voice_assistant.TRANSCRIPT_MAX_NO_SPEECH_PROB", None):
-            self.assertEqual(transcript_rejection("hello", [_Seg(no_speech_prob=0.99)]), "")
 
 
 class TestEnsureInputResolved(unittest.TestCase):
@@ -434,7 +264,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             result = va._call_ollama("hello")
         self.assertEqual(result, "reply")
         _, kwargs = mock_post.call_args
@@ -454,7 +284,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
              patch("ai.voice_assistant.rag.retrieve_context", return_value="CONTEXT_TEXT"), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va._call_ollama("hello")
         messages = mock_post.call_args[1]["json"]["messages"]
         system_msg, user_msg = messages[0], messages[-1]
@@ -474,7 +304,7 @@ class TestCallOllama(unittest.TestCase):
         with patch("ai.voice_assistant.RAG_CONTEXT_PLACEMENT", "system"), \
              patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
              patch("ai.voice_assistant.rag.retrieve_context", return_value="CONTEXT_TEXT"), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va._call_ollama("hello")
         messages = mock_post.call_args[1]["json"]["messages"]
         self.assertIn("PERSONA_TEXT", messages[0]["content"])
@@ -488,7 +318,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.rag.retrieve_context", return_value="CONTEXT_TEXT"), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp), \
+             patch("ai.llm.requests.post", return_value=mock_resp), \
              patch.object(va, "_transcribe", return_value="hello"), \
              patch.object(va, "_speak"):
             va._process(np.zeros(16000, dtype=np.int16), rate=16000)
@@ -503,7 +333,7 @@ class TestCallOllama(unittest.TestCase):
             "eval_count": 40, "eval_duration": 2_000_000_000,                # 2 s -> 20 tok/s
         }
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp):
+             patch("ai.llm.requests.post", return_value=mock_resp):
             va._call_ollama("hello")
         t = va.stage_timings()
         self.assertEqual(t["llm_prompt_ms"], 200)
@@ -518,7 +348,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp):
+             patch("ai.llm.requests.post", return_value=mock_resp):
             self.assertEqual(va._call_ollama("hello"), "reply")
         self.assertEqual(va.stage_timings()["llm_tok_s"], 0.0)
 
@@ -528,7 +358,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
              patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va._call_ollama("hello")
         messages = mock_post.call_args[1]["json"]["messages"]
         self.assertEqual(messages[0]["content"], "PERSONA_TEXT")
@@ -539,7 +369,7 @@ class TestCallOllama(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "reply"}}
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va._call_ollama("hello")
         _, kwargs = mock_post.call_args
         self.assertIn("timeout", kwargs)
@@ -550,7 +380,7 @@ class TestCallOllama(unittest.TestCase):
     def test_connection_error_raises_runtime_error(self):
         va = make_assistant()
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
-             patch("ai.voice_assistant.requests.post", side_effect=requests.exceptions.ConnectionError()):
+             patch("ai.llm.requests.post", side_effect=requests.exceptions.ConnectionError()):
             with self.assertRaises(RuntimeError):
                 va._call_ollama("hello")
 
@@ -558,7 +388,7 @@ class TestCallOllama(unittest.TestCase):
 class TestEnsureLlmWarm(unittest.TestCase):
     def test_swallows_connection_error(self):
         va = make_assistant()
-        with patch("ai.voice_assistant.requests.post", side_effect=requests.exceptions.ConnectionError()):
+        with patch("ai.llm.requests.post", side_effect=requests.exceptions.ConnectionError()):
             va.ensure_llm_warm()  # must not raise
 
     def test_posts_a_trivial_request(self):
@@ -568,7 +398,7 @@ class TestEnsureLlmWarm(unittest.TestCase):
         # log_model_placement patched out: it is diagnostics-only, and unpatched it would reach for a
         # real Ollama on localhost from the test suite.
         with patch("ai.voice_assistant.log_model_placement"), \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp) as mock_post:
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
             va.ensure_llm_warm()
         mock_post.assert_called_once()
 
@@ -579,128 +409,17 @@ class TestEnsureLlmWarm(unittest.TestCase):
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": "hi"}}
         with patch("ai.voice_assistant.log_model_placement") as mock_ps, \
-             patch("ai.voice_assistant.requests.post", return_value=mock_resp):
+             patch("ai.llm.requests.post", return_value=mock_resp):
             va.ensure_llm_warm()
         mock_ps.assert_called_once()
 
     def test_skips_placement_probe_when_warm_up_failed(self):
         va = make_assistant()
         with patch("ai.voice_assistant.log_model_placement") as mock_ps, \
-             patch("ai.voice_assistant.requests.post",
+             patch("ai.llm.requests.post",
                    side_effect=requests.exceptions.ConnectionError()):
             va.ensure_llm_warm()
         mock_ps.assert_not_called()
-
-
-class TestLogModelPlacement(unittest.TestCase):
-    def _resp(self, payload):
-        r = MagicMock()
-        r.json.return_value = payload
-        return r
-
-    def test_reports_a_full_gpu_offload(self):
-        payload = {"models": [{"name": f"{OLLAMA_MODEL}", "size": 2000, "size_vram": 2000}]}
-        with patch("ai.voice_assistant.requests.get", return_value=self._resp(payload)):
-            out = voice_assistant.log_model_placement()
-        self.assertEqual(out["gpu_pct"], 100.0)
-
-    def test_reports_a_partial_offload(self):
-        """The ~2x slowdown this whole probe exists to make visible."""
-        payload = {"models": [{"name": f"{OLLAMA_MODEL}", "size": 2000, "size_vram": 900}]}
-        with patch("ai.voice_assistant.requests.get", return_value=self._resp(payload)):
-            out = voice_assistant.log_model_placement()
-        self.assertEqual(out["gpu_pct"], 45.0)
-
-    def test_never_raises_when_ollama_is_unreachable(self):
-        with patch("ai.voice_assistant.requests.get",
-                   side_effect=requests.exceptions.ConnectionError()):
-            self.assertEqual(voice_assistant.log_model_placement(), {})
-
-    def test_handles_model_not_loaded(self):
-        with patch("ai.voice_assistant.requests.get", return_value=self._resp({"models": []})):
-            self.assertEqual(voice_assistant.log_model_placement(), {})
-
-
-class TestSplitSentences(unittest.TestCase):
-    def test_splits_on_terminal_punctuation(self):
-        self.assertEqual(_split_sentences("Hi there. How are you?"), ["Hi there.", "How are you?"])
-
-    def test_no_punctuation_is_one_sentence(self):
-        self.assertEqual(_split_sentences("didn't catch that"), ["didn't catch that"])
-
-    def test_empty_returns_empty(self):
-        self.assertEqual(_split_sentences("   "), [])
-
-
-class TestSpeakSegments(unittest.TestCase):
-    def test_one_segment_per_sentence(self):
-        _, segs = _speak_segments("First one. Second one here.", 0.0)
-        self.assertEqual(len(segs), 2)
-
-    def test_short_sentence_hits_min_floor(self):
-        _, segs = _speak_segments("Hi.", 0.0)
-        self.assertAlmostEqual(segs[0][1] - segs[0][0], SPEAK_MIN_SENTENCE_S)
-
-    def test_gap_between_sentences(self):
-        _, segs = _speak_segments("One two three. Four five six.", 0.0)
-        gap = segs[1][0] - segs[0][1]
-        self.assertAlmostEqual(gap, SPEAK_GAP_S)
-
-    def test_longer_sentence_stays_open_longer(self):
-        _, short = _speak_segments("Hi there now.", 0.0)
-        _, long  = _speak_segments("Hi there now this is a much longer sentence indeed.", 0.0)
-        self.assertLess(short[0][1] - short[0][0], long[0][1] - long[0][0])
-
-    def test_runaway_reply_capped_at_max(self):
-        text = ". ".join(["word " * 5 for _ in range(100)])
-        _, segs = _speak_segments(text, 0.0)
-        self.assertLessEqual(segs[-1][1], SPEAK_MAX_S)
-
-    def test_empty_text_still_produces_a_segment(self):
-        _, segs = _speak_segments("", 0.0)
-        self.assertEqual(len(segs), 1)
-
-
-class TestSpeakingOpennessAt(unittest.TestCase):
-    def test_none_when_no_schedule(self):
-        self.assertIsNone(speaking_openness_at(5.0, None, ()))
-        self.assertIsNone(speaking_openness_at(5.0, 0.0, ()))
-
-    def test_none_before_start(self):
-        _, segs = _speak_segments("Hello there friend.", 10.0)
-        self.assertIsNone(speaking_openness_at(9.0, 10.0, segs))
-
-    def test_none_after_last_sentence(self):
-        _, segs = _speak_segments("Hello there friend.", 0.0)
-        end = segs[-1][1]
-        self.assertIsNone(speaking_openness_at(end, 0.0, segs))
-        self.assertIsNone(speaking_openness_at(end + 1.0, 0.0, segs))
-
-    def test_openness_within_bounds(self):
-        _, segs = _speak_segments("Hello there friend. Nice to meet you.", 0.0)
-        t = 0.0
-        while t < segs[-1][1]:
-            o = speaking_openness_at(t, 0.0, segs)
-            self.assertIsNotNone(o)
-            self.assertGreaterEqual(o, 0.0)
-            self.assertLessEqual(o, SPEAK_AMP + 1e-9)
-            t += 0.02
-
-    def test_opens_at_start_holds_then_closes(self):
-        # A single long sentence: closed-ish at the very edges, wide open in the middle.
-        _, segs = _speak_segments("This is one nice long spoken sentence for testing.", 0.0)
-        s0, s1 = segs[0]
-        mid   = speaking_openness_at((s0 + s1) / 2.0, 0.0, segs)
-        start = speaking_openness_at(s0 + 0.001, 0.0, segs)
-        end   = speaking_openness_at(s1 - 0.001, 0.0, segs)
-        self.assertAlmostEqual(mid, SPEAK_AMP)   # held fully open through the middle
-        self.assertLess(start, mid * 0.5)         # ramps open from ~closed
-        self.assertLess(end, mid * 0.5)           # ramps closed at the end
-
-    def test_mouth_closed_between_sentences(self):
-        _, segs = _speak_segments("First sentence here. Second sentence here.", 0.0)
-        gap_t = (segs[0][1] + segs[1][0]) / 2.0   # midpoint of the between-sentence pause
-        self.assertEqual(speaking_openness_at(gap_t, 0.0, segs), 0.0)
 
 
 class TestSpeakingIntegration(unittest.TestCase):
@@ -716,7 +435,7 @@ class TestSpeakingIntegration(unittest.TestCase):
         with patch("ai.voice_assistant.rag.retrieve_context", return_value=""):
             mock_resp = MagicMock()
             mock_resp.json.return_value = {"message": {"content": "hello there friend"}}
-            with patch("ai.voice_assistant.requests.post", return_value=mock_resp), \
+            with patch("ai.llm.requests.post", return_value=mock_resp), \
                  patch.object(va, "_transcribe", return_value="hi"):
                 va._process(np.zeros((10, 1), dtype="int16"))
         self.assertEqual(va.get_status()["voice_status"], STATUS_DONE)
@@ -729,42 +448,6 @@ class TestSpeakingIntegration(unittest.TestCase):
             va._process(np.zeros((10, 1), dtype="int16"))
         self.assertEqual(va.get_status()["voice_response"], NO_SPEECH_RESPONSE)
         self.assertTrue(va.get_status()["voice_speaking"])
-
-
-class TestSpeakSegmentsForDuration(unittest.TestCase):
-    def test_fills_requested_duration_exactly(self):
-        _, segs = _speak_segments_for_duration("One two. Three four.", 0.0, 5.0)
-        self.assertAlmostEqual(segs[-1][1], 5.0, places=6)
-
-    def test_one_segment_per_sentence(self):
-        _, segs = _speak_segments_for_duration("A here. B here. C here.", 0.0, 3.0)
-        self.assertEqual(len(segs), 3)
-
-    def test_longer_sentence_gets_more_time(self):
-        _, segs = _speak_segments_for_duration("Hi. This one is quite a bit longer indeed.", 0.0, 6.0)
-        self.assertLess(segs[0][1] - segs[0][0], segs[1][1] - segs[1][0])
-
-    def test_gap_between_sentences_and_still_fills_duration(self):
-        _, segs = _speak_segments_for_duration("One two three. Four five six.", 0.0, 4.0)
-        self.assertAlmostEqual(segs[1][0] - segs[0][1], SPEAK_GAP_S, places=6)
-        self.assertAlmostEqual(segs[-1][1], 4.0, places=6)
-
-    def test_zero_duration_is_empty(self):
-        _, segs = _speak_segments_for_duration("Hello.", 0.0, 0.0)
-        self.assertEqual(segs, ())
-
-    def test_negative_duration_is_empty(self):
-        _, segs = _speak_segments_for_duration("Hello.", 0.0, -2.0)
-        self.assertEqual(segs, ())
-
-    def test_empty_text_single_segment_filling_duration(self):
-        _, segs = _speak_segments_for_duration("   ", 0.0, 2.0)
-        self.assertEqual(len(segs), 1)
-        self.assertAlmostEqual(segs[-1][1], 2.0, places=6)
-
-    def test_start_time_is_passed_through(self):
-        start, _ = _speak_segments_for_duration("Hello there.", 12.5, 2.0)
-        self.assertEqual(start, 12.5)
 
 
 class _InlineThread:
@@ -992,21 +675,6 @@ def _info(language, probs=None, prob=0.9):
     info.language_probability = prob
     info.all_language_probs = probs
     return info
-
-
-class TestBestAllowedLanguage(unittest.TestCase):
-    def test_picks_the_highest_scoring_allowed_language(self):
-        info = _info("cy", [("cy", 0.5), ("tl", 0.3), ("en", 0.1), ("nn", 0.05)])
-        self.assertEqual(_best_allowed_language(info, ("en", "tl")), "tl")
-
-    def test_ignores_disallowed_languages_however_confident(self):
-        info = _info("nn", [("nn", 0.99), ("en", 0.001)])
-        self.assertEqual(_best_allowed_language(info, ("en", "tl")), "en")
-
-    def test_falls_back_to_the_first_allowed_when_probs_are_missing(self):
-        # Older faster-whisper builds don't populate all_language_probs; guess nothing.
-        self.assertEqual(_best_allowed_language(_info("cy", None), ("en", "tl")), "en")
-        self.assertEqual(_best_allowed_language(_info("cy", []), ("tl", "en")), "tl")
 
 
 class TestLanguageRestriction(unittest.TestCase):
