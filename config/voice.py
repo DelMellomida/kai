@@ -307,7 +307,8 @@ MAX_HISTORY_TURNS = 6
 # Kai has no audio (yet), so when a reply is produced we drive the jaw servo for a window
 # sized to how long that text would take to say aloud. The mouth opens once per sentence:
 # ramps open at the start, holds open while "spoken", closes at the end, with a short closed
-# pause between sentences. face_track.py reads speaking_openness() each frame.
+# pause between sentences. The schedule is built in ai/speak_envelope.py and face_track.py reads
+# speaking_openness() each frame.
 SPEAK_SEC_PER_WORD   = 0.34   # ~175 wpm — sets how long each sentence stays open for N words
 SPEAK_MIN_SENTENCE_S = 0.6    # floor so a one-word sentence still visibly opens the jaw
 SPEAK_MAX_S          = 15.0   # overall ceiling so a runaway reply can't pin the jaw forever

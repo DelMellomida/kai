@@ -127,9 +127,9 @@ class ConversationSession:
 
         # Filler bank state. All of it is re-armed by _arm_filler on every entry to BUSY, so a turn
         # can never inherit the previous turn's queue or its already-spoken flag. _filler_rng is a
-        # private Random rather than the module-level one: the sweep in face_track draws from its
-        # own too, and sharing global state across two independent randomised features makes each
-        # one's behaviour depend on how often the other ran.
+        # private Random rather than the module-level one: the sweep in app/control_loop.py draws
+        # from its own too, and sharing global state across two independent randomised features
+        # makes each one's behaviour depend on how often the other ran.
         self._filler_rng = random.Random()
         self._filler_lang = FILLER_DEFAULT_LANG   # latched at the opener, so a turn never switches
         self._filler_delay = 0.0                  # drawn per turn, clamped against the ceiling

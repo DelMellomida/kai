@@ -1,5 +1,8 @@
 """Face-tracking loop knobs — servo mapping, smoothing, jaw, inference cadence, web feed.
-Consumed by face_track.py (INFERENCE_INTERVAL is derived there from INFERENCE_FPS)."""
+
+Consumed by face_track.py (INFERENCE_INTERVAL is derived there from INFERENCE_FPS),
+app/control_loop.py (CONTROL_INTERVAL likewise from CONTROL_FPS), app/camera_supervisor.py, and
+web/server.py (WEB_PORT, UPLOAD_DIR, REBOOT_ENABLED)."""
 
 # Run MediaPipe at this rate. Perception cadence only — it updates the servo *target*; a
 # dedicated control thread (CONTROL_FPS) drives the servo independently.
@@ -58,7 +61,7 @@ FACE_MIN_TRACKING_CONF  = 0.5
 WEB_PORT   = 8081
 UPLOAD_DIR = "/tmp/face_servo_upload"
 
-# ── Reboot control (face_track.py POST /system/reboot) ────────────────────────
+# ── Reboot control (web/server.py POST /system/reboot) ────────────────────────
 # OFF by default, and deliberately so. Every other control on the dashboard is recoverable in
 # place; a reboot is not, and the dashboard has **no authentication at all** — Flask binds
 # 0.0.0.0, so anyone who can reach the robot's port can press anything on it. On a home LAN that
