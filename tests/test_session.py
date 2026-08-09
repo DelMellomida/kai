@@ -1137,6 +1137,34 @@ class TestStart(SessionCase):
         self.assertIsNone(self.voice.attached)
 
 
+class TestStop(SessionCase):
+    """R7. Piper and paplay are child PROCESSES, not threads — the interpreter exiting does not take
+    them with it. A teardown that leaves them running means the replacement process (autostart.sh
+    relaunches within seconds) starts talking over audio the previous one left in the air, with its
+    own self-hearing gate wide open because it knows nothing about that sound."""
+
+    def test_stop_cancels_speech_in_flight(self):
+        s = self.make()
+        self.mock_stop.reset_mock()
+        s.stop()
+        self.mock_stop.assert_called()
+
+    def test_stop_cancels_speech_before_releasing_the_mic(self):
+        # Ordering is the point: the mic close ends this process's claim on the audio devices, and a
+        # synth still running past it is exactly the orphan this closes.
+        s = self.make()
+        order = []
+        self.mock_stop.side_effect = lambda: order.append("tts.stop")
+        self.mic.stop = lambda: order.append("mic.stop")
+        s.stop()
+        self.assertEqual(order, ["tts.stop", "mic.stop"])
+
+    def test_stop_is_idempotent_and_safe_on_a_session_that_never_started(self):
+        s = self.make()
+        s.stop()
+        s.stop()
+
+
 class TestGreeting(SessionCase):
     """"Hi, I'm Kai" on boot: once per process, on the warm thread, and out of the bank's way."""
 
