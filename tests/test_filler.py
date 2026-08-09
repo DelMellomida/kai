@@ -20,10 +20,15 @@ from config.filler import (
 )
 from config.thinking import THINKING_SOUND_DELAY_S
 
-# The distribution the bank was commissioned with: 60% Tagalog, 20% Bisaya, 20% English, in
-# both tiers. Asserted rather than derived, so dropping a line is a test failure and not a
-# silently thinner bank.
-EXPECTED_COUNTS = {"tl": 12, "ceb": 4, "en": 4}
+# The distribution the bank was commissioned with: 60% Tagalog, 20% Bisaya, 20% English.
+# Asserted rather than derived, so dropping a line is a test failure and not a silently thinner
+# bank.
+EXPECTED_OPENERS = {"tl": 12, "ceb": 4, "en": 4}
+
+# The stalls deliberately do NOT follow that split -- see the note in config/filler.py. An opener
+# is drawn once per turn; stalls loop until the answer lands, so a four-line pool laps inside a
+# single wait and repeats where the ear is listening hardest.
+EXPECTED_STALLS = {"tl": 12, "ceb": 10, "en": 10}
 
 BANKS = (("openers", FILLER_OPENERS), ("stalls", FILLER_STALLS))
 
@@ -42,9 +47,17 @@ class TestBankShape(unittest.TestCase):
         self.assertEqual(set(FILLER_OPENERS), set(FILLER_STALLS))
 
     def test_counts_match_the_commissioned_split(self):
-        for tier, bank in BANKS:
+        for (tier, bank), expected in zip(BANKS, (EXPECTED_OPENERS, EXPECTED_STALLS)):
             with self.subTest(tier=tier):
-                self.assertEqual({k: len(v) for k, v in bank.items()}, EXPECTED_COUNTS)
+                self.assertEqual({k: len(v) for k, v in bank.items()}, expected)
+
+    def test_every_stall_pool_outlasts_a_long_wait(self):
+        # The repeat heard on the robot was not a selection bug alone: a pool has to hold more
+        # lines than one wait can spend, or every guard in ai/filler is just choosing which line
+        # to repeat. A ~10 s wait spends 3-4 stalls, so this is roughly two laps of the worst case.
+        for lang, lines in FILLER_STALLS.items():
+            with self.subTest(lang=lang):
+                self.assertGreaterEqual(len(lines), 8)
 
     def test_default_language_exists_in_both_tiers(self):
         # The opener usually fires BEFORE transcription finishes, so the fallback key is the one
@@ -162,7 +175,7 @@ class TestKeys(unittest.TestCase):
 
     def test_every_line_has_a_unique_key(self):
         lines = filler.canned_lines()
-        self.assertEqual(len(lines), sum(EXPECTED_COUNTS.values()) * 2)
+        self.assertEqual(len(lines), sum(EXPECTED_OPENERS.values()) + sum(EXPECTED_STALLS.values()))
 
     def test_keys_do_not_collide_with_the_core_canned_names(self):
         # "ack", "no_speech", "error", "thinking" live in the same dict and the same directory.
@@ -208,12 +221,12 @@ class TestSelection(unittest.TestCase):
     def test_opener_draws_the_whole_bank_eventually(self):
         rng = random.Random(3)
         seen = {filler.pick_opener("tl", rng) for _ in range(500)}
-        self.assertEqual(len(seen), EXPECTED_COUNTS["tl"])
+        self.assertEqual(len(seen), EXPECTED_OPENERS["tl"])
 
     def test_stall_queue_holds_every_line_exactly_once(self):
         # The reason it is a shuffled queue and not an independent draw per gap: this guarantees
         # all 12 are heard before any is heard twice.
-        for lang, n in EXPECTED_COUNTS.items():
+        for lang, n in EXPECTED_STALLS.items():
             with self.subTest(lang=lang):
                 q = filler.stall_queue(lang, random.Random(5))
                 self.assertEqual(sorted(q), sorted(f"filler_st_{lang}_{i}" for i in range(n)))
@@ -238,24 +251,24 @@ class TestSelection(unittest.TestCase):
 
     def test_used_openers_are_skipped(self):
         rng = random.Random(23)
-        used = {f"filler_op_tl_{i}" for i in range(EXPECTED_COUNTS["tl"] - 1)}
+        used = {f"filler_op_tl_{i}" for i in range(EXPECTED_OPENERS["tl"] - 1)}
         for _ in range(50):
             self.assertEqual(filler.pick_opener("tl", rng, used=used),
-                             f"filler_op_tl_{EXPECTED_COUNTS['tl'] - 1}")
+                             f"filler_op_tl_{EXPECTED_OPENERS['tl'] - 1}")
 
     def test_used_stalls_are_skipped(self):
         rng = random.Random(29)
         used = {f"filler_st_tl_{i}" for i in range(4)}
         q = filler.stall_queue("tl", rng, used=used)
         self.assertEqual(set(q) & used, set())
-        self.assertEqual(len(q), EXPECTED_COUNTS["tl"] - 4)
+        self.assertEqual(len(q), EXPECTED_STALLS["tl"] - 4)
 
     def test_an_exhausted_bank_starts_a_second_lap_rather_than_going_quiet(self):
-        # `used` is a preference, not a promise. A conversation can outlast 12 lines, and refusing
+        # `used` is a preference, not a promise. A conversation can outlast the bank, and refusing
         # to repeat would trade a small tell for the exact dead air the module exists to prevent.
         rng = random.Random(31)
-        every_opener = {f"filler_op_tl_{i}" for i in range(EXPECTED_COUNTS["tl"])}
-        every_stall = {f"filler_st_tl_{i}" for i in range(EXPECTED_COUNTS["tl"])}
+        every_opener = {f"filler_op_tl_{i}" for i in range(EXPECTED_OPENERS["tl"])}
+        every_stall = {f"filler_st_tl_{i}" for i in range(EXPECTED_STALLS["tl"])}
         self.assertIn(filler.pick_opener("tl", rng, used=every_opener), every_opener)
         self.assertEqual(sorted(filler.stall_queue("tl", rng, used=every_stall)),
                          sorted(every_stall))
@@ -265,11 +278,92 @@ class TestSelection(unittest.TestCase):
         # uncached key plays nothing, so selecting one puts a gap where the ceiling forbids it.
         rng = random.Random(37)
         have = {"filler_op_tl_0", "filler_st_tl_0"}
-        every = {f"filler_op_tl_{i}" for i in range(EXPECTED_COUNTS["tl"])}
-        every |= {f"filler_st_tl_{i}" for i in range(EXPECTED_COUNTS["tl"])}
+        every = {f"filler_op_tl_{i}" for i in range(EXPECTED_OPENERS["tl"])}
+        every |= {f"filler_st_tl_{i}" for i in range(EXPECTED_STALLS["tl"])}
         for _ in range(50):
             self.assertEqual(filler.pick_opener("tl", rng, have=have, used=every), "filler_op_tl_0")
         self.assertEqual(filler.stall_queue("tl", rng, have=have, used=every), ["filler_st_tl_0"])
+
+
+class TestStallRepeats(unittest.TestCase):
+    """The robot bug of 2026-08-09: the same short filler twice in one exchange.
+
+    The queue itself never repeats -- these all concern what happens at a LAP BOUNDARY, when the
+    soft sets have emptied and the whole bank comes back. The session pops from the END of the
+    returned list, so "the next line played" is keys[-1] throughout."""
+
+    def test_the_line_that_just_played_is_never_the_next_one_out(self):
+        # The failure exactly: a lap ends, the full bank returns, and the shuffle is free to put
+        # the line still ringing in the room at the end of the list. 1-in-N per boundary, and the
+        # small banks hit a boundary inside one wait.
+        every = {f"filler_st_ceb_{i}" for i in range(EXPECTED_STALLS["ceb"])}
+        for seed in range(200):
+            for avoid in sorted(every):
+                q = filler.stall_queue("ceb", random.Random(seed), used=every, avoid=avoid)
+                with self.subTest(seed=seed, avoid=avoid):
+                    self.assertNotEqual(q[-1], avoid)
+
+    def test_avoid_rotates_rather_than_drops(self):
+        # Dropping it would cost the lap a line to protect the one gap it is least likely to be
+        # heard in. It stays in the queue, just not at the front of the queue's mouth.
+        every = {f"filler_st_en_{i}" for i in range(EXPECTED_STALLS["en"])}
+        for seed in range(50):
+            q = filler.stall_queue("en", random.Random(seed), used=every, avoid="filler_st_en_2")
+            with self.subTest(seed=seed):
+                self.assertEqual(sorted(q), sorted(every))
+
+    def test_avoid_still_yields_the_only_line_there_is(self):
+        # Same standing as pick_opener's single-line case: repeating beats going silent.
+        have = {"filler_st_tl_0"}
+        q = filler.stall_queue("tl", random.Random(3), have=have, avoid="filler_st_tl_0")
+        self.assertEqual(q, ["filler_st_tl_0"])
+
+    def test_the_turn_tier_holds_when_the_conversation_tier_has_emptied(self):
+        # Turn two of a conversation that already spent the bank: `used` is full, so it can no
+        # longer express any preference. Everything spent in THIS turn must still be avoided --
+        # that is what keeps a repeat out of one wait, which is where the ear catches it.
+        every = {f"filler_st_en_{i}" for i in range(EXPECTED_STALLS["en"])}
+        turn = {"filler_st_en_0", "filler_st_en_1", "filler_st_en_2"}
+        for seed in range(50):
+            q = filler.stall_queue("en", random.Random(seed), used=every, turn_used=turn)
+            with self.subTest(seed=seed):
+                self.assertEqual(set(q) & turn, set())
+                self.assertEqual(set(q), every - turn)
+
+    def test_both_tiers_exhausted_still_returns_the_whole_bank(self):
+        # The floor under the ladder. Once a turn has been through everything, silence is the
+        # worse answer -- FILLER_MAX_SILENCE_S is the promise this module is accountable to.
+        every = {f"filler_st_en_{i}" for i in range(EXPECTED_STALLS["en"])}
+        q = filler.stall_queue("en", random.Random(5), used=every, turn_used=every)
+        self.assertEqual(sorted(q), sorted(every))
+
+    def test_the_hard_cache_filter_outranks_both_tiers(self):
+        # `have` stays hard no matter how far down the ladder the call falls: an uncached key is
+        # silence, and the ladder exists to prevent repeats, not to create gaps.
+        have = {"filler_st_en_0", "filler_st_en_1"}
+        every = {f"filler_st_en_{i}" for i in range(EXPECTED_STALLS["en"])}
+        q = filler.stall_queue("en", random.Random(7), have=have, used=every, turn_used=every)
+        self.assertEqual(sorted(q), sorted(have))
+
+
+class TestWarmCounts(unittest.TestCase):
+    """What _prewarm_bank prints. The bank total hides the number that actually governs repeats."""
+
+    def test_counts_are_per_language_and_per_tier(self):
+        warm = {"filler_op_tl_0", "filler_op_tl_1", "filler_st_tl_0", "filler_st_en_3"}
+        got = filler.warm_counts(warm)
+        self.assertEqual(got["tl"], (2, 1))
+        self.assertEqual(got["en"], (0, 1))
+        self.assertEqual(got["ceb"], (0, 0))
+
+    def test_a_full_bank_reports_every_line(self):
+        self.assertEqual(filler.warm_counts(set(filler.canned_lines())),
+                         {lang: (EXPECTED_OPENERS[lang], EXPECTED_STALLS[lang])
+                          for lang in EXPECTED_OPENERS})
+
+    def test_keys_that_are_not_ours_are_not_counted(self):
+        self.assertEqual(filler.warm_counts({"ack", "thinking", "filler_st_tl_99"}),
+                         {lang: (0, 0) for lang in EXPECTED_OPENERS})
 
     def test_tagalog_reaches_the_bisaya_bank(self):
         # Whisper has no "ceb" label (config/voice.WHISPER_LANGUAGES is ("en", "tl")), so without

@@ -96,6 +96,17 @@ FILLER_OPENERS = {
 # nudge the listener to try again, half just admit to still thinking.
 #
 # Same language keys as the openers, so a turn never switches language halfway through.
+#
+# NOT split 60/20/20 like the openers, and that is the point. An opener is drawn ONCE per turn, so
+# its per-language count only has to outlast a conversation. Stalls loop until the answer lands --
+# a 10 s wait spends 3-4 of them -- so what governs whether a line repeats is the size of ONE
+# language's pool, not the bank total. At four lines, ceb and en lapped inside a single wait and
+# the same stall was heard twice in one exchange on the robot (2026-08-09). Ten is roughly two
+# laps of a long wait. The length cap can still shrink these below what is written here, which is
+# why session._prewarm_bank now prints the surviving pool per language.
+#
+# The lines added to reach ten have NOT been through the synthesise-and-transcribe pass the
+# docstring requires. The cap is the backstop, not the check: a line that mangles will still play.
 FILLER_STALLS = {
     "tl": [
         "Try mo nga ulit.",
@@ -116,12 +127,24 @@ FILLER_STALLS = {
         "Balik-balika nga.",
         "Hapit na.",
         "Ginaproseso pa.",
+        "Huwat lang.",
+        "Gamay na lang.",
+        "Naghuna-huna pa.",
+        "Hapit na gyud.",
+        "Ay, huwat sa.",
+        "Sige, huwat.",
     ],
     "en": [
         "One sec.",
         "Say that again.",
         "Still cooking.",
         "Almost, almost.",
+        "Hang on.",
+        "Wait lang.",
+        "Still thinking.",
+        "One moment.",
+        "Almost there.",
+        "Give me a sec.",
     ],
 }
 
@@ -134,11 +157,11 @@ FILLER_DEFAULT_LANG = "tl"
 #
 # This knob exists because of a hard constraint upstream: config/voice.WHISPER_LANGUAGES is
 # ("en", "tl"), so Whisper has no "ceb" label and detection can never select the Bisaya bank on
-# its own. Without this the 8 Bisaya lines would be permanently dead weight -- synthesised at
+# its own. Without this the 14 Bisaya lines would be permanently dead weight -- synthesised at
 # startup, never played.
 #
-# 0.25 rather than the bank's own 4-in-16 share, because this fires only on Tagalog turns. It is
-# a deliberate product choice, not an inference about who is speaking: the room is Philippine,
+# 0.25 rather than the opener bank's own 4-in-16 share, because this fires only on Tagalog turns.
+# It is a deliberate product choice, not an inference about who is speaking: the room is Philippine,
 # Bisaya reads as playful rather than wrong to a Tagalog listener, and a filler line is the
 # lowest-stakes place in the whole system to mix them. Set to 0.0 to switch it off entirely.
 # English turns are never affected.

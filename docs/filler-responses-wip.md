@@ -183,7 +183,10 @@ on the Jetson and buys nothing against a mocked synth, so no coverage is lost.
 ## Next steps, in order
 
 1. ~~Fix the 13 tests, then re-run the suite.~~ **Done 2026-08-09 — suite green.**
-2. **Restart the robot** and watch for `[session] filler bank: N/40 lines cached (pass 1, +N)`.
+2. **Restart the robot** and watch for
+   `[session] filler bank: N/52 lines cached (pass 1, +N) [tl 12op/12st, ceb 4op/10st, en 4op/10st]`.
+   The per-language pools in the brackets are the numbers that matter: a stall pool that arrives
+   under ~8 will repeat inside one wait no matter what the total says.
    Confirm no `could not pre-synthesize` storm and no `EOFError` traceback.
 3. **Run `python3 -m scripts.filler_check` on the robot.** Still never run. It flags lines whose
    audio does not match their text, and over-long stalls. Review flags by ear — a Bisaya line can

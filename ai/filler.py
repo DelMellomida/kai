@@ -39,12 +39,28 @@ def canned_lines() -> dict[str, str]:
     return {**_keys(FILLER_OPENERS, OPENER_PREFIX), **_keys(FILLER_STALLS, STALL_PREFIX)}
 
 
+def warm_counts(warm: set[str]) -> dict[str, tuple[int, int]]:
+    """{lang: (openers cached, stalls cached)} for the given set of warm keys.
+
+    Exists because the bank total that _prewarm_bank prints is the wrong number to judge the
+    feature by. A turn draws from ONE language's stalls, so what decides whether a line repeats is
+    that language's pool alone — and "41/44 cached" reads as healthy while hiding an English stall
+    pool of two, which repeats inside a single wait. The length cap silently drops long lines
+    (session._within_length_cap), so a pool can shrink without anyone editing this file: the
+    per-language number has to be printed, not inferred."""
+    return {lang: (sum(1 for i in range(len(FILLER_OPENERS[lang]))
+                       if f"{OPENER_PREFIX}_{lang}_{i}" in warm),
+                   sum(1 for i in range(len(FILLER_STALLS.get(lang, ())))
+                       if f"{STALL_PREFIX}_{lang}_{i}" in warm))
+            for lang in FILLER_OPENERS}
+
+
 def pick_lang(detected: str, rng: random.Random) -> str:
     """Which language bank to draw this turn from, given what Whisper labelled the utterance.
 
     Whisper is constrained to config/voice.WHISPER_LANGUAGES, which is ("en", "tl") — there is no
     "ceb" label, so detection can NEVER select the Bisaya bank on its own. Rather than leave 8 of
-    the 40 lines permanently dead, a Tagalog turn draws from the Bisaya bank FILLER_CEB_SHARE of
+    the 52 lines permanently dead, a Tagalog turn draws from the Bisaya bank FILLER_CEB_SHARE of
     the time. That is a deliberate product choice, not an inference about the speaker: the room is
     Philippine, Bisaya reads as playful rather than wrong to a Tagalog speaker, and the two are
     adjacent enough that a filler line is a low-stakes place to mix them. Set FILLER_CEB_SHARE to
@@ -56,24 +72,37 @@ def pick_lang(detected: str, rng: random.Random) -> str:
     return lang
 
 
-def _available(keys: list[str], have: set[str] | None, used: set[str] | None) -> list[str]:
-    """Warm keys, preferring ones this conversation has not spent yet.
+def _available(keys: list[str], have: set[str] | None = None,
+               spent: tuple[set[str] | None, ...] = ()) -> list[str]:
+    """Warm keys, preferring ones the caller has not spent yet.
 
-    Two filters with very different standing, which is why they are not one argument:
+    Two kinds of filter with very different standing, which is why they are not one argument:
 
     `have` is HARD. An uncached key is a silent one (filler is never synthesised live — see
     session._speak_filler), so selecting one would spend a slot and play nothing, leaving a gap
     exactly where FILLER_MAX_SILENCE_S says there must not be one.
 
-    `used` is SOFT. Not repeating inside one conversation is what keeps canned audio from
-    announcing itself, but it is a preference, not a promise: a conversation can outlast the bank,
-    and going silent because everything has been heard once would trade a small tell for the exact
-    dead air the module exists to prevent. So an exhausted set falls back to the full warm one,
-    which is the conversation quietly starting a second lap."""
+    `spent` is SOFT, and is a LADDER of sets from strongest preference to weakest, each tried only
+    when the one before it has nothing left. Not repeating is what keeps canned audio from
+    announcing itself, but it can never be a promise: a conversation can outlast the bank, and
+    going silent because everything has been heard once would trade a small tell for the exact dead
+    air the module exists to prevent.
+
+    The ladder exists because a single set collapses too early. The stall caller passes
+    (conversation-spent, turn-spent): once a conversation has been through the bank the first rung
+    is empty on EVERY later turn, and with one set that meant the whole bank came straight back —
+    including the line that just played. The second rung keeps the weaker promise that still
+    matters, nothing twice inside ONE turn, instead of dropping to no promise at all. A rung that
+    is None or empty means nothing is spent at that level, so everything below it is moot and the
+    full list is already the answer."""
     if have is not None:
         keys = [k for k in keys if k in have]
-    if used:
-        return [k for k in keys if k not in used] or keys
+    for used in spent:
+        if not used:
+            return keys
+        fresh = [k for k in keys if k not in used]
+        if fresh:
+            return fresh
     return keys
 
 
@@ -89,7 +118,7 @@ def pick_opener(lang: str, rng: random.Random, avoid: str = "",
 
     Returns "" when nothing is warm, which is what lets the session fall back to the old "Hmm"."""
     keys = _available([f"{OPENER_PREFIX}_{lang}_{i}"
-                       for i in range(len(FILLER_OPENERS.get(lang, ())))], have, used)
+                       for i in range(len(FILLER_OPENERS.get(lang, ())))], have, (used,))
     if not keys:
         return ""
     fresh = [k for k in keys if k != avoid] or keys
@@ -97,20 +126,36 @@ def pick_opener(lang: str, rng: random.Random, avoid: str = "",
 
 
 def stall_queue(lang: str, rng: random.Random, have: set[str] | None = None,
-                used: set[str] | None = None) -> list[str]:
-    """The turn's stalls, shuffled, to be consumed in order and refilled when exhausted.
+                used: set[str] | None = None, turn_used: set[str] | None = None,
+                avoid: str = "") -> list[str]:
+    """The turn's stalls, shuffled, to be consumed FROM THE END and refilled when exhausted.
 
     A shuffle rather than an independent draw per gap: independent draws repeat far more often
     than they feel like they should (a 1-in-12 draw hits the same line within three tries about a
     quarter of the time), and a repeat inside one wait is exactly when the ear is listening
     hardest. Consuming a shuffled queue guarantees the whole bank before any line is heard twice.
 
-    The queue is rebuilt per turn, so `used` is what carries the no-repeat promise ACROSS turns:
-    without it "Sandali ha" could open the stalls of three turns in a row, since each turn's
-    shuffle knows nothing about the last one's."""
+    `used` (conversation) and `turn_used` (this turn) are the soft ladder — see _available. The
+    queue is rebuilt whenever it empties, so these are what carry the no-repeat promise ACROSS
+    rebuilds: without them "Sandali ha" could open the stalls of three turns in a row, since each
+    shuffle knows nothing about the last one's.
+
+    `avoid` is the line that just played, and it guards the seam a shuffle cannot. When a lap ends
+    and the ladder bottoms out, the full bank comes back — and the shuffle is free to put the
+    line that just finished at the end of the list, which is the next one popped. That is the
+    back-to-back repeat heard on the robot 2026-08-09: the small banks (ceb and en hold a handful
+    of stalls each) lap inside a single wait, so it landed within one exchange rather than
+    "eventually". Same case pick_opener has always guarded; stalls simply never had it.
+
+    Rotated to the front rather than dropped, because dropping it would cost the lap a line for
+    the sake of the gap it is least likely to be heard in. With one key there is nothing to
+    rotate and the repeat stands: repeating beats going silent, exactly as in pick_opener."""
     keys = _available([f"{STALL_PREFIX}_{lang}_{i}"
-                       for i in range(len(FILLER_STALLS.get(lang, ())))], have, used)
+                       for i in range(len(FILLER_STALLS.get(lang, ())))],
+                      have, (used, turn_used))
     rng.shuffle(keys)
+    if avoid and len(keys) > 1 and keys[-1] == avoid:
+        keys.insert(0, keys.pop())
     return keys
 
 
