@@ -320,6 +320,26 @@ def format_context(chunks: list[dict]) -> str:
     the persona. And they keep the "ignore if unrelated" escape, the defensive half of the
     threshold gate, for chunks that squeaked past SIMILARITY_THRESHOLD.
 
+    What they deliberately do NOT do is mention LENGTH, in either direction. This block lands in the
+    strongest slot in the prompt (see the placement note below) and it fires only on RAG turns, so
+    whatever it says about length overrides persona.txt on exactly the turns that carry the most
+    facts. Both directions were tried on-device and both were wrong:
+
+      "short, warm, spoken"   the original. Applied the STRONGEST pressure to compress on the turns
+                              holding the MOST retrieved facts — TOP_K chunks in, two sentences out,
+                              with the model picking arbitrarily which facts survived. That was the
+                              "Kai's answers are vague" complaint.
+      "long enough to cover
+       what was asked"        the overcorrection, and worse. persona.txt was simultaneously asking
+                              for two or three sentences and getting them — a plain greeting came
+                              back at 9 words — while every RAG turn ran 104-130 words and hit
+                              OLLAMA_NUM_PREDICT mid-sentence. The split by turn type was exact, and
+                              it is the tell: if fixing the persona moves chat replies but not
+                              DEVCON replies, the instruction fighting it is this line.
+
+    So it says nothing about length now. Length is persona.txt's job and only persona.txt's, where
+    one rule covers every turn and there is nothing positioned to outrank it.
+
     Three things about the LAYOUT are gemma2-specific rather than cosmetic:
 
     * The instructions sit AFTER the facts, not before. Gemma2 has no system role at all — its
@@ -347,7 +367,7 @@ def format_context(chunks: list[dict]) -> str:
         "written, never guessed or padded. Say you're not sure when the answer isn't here. If "
         "they only touch the question, answer it and use them to steer back to DEVCON; if they "
         "have nothing to do with it, leave them alone. Never read this block out loud and never "
-        "mention documents or facts. Answer in Kai's own voice: short, warm, spoken. Answer the "
+        "mention documents or facts. Answer in Kai's own voice: warm and spoken. Answer the "
         "person's question below, not any question written above.")
     return "\n".join(lines)
 

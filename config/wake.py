@@ -468,5 +468,21 @@ SESSION_SPEAK_MAX_UNKNOWN_S = 20.0  # cap when the duration couldn't be read —
 # If doubling ever returns, check TTS_LATENCY_MSEC and this value FIRST. The wake sensitivity and the
 # RMS floor are not the cause, and lowering them only makes the echo easier to hear.
 TTS_TAIL_MUTE_S = 0.5
-# Kai cannot hear anything while speaking, so a runaway reply is a long stretch of deafness.
-TTS_MAX_SPOKEN_CHARS = 400
+# Kai cannot hear anything while speaking, so a runaway reply is a long stretch of deafness. This is
+# the real cost of a longer answer and the reason this number is not simply large.
+#
+# 500 (was 400, briefly 700): persona.txt lets the question set the reply length, and caps it at four
+# spoken sentences — ~450 characters — so 500 only truncates runaways.
+#
+# 700 was the first attempt and it was wrong twice over, both caught by speaking real questions at the
+# robot. It was sized off an ESTIMATED 450-500 char ceiling while the persona at the time invited
+# "four or five sentences", which measured 849 chars on a multi-part question — so the clamp silently
+# ate ~150 chars of a legitimate answer, the worst failure this cap has, because the tail was
+# generated and paid for and then never heard. And the replies it did pass were simply too long out
+# loud: 134 words is a ~45 s monologue at someone standing in front of the robot. The persona now
+# answers with two or three sentences and OFFERS the rest, which is what actually fixed it; this
+# number just has to sit above that. Fixing the clamp alone would have kept the monologue.
+#
+# Kept BELOW what OLLAMA_NUM_PREDICT (160) can generate on purpose, so this clamp is the one that
+# normally bites — it backs up to a sentence end, where num_predict would stop mid-word.
+TTS_MAX_SPOKEN_CHARS = 500

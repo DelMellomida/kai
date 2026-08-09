@@ -258,6 +258,41 @@ or volume change.
 | `FILLER_CEB_SHARE` | 0.0 switches the Bisaya bank off entirely |
 | `FILLER_MIN_GAP_S` / `FILLER_MAX_SILENCE_S` | the floor and ceiling every gap is clamped into |
 
+### The tier inversion, and why a killed line is retried on the spot
+
+A second robot symptom, 2026-08-09: **the short stall opened the turn instead of the long line.**
+Not a reordering — `pick_opener` returned `""` because no opener for that language was on disk
+yet, so the turn fell to the "Hmm" and went straight to the stalls
+(`ai/session.py` `_tick_filler`, the `if not key:` branch).
+
+Nothing had been rejected by the cap. The openers had simply lost the warming race, and lost it
+*systematically*:
+
+| Tier | Lines | Failed prewarms | Per line |
+|---|---|---|---|
+| Openers | 20 | 11 | **55%** |
+| Stalls | 32 | 5 | 16% |
+
+`tts` publishes one `_synth_proc` and `stop()` kills whatever is in it when a turn starts. An
+opener is ~8 s of audio to synthesise; a stall is a fraction of a second. The long line is simply
+a much wider target — and a killed line then sat out the **rest of the pass**, which is minutes
+(52 lines, each willing to wait 10 s for quiet). The pass-1 summaries show the result directly:
+
+```
+filler bank: 40/52 lines cached (pass 1, +40) [tl 11op/6st, ceb 1op/10st, en 2op/10st]
+filler bank: 32/52 lines cached (pass 1, +32) [tl  9op/5st, ceb 1op/6st,  en 2op/9st]
+```
+
+`ceb 1op/10st` — the tier the turn needs *first* is the one that is empty. `BANK_LINE_RETRIES`
+now retries a killed synthesis immediately instead of deferring it, so the window closes in
+seconds rather than minutes. Only a dead synthesis is retried: a line that never found a quiet
+window is not (the robot is busy right now, so re-waiting is equally futile), and a line rejected
+by the cap is not (deterministic — it measures the same every time).
+
+Deliberately *not* a hard barrier that finishes all openers before starting any stall. On a robot
+that stays busy, that trades a turn with no opener for a turn with **nothing at all**, which is
+the dead air the whole module exists to prevent.
+
 ### Why Bisaya needs its own route
 
 `config/voice.WHISPER_LANGUAGES` is `("en", "tl")`. There is no `ceb` label, so detection can

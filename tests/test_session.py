@@ -15,8 +15,8 @@ from ai.session import (
 from ai.voice_assistant import STATUS_RECORDING
 import settings
 from config.filler import (
-    FILLER_DELAY_JITTER_S, FILLER_MAX_LINE_S, FILLER_MAX_SILENCE_S, FILLER_MAX_STALL_S,
-    FILLER_MIN_GAP_S, FILLER_PLAYBACK_START_BUDGET_S,
+    BANK_LINE_RETRIES, BANK_PASSES, FILLER_DELAY_JITTER_S, FILLER_MAX_LINE_S, FILLER_MAX_SILENCE_S,
+    FILLER_MAX_STALL_S, FILLER_MIN_GAP_S, FILLER_PLAYBACK_START_BUDGET_S,
 )
 from config.thinking import THINKING_SOUND_DELAY_S, THINKING_SOUND_TEXT
 from config.wake import (
@@ -2027,6 +2027,81 @@ class TestFiller(SessionCase):
         """Make the mocked prewarm behave like a Piper that succeeds on every line."""
         self.mock_prewarm_canned.side_effect = (
             lambda lines, *a, **kw: {k: f"/tmp/{k}.wav" for k in lines})
+
+    def _fails_then_succeeds(self, key: str, failures: int):
+        """Make the mocked prewarm kill `key` its first `failures` times, as tts.stop() does when a
+        turn starts, and succeed on everything else."""
+        seen = {"n": 0}
+
+        def synth(lines, *a, **kw):
+            asked = list(lines)
+            if asked == [key]:
+                seen["n"] += 1
+                if seen["n"] <= failures:
+                    return {}
+            return {k: f"/tmp/{k}.wav" for k in lines}
+
+        self.mock_prewarm_canned.side_effect = synth
+        return seen
+
+    def test_a_killed_synthesis_is_retried_on_the_spot(self):
+        # The bias measured on the robot 2026-08-09: openers failed on 55% of lines against the
+        # stalls' 16%, because they are the longest and tts.stop() kills the one _synth_proc when a
+        # turn starts. Deferring to the next pass is minutes away, so the opener tier sat empty
+        # while the stalls filled -- and the turn opened with a stall instead of the long line.
+        # Pinned to ONE pass, because the later passes are exactly what used to paper over this:
+        # the line does come back eventually, minutes later, which is no use to the turn happening
+        # now. What is being asserted is that it comes back inside the pass that lost it.
+        s = self.make()
+        s._canned = {}
+        self._fails_then_succeeds("filler_op_tl_0", failures=1)
+        with patch("ai.session.BANK_PASSES", 1):
+            s._prewarm_bank()
+        self.assertIn("filler_op_tl_0", s._canned, "a killed line waited for the next pass")
+
+    def test_the_retry_happens_before_the_next_line_is_touched(self):
+        # "Retried" is not enough: retried IMMEDIATELY is the fix. A retry that queues behind the
+        # rest of the bank is the deferral this replaces, just with a shorter name.
+        s = self.make()
+        s._canned = {}
+        self._fails_then_succeeds("filler_op_tl_0", failures=1)
+        s._prewarm_bank()
+        asked = [k for c in self.mock_prewarm_canned.call_args_list for k in c[0][0]]
+        self.assertEqual(asked[:2], ["filler_op_tl_0", "filler_op_tl_0"])
+
+    def test_retries_are_bounded(self):
+        # A line that never comes back must not hold the bank hostage: everything behind it is
+        # still unwarmed, and dead air is the failure the whole module exists to prevent.
+        s = self.make()
+        s._canned = {}
+        self._fails_then_succeeds("filler_op_tl_0", failures=99)
+        s._prewarm_bank()
+        attempts = [k for c in self.mock_prewarm_canned.call_args_list
+                    for k in c[0][0] if k == "filler_op_tl_0"]
+        self.assertEqual(len(attempts), (BANK_LINE_RETRIES + 1) * BANK_PASSES)
+        self.assertIn("filler_op_tl_1", s._canned, "the rest of the bank warmed anyway")
+
+    def test_a_line_over_the_cap_is_not_retried(self):
+        # Deterministic: it will measure the same length every time. Spending the retry budget on
+        # it takes the window away from the lines a retry can actually save.
+        s = self.make()
+        s._canned = {}
+        self._synthesises_everything()
+        with patch("ai.session.tts.wav_duration", return_value=FILLER_MAX_LINE_S + 1.0):
+            s._prewarm_bank()
+        attempts = [k for c in self.mock_prewarm_canned.call_args_list
+                    for k in c[0][0] if k == "filler_op_tl_0"]
+        self.assertEqual(len(attempts), BANK_PASSES, "a rejected line was retried within the pass")
+
+    def test_a_line_that_never_finds_quiet_is_not_retried(self):
+        # The robot is busy RIGHT NOW, so an immediate retry is just as futile as the wait that
+        # just timed out -- and every retry is another BANK_QUIET_WAIT_TRIES of standing still.
+        s = self.make()
+        s._canned = {}
+        self._synthesises_everything()
+        s._set_state(STATE_BUSY, T0)
+        s._prewarm_bank()
+        self.assertEqual(self.mock_prewarm_canned.call_args_list, [])
 
     def test_a_line_over_the_cap_is_never_cached(self):
         # The cap is enforced HERE, at prewarm, rather than warned about: the loop only ever
