@@ -109,6 +109,30 @@ class TestPDAxis(unittest.TestCase):
             pd.reset(120.0)
         self.assertEqual(pd.update(140.0), 124)             # 120 + kp*20
 
+    def test_command_rounds_up_when_nearer_the_higher_degree(self):
+        # R9. int() truncates toward zero and every servo angle is positive, so truncation was a
+        # uniform downward bias of up to a degree. It did not stop at the wire either:
+        # app/control_loop.py stores this return value as last_pan_cmd and uses it as the slew
+        # reference, the hold anchor, and the value reset() re-syncs the PD to.
+        pd = PDAxis(start=90.0, kp=0.28, kd=0.0)
+        self.assertEqual(pd.update(100.0), 93)              # 92.8 -> 93; truncation gave 92
+        self.assertAlmostEqual(pd.current, 92.8, places=6,
+                               msg="internal state must stay float — only the command is rounded")
+
+    def test_command_rounds_down_when_nearer_the_lower_degree(self):
+        pd = PDAxis(start=90.0, kp=0.22, kd=0.0)
+        self.assertEqual(pd.update(100.0), 92)              # 92.2 -> 92
+
+    def test_command_is_always_the_nearest_degree_to_the_internal_state(self):
+        # The invariant, swept rather than spot-checked: whatever the gains, the commanded angle is
+        # never more than half a degree from where the controller actually thinks it is.
+        for kp in (0.05, 0.13, 0.20, 0.37, 0.64):
+            pd = PDAxis(start=90.0, kp=kp, kd=0.0)
+            for target in (0.0, 45.0, 91.0, 137.0, 180.0):
+                with self.subTest(kp=kp, target=target):
+                    cmd = pd.update(target)
+                    self.assertLessEqual(abs(cmd - pd.current), 0.5)
+
     def test_custom_kp_higher_gives_bigger_step(self):
         pd_high = PDAxis(start=90.0, kp=0.5, kd=0.0)
         pd_low  = PDAxis(start=90.0, kp=0.1, kd=0.0)
