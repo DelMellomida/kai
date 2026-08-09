@@ -20,6 +20,33 @@ Conventions:
 
 ---
 
+## 2026-08-10 — Long replies were being cut off mid-sentence, with the jaw still moving
+
+Two independent bugs behind one symptom. Suite green: 1180 passed, 2675 subtests (was 1173).
+
+- **`STATE_SPEAKING` guillotined every reply at 20 s.** `_enter_speaking` armed
+  `SESSION_SPEAK_MAX_UNKNOWN_S` unconditionally, and that was the only deadline a *healthy* reply
+  ever got — `SESSION_SPEAK_GRACE_S`, commented "allowed overrun past the WAV's own duration",
+  reached only the canned branch. The clock also starts before Piper does, because `on_done` fires
+  from the turn worker the moment the reply text exists. Meanwhile `TTS_MAX_SPOKEN_CHARS` (500)
+  allows ~90 words — about 31 s at `SPEAK_SEC_PER_WORD`. So any answer past ~18 s was cut mid-word
+  by the guard against a *wedged* paplay. `VoiceAssistant.audio_ends_at()` now publishes the WAV's
+  measured end and `session._speaking_deadline()` prefers it, falling back to the 20 s cap only
+  when no length is known — a pantomime, an unreadable header, or the synthesis window. The
+  backstop is intact: a wedged paplay either publishes no end time or overruns the one it did.
+- **Cut audio left the jaw miming on.** The jaw is a `(start, segments)` schedule that
+  `face_track.py` reads every frame; `tts.stop()` only kills the subprocess, and the sole reset in
+  the class was `start_recording()`'s, covering push-to-talk alone. So a filler cut mid-word by an
+  arriving reply went on mouthing the rest of its sentence in silence — up to `FILLER_MAX_LINE_S`,
+  plus the 0.5–1.5 s Piper run before the reply had a window of its own. `_begin_speech()` now
+  retires the outgoing schedule at the one seam every speech path already passes through, and
+  `stop_speech()` pairs the two for the four sites in `ai/session.py` that cut audio directly
+  (ack timeout, speak timeout, push-to-talk interrupt, session end).
+
+Clearing the stale end time in `_begin_speech` is load-bearing for the first fix: `_enter_speaking`
+arms from `on_done`, which fires after `_speak()` has claimed the speaker but before its worker
+knows a duration. A left-over end time from the previous line would cut the new one instantly.
+
 ## 2026-08-10 — Documentation restructure
 
 Docs only — no code behaviour changed. The full test suite is green before and after

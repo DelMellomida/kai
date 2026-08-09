@@ -826,7 +826,7 @@ class ConversationSession:
             if self._state in (STATE_ACK, STATE_BUSY):
                 return {"error": f"busy: {self._state}"}
             if self._state == STATE_SPEAKING:
-                tts.stop()
+                self._cut_speech()
             self._epoch = self._voice.bump_epoch()
             self._scan_token += 1   # a scan result landing mid-PTT must be dropped, not acted on
             self._manual_end = True
@@ -972,11 +972,50 @@ class ConversationSession:
     def _enter_speaking(self, now: float, canned: bool = False) -> None:
         """Caller holds the lock. Sets a hard deadline so a wedged paplay cannot deafen Kai for good
         — a failure that would otherwise be invisible, precisely because the mute gate is keyed on
-        playback."""
+        playback.
+
+        This is the FALLBACK deadline only. It has to be, because nothing here can know how long the
+        reply takes to say: on_done fires from the turn worker the moment the reply text exists, and
+        _speak() hands synthesis to a thread, so at this point Piper has not started. Once the WAV
+        exists the assistant publishes its real end time and _speaking_deadline() prefers that."""
         self._set_state(STATE_SPEAKING, now)
         self._speak_deadline = now + SESSION_SPEAK_MAX_UNKNOWN_S
         if canned:
             self._speak_deadline = now + WAKE_ACK_MAX_S + SESSION_SPEAK_GRACE_S
+
+    def _speaking_deadline(self) -> float:
+        """Caller holds the lock. When STATE_SPEAKING gives up and cuts the audio.
+
+        The WAV's own end plus SESSION_SPEAK_GRACE_S once the assistant knows it, else the fallback
+        _enter_speaking armed. That is what SESSION_SPEAK_GRACE_S ("allowed overrun past the WAV's
+        own duration") was always written for, and until now it reached only the canned branch.
+
+        Why this matters rather than being tidiness: SESSION_SPEAK_MAX_UNKNOWN_S is 20 s and was the
+        ONLY deadline a healthy reply ever got, while TTS_MAX_SPOKEN_CHARS lets a reply run to 500
+        characters — around 90 words, or ~31 s at SPEAK_SEC_PER_WORD. The clock also starts before
+        synthesis, so Piper's run came out of the same 20 s. Every long reply was therefore cut off
+        mid-sentence by the guard against a WEDGED paplay, with the jaw (sized to the real audio)
+        carrying on over the silence. The backstop still works: a paplay that wedges publishes no
+        end time, or overruns the one it published, and both land back on a deadline.
+
+        Guarded because a stubbed assistant in the tests need not publish an end time at all, and a
+        missing one must only ever mean "fall back to the armed cap"."""
+        try:
+            ends_at = self._voice.audio_ends_at()
+        except (AttributeError, TypeError):
+            ends_at = None
+        if ends_at is None:
+            return self._speak_deadline
+        return ends_at + SESSION_SPEAK_GRACE_S
+
+    def _cut_speech(self) -> None:
+        """Stop Kai talking, jaw included. See VoiceAssistant.stop_speech — a bare tts.stop() leaves
+        the mouth miming audio that has already been killed. Guarded so a stub without the method
+        still cuts the audio."""
+        try:
+            self._voice.stop_speech()
+        except (AttributeError, TypeError):
+            tts.stop()
 
     # ── filler ──────────────────────────────────────────────────────────────
 
@@ -1204,18 +1243,18 @@ class ConversationSession:
                 if not self._voice.speech_in_flight():
                     self._set_state(STATE_COOLDOWN, now)
                 elif elapsed >= WAKE_ACK_MAX_S:
-                    tts.stop()
+                    self._cut_speech()
                     self._log("ack timed out")
                     self._set_state(STATE_COOLDOWN, now)
 
             elif state == STATE_SPEAKING:
                 if not self._voice.speech_in_flight():
                     self._set_state(STATE_COOLDOWN, now)
-                elif now >= self._speak_deadline:
+                elif now >= self._speaking_deadline():
                     # Backstop only — the normal exit is above. A wedged paplay would otherwise keep
                     # the mic muted forever, i.e. deafen Kai for good, and invisibly, because the
                     # mute gate is keyed on playback.
-                    tts.stop()
+                    self._cut_speech()
                     self._log("speak timed out")
                     self._set_state(STATE_COOLDOWN, now)
 
@@ -1288,7 +1327,7 @@ class ConversationSession:
         # that just ended.
         self._scan_token += 1
         self._scan_ready_at = now + WAKE_WHISPER_COOLDOWN_S
-        tts.stop()
+        self._cut_speech()
         self._mic.harvest_utterance()   # disarm and drop whatever was buffered
         self._gate.reset()
         self._mic.reset_dsp()

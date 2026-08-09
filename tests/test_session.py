@@ -23,6 +23,7 @@ from config.wake import (
     GREETING_TEXT,
     MAX_UTTERANCE_S, MIN_UTTERANCE_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
     SESSION_MAX_NO_SPEECH_STREAK, SESSION_NO_FACE_S, SESSION_NO_SPEECH_S,
+    SESSION_SPEAK_GRACE_S, SESSION_SPEAK_MAX_UNKNOWN_S,
     SESSION_START_ATTEMPTS, SESSION_START_BACKOFF_S, WAKE_ACK_MAX_S,
     VAD_HANGOVER_S, VAD_RMS_FLOOR, VAD_RMS_FLOOR_HOLD, WAKE_REFRACTORY_S, WAKE_SCAN_HANGOVER_S,
     WAKE_WHISPER_CHECK_MAX_S, WAKE_WHISPER_COOLDOWN_S,
@@ -118,6 +119,8 @@ class FakeVoice:
         self.stt_ready = True               # the turn model is loaded
         self.scan_ready = True              # the tiny wake-scan model is pre-warmed
         self.speaking = False
+        self.audio_end = None               # monotonic end of the audio playing, None = unknown
+        self.speech_cuts = 0                # times stop_speech() cut a line short
         self.gate_open = True               # mic_muted() returns `not gate_open`
         self.turns = []
         self.spoken = []
@@ -161,6 +164,19 @@ class FakeVoice:
     # speech
     def speech_in_flight(self):
         return self.speaking
+
+    def audio_ends_at(self):
+        # None = "length not known", which is the real assistant's answer for the whole synthesis
+        # window and for a silent pantomime. Tests that exercise the duration-sized speak deadline
+        # set this to an absolute time on the fake clock.
+        return getattr(self, "audio_end", None)
+
+    def stop_speech(self):
+        # Deliberately does NOT clear `speaking`: the real assistant releases _tts_active from the
+        # cut worker's finally, under a generation check, so that a cut cannot report silence on
+        # behalf of the line that replaced it.
+        self.speech_cuts += 1
+        self.audio_end = None
 
     def last_language(self):
         # Whisper's label for the previous utterance, which the filler bank reads to pick a
@@ -494,7 +510,48 @@ class TestAckAndCooldown(SessionCase):
         self.voice.speaking = True
         s.tick(T0 + WAKE_ACK_MAX_S + 0.1)
         self.assertEqual(s.state, STATE_COOLDOWN)
-        self.mock_stop.assert_called()
+        # The jaw has to be cut with the audio, so stop_speech() rather than a bare tts.stop().
+        self.assertEqual(self.voice.speech_cuts, 1)
+
+    def test_a_long_reply_is_not_cut_off_by_the_unknown_duration_backstop(self):
+        # The regression this suite existed without: SESSION_SPEAK_MAX_UNKNOWN_S (20 s) is armed
+        # from on_done, BEFORE Piper starts, and was the only deadline a healthy reply ever got —
+        # while TTS_MAX_SPOKEN_CHARS allows ~31 s of speech. Every long answer was guillotined
+        # mid-sentence by the guard against a WEDGED paplay.
+        s = self.make()
+        s._set_state(STATE_SPEAKING, T0)
+        s._speak_deadline = T0 + SESSION_SPEAK_MAX_UNKNOWN_S
+        self.voice.speaking = True
+        self.voice.audio_end = T0 + 31.0        # a full-length reply, as the assistant measured it
+        for i in range(1, 31):
+            s.tick(T0 + i)
+            self.assertEqual(s.state, STATE_SPEAKING, f"cut off at {i}s into a 31s reply")
+        self.assertEqual(self.voice.speech_cuts, 0)
+
+    def test_a_reply_past_its_own_measured_end_is_still_cut(self):
+        # The backstop has to survive: a paplay that wedges overruns the end time it published.
+        s = self.make()
+        s._set_state(STATE_SPEAKING, T0)
+        s._speak_deadline = T0 + SESSION_SPEAK_MAX_UNKNOWN_S
+        self.voice.speaking = True
+        self.voice.audio_end = T0 + 4.0
+        s.tick(T0 + 4.0 + SESSION_SPEAK_GRACE_S - 0.1)
+        self.assertEqual(s.state, STATE_SPEAKING)   # still inside the allowed overrun
+        s.tick(T0 + 4.0 + SESSION_SPEAK_GRACE_S + 0.1)
+        self.assertEqual(s.state, STATE_COOLDOWN)
+        self.assertEqual(self.voice.speech_cuts, 1)
+
+    def test_an_unmeasurable_reply_falls_back_to_the_armed_cap(self):
+        # A silent pantomime, or a WAV whose header wouldn't read, publishes no end time.
+        s = self.make()
+        s._set_state(STATE_SPEAKING, T0)
+        s._speak_deadline = T0 + SESSION_SPEAK_MAX_UNKNOWN_S
+        self.voice.speaking = True
+        self.voice.audio_end = None
+        s.tick(T0 + SESSION_SPEAK_MAX_UNKNOWN_S - 0.1)
+        self.assertEqual(s.state, STATE_SPEAKING)
+        s.tick(T0 + SESSION_SPEAK_MAX_UNKNOWN_S + 0.1)
+        self.assertEqual(s.state, STATE_COOLDOWN)
 
     def test_cooldown_holds_while_the_amp_settles(self):
         # paplay exits once the WAV is in the sink buffer, before the amp is actually quiet.
@@ -841,7 +898,8 @@ class TestPushToTalk(SessionCase):
         s = self.make()
         s._set_state(STATE_SPEAKING, T0)
         self.assertEqual(s.request_ptt_start(), {"status": "ok"})
-        self.mock_stop.assert_called()
+        # Audio AND jaw — a reply interrupted by the button must not go on mouthing itself.
+        self.assertEqual(self.voice.speech_cuts, 1)
         self.assertEqual(s.state, STATE_LISTEN_SPEECH)
 
     def test_start_takes_over_a_hands_free_session(self):
