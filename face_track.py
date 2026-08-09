@@ -11,29 +11,26 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import os
-import random
 import socket
 import threading
 import time
-from typing import NamedTuple
 
 import cv2
 import mediapipe as mp
 import numpy as np
 
-from app               import lifecycle
+from app               import control_loop, lifecycle
 from app.camera_supervisor import CameraSupervisor
 from web.server         import Dashboard
 from web.state          import DashboardState
 from vision.camera      import CameraThread, NullCamera
-from vision.controller  import EMAFilter, PDAxis, TrackingTarget
+from vision.controller  import EMAFilter, TrackingTarget
 from vision.face_params import FaceParams, NOSE_TIP, PROCESS_W, PROCESS_H, compute_face_params, classify_emotion
 from vision.gesture     import GestureDetector
 from vision            import presence
 from servo.servo        import ServoSerial
-from ai.voice_assistant import STATUS_THINKING, STATUS_TRANSCRIBING, VoiceAssistant
+from ai.voice_assistant import VoiceAssistant
 from ai.session        import ConversationSession
 from ai import rag
 import settings
@@ -53,21 +50,13 @@ class _NullServo:
 # Tunable knobs live in config/tracking.py; re-imported here so the names stay module-level.
 from config.tracking import (
     INFERENCE_FPS, NO_FRAME_SLEEP, EMA_ALPHA, PAN_SCALE, TILT_SCALE, MIN_FACE_AREA,
-    JAW_CLOSED, JAW_OPEN, JAW_EMA_ALPHA, JAW_DEADBAND, PAN_MAX_STEP, EMA_RESET_FRAMES,
-    WEB_PUBLISH_INTERVAL, PAN_KP, PAN_KD, FACE_MIN_DETECTION_CONF, FACE_MIN_TRACKING_CONF,
-    WEB_PORT, UPLOAD_DIR, CONTROL_FPS, CONTROL_STALE_TIMEOUT, SERVO_ABSENCE_FRAMES,
-    NO_FACE_LOG_INTERVAL_S, CONTROL_LOG_INTERVAL_S,
+    JAW_CLOSED, JAW_OPEN, JAW_EMA_ALPHA, JAW_DEADBAND, EMA_RESET_FRAMES,
+    WEB_PUBLISH_INTERVAL, FACE_MIN_DETECTION_CONF, FACE_MIN_TRACKING_CONF,
+    WEB_PORT, UPLOAD_DIR, SERVO_ABSENCE_FRAMES, NO_FACE_LOG_INTERVAL_S,
 )
-from config.servo import PAN_DEADBAND      # the control loop needs it to know when a send is a no-op
 from config.wake import SESSION_START_ATTEMPTS, SESSION_START_BACKOFF_S
-from config.thinking import (
-    THINKING_SWEEP_AMP_JITTER, THINKING_SWEEP_DEG, THINKING_SWEEP_PERIOD_JITTER,
-    THINKING_SWEEP_PERIOD_S, THINKING_SWEEP_RETURN_DPS, THINKING_SWEEP_START_S,
-    THINKING_SWEEP_WANDER_FRAC, THINKING_SWEEP_WANDER_RATIO,
-)
 
 INFERENCE_INTERVAL = 1.0 / INFERENCE_FPS   # derived from INFERENCE_FPS
-CONTROL_INTERVAL   = 1.0 / CONTROL_FPS     # servo control-loop period (decoupled from inference)
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -182,170 +171,6 @@ def _speaking_jaw(openness: float) -> int:
     """Map speaking openness (0..1 from the voice assistant) onto a jaw servo angle,
     using the same closed/open range as the human-mouth mirror."""
     return int(round(JAW_CLOSED + (JAW_OPEN - JAW_CLOSED) * openness))
-
-
-# ── "Thinking" pan sweep ──────────────────────────────────────────────────────
-# The two statuses that mean "Kai has stopped listening and is working out a reply". Read off the
-# assistant, not the session's projected voice_status: the projection exists for the dashboard and
-# reports "recording" while a session listens, which is not the window we want.
-_THINKING_STATUSES = (STATUS_TRANSCRIBING, STATUS_THINKING)
-
-
-class SweepShape(NamedTuple):
-    """One thinking window's randomly drawn sweep. Immutable and drawn once per window, so the motion
-    within a window is smooth and deterministic while no two windows look alike."""
-    main_amp:      float   # degrees
-    main_period:   float   # seconds
-    wander_amp:    float   # degrees
-    wander_period: float   # seconds
-    direction:     float   # +1 or -1: which way the head goes first
-
-
-def _draw_sweep(rng: random.Random) -> SweepShape:
-    """Draw the shape for one thinking window.
-
-    Amplitude and period are jittered and the starting direction is a coin flip, so the gesture is not
-    the same arc every turn. main_amp + wander_amp == amp by construction, which is what keeps
-    THINKING_SWEEP_DEG a hard bound on the sum rather than on each component separately."""
-    amp    = THINKING_SWEEP_DEG * rng.uniform(*THINKING_SWEEP_AMP_JITTER)
-    period = THINKING_SWEEP_PERIOD_S * rng.uniform(*THINKING_SWEEP_PERIOD_JITTER)
-    return SweepShape(
-        main_amp      = amp * (1.0 - THINKING_SWEEP_WANDER_FRAC),
-        main_period   = period,
-        wander_amp    = amp * THINKING_SWEEP_WANDER_FRAC,
-        wander_period = period * THINKING_SWEEP_WANDER_RATIO,
-        direction     = rng.choice((-1.0, 1.0)),
-    )
-
-
-def _thinking_offset(elapsed: float, shape: SweepShape) -> float:
-    """Pan offset in degrees for a head that is thinking, `elapsed` seconds in. 0 before the dead time.
-
-    Two sines at incommensurate periods, so the path never repeats even on a long think. Pure — the
-    randomness is all in `shape`, drawn by the caller — so the maths stays testable with no hardware
-    and no seeding. Both components start at sin(0) = 0, so the sweep grows out of wherever the head
-    already was instead of stepping to one side of it."""
-    if elapsed < THINKING_SWEEP_START_S:
-        return 0.0
-    t = elapsed - THINKING_SWEEP_START_S
-    main   = shape.main_amp   * math.sin(2.0 * math.pi * t / shape.main_period)
-    wander = shape.wander_amp * math.sin(2.0 * math.pi * t / shape.wander_period)
-    return shape.direction * (main + wander)
-
-
-def _ease_toward(current: float, target: float, max_step: float) -> float:
-    """Move `current` toward `target` by at most `max_step`. Also pure.
-
-    This is what stops the head jerking back to the tracked angle when a reply lands mid-swing: the
-    offset walks home at THINKING_SWEEP_RETURN_DPS instead of vanishing in one tick."""
-    delta = target - current
-    if abs(delta) <= max_step:
-        return target
-    return current + (max_step if delta > 0 else -max_step)
-
-
-def _control_loop(servo, target: TrackingTarget, stop_evt: threading.Event) -> None:
-    """Dedicated servo control thread — decoupled from MediaPipe inference.
-
-    Runs at a fixed CONTROL_FPS and drives the pan PD controller toward the LATEST target set
-    by the inference thread, so the head glides smoothly *between* inference ticks instead of
-    stepping only on them. Each command stays bounded by PAN_MAX_STEP, so the per-command
-    current draw is unchanged (only the cadence is fixed and inference-independent — see the
-    brownout note in config/servo.py). Owns pan_pd + last_pan_cmd (moved out of the main loop).
-
-    On no-face / stale target it HOLDS: sends nothing (so the firmware idle-detach still relaxes
-    the servos) and keeps the PD synced to the held position so re-acquire doesn't jump.
-
-    While the assistant is thinking it adds a slow ±THINKING_SWEEP_DEG pan offset on top of whatever
-    it would otherwise be doing (config/thinking.py). The offset RIDES ON the tracked or held angle
-    rather than replacing it, so the person stays framed; last_pan_cmd and the PD stay anchored to the
-    un-swept position, so re-acquire still glides from where the head really was."""
-    pan_pd       = PDAxis(start=90, kp=PAN_KP, kd=PAN_KD)
-    last_pan_cmd = 90.0
-    next_tick    = time.monotonic()
-    ticks        = 0
-    last_rate_t  = next_tick
-    logged_face  = None      # face_present as of the last [control] line; None = nothing logged yet
-    sweep_off      = 0.0     # live thinking offset in degrees; eased, never snapped
-    thinking_since = None    # monotonic time thinking began; None means "not thinking"
-    sweep_settled  = True    # has the head been returned to the anchor since the last sweep?
-    sweep_shape    = None    # this window's randomly drawn arc; redrawn on each entry into thinking
-    sweep_rng      = random.Random()
-    sweep_max_step = THINKING_SWEEP_RETURN_DPS * CONTROL_INTERVAL
-    while not stop_evt.is_set():
-        pan_t, tilt_t, face_present, updated_at = target.snapshot()
-        now   = time.monotonic()
-        stale = (now - updated_at) > CONTROL_STALE_TIMEOUT
-
-        # Thinking is tracked LOCALLY off the assistant's own status: one dict copy under an
-        # uncontended lock at CONTROL_FPS, and no new shared mutable or lock to reason about. (The
-        # heavier _session.get_status() is deliberately not used here.)
-        if _voice.get_status()["voice_status"] in _THINKING_STATUSES:
-            if thinking_since is None:
-                thinking_since = now
-                # Draw the arc ONCE, here, on entry. Drawing per tick would resample the amplitude and
-                # period every 67 ms and turn a smooth sweep into noise.
-                sweep_shape = _draw_sweep(sweep_rng)
-        else:
-            thinking_since = None
-        # Gated on BOTH toggles: "Follow faces" off has to mean the head does not move at all, sweep
-        # included. Don't drop the servo_tracking half in a refactor.
-        want_off = 0.0
-        if (thinking_since is not None
-                and settings.get("thinking_sweep") and settings.get("servo_tracking")):
-            want_off = _thinking_offset(now - thinking_since, sweep_shape)
-        sweep_off = _ease_toward(sweep_off, want_off, sweep_max_step)
-
-        # "Follow faces" off routes into the existing HOLD branch rather than a new code path: nothing
-        # is sent, so the firmware's idle-detach relaxes the servos, and the PD stays synced so
-        # switching it back on glides instead of snapping.
-        if not face_present or stale or not settings.get("servo_tracking"):
-            pan_pd.reset(last_pan_cmd)     # hold: resync PD so re-acquire glides, no jump
-            # A held head still sweeps while thinking — the offset is what moves, around the held
-            # position. Once it has eased back to 0 we go quiet again, so idle-detach still fires.
-            anchor = int(round(last_pan_cmd))
-            if round(sweep_off) != 0:
-                servo.send(int(round(anchor + sweep_off)), servo.last_tilt)
-                sweep_settled = False
-            elif not sweep_settled:
-                # One explicit command AT the anchor before going quiet. Necessary because send() is
-                # gated to 10 Hz while this loop runs at 15: the easing's last steps toward 0 can be
-                # dropped, and simply falling silent then leaves the head parked a few degrees off the
-                # anchor — physically out of sync with last_pan_cmd, which is the desync that costs a
-                # jump on the next re-acquire. Retried until send() reports it landed.
-                if abs(anchor - servo.last_pan) <= PAN_DEADBAND or servo.send(anchor, servo.last_tilt):
-                    sweep_settled = True
-        else:
-            pan_out = pan_pd.update(pan_t)
-            if abs(pan_out - last_pan_cmd) > PAN_MAX_STEP:   # bound per-command travel (current safety)
-                pan_out = last_pan_cmd + (PAN_MAX_STEP if pan_out > last_pan_cmd else -PAN_MAX_STEP)
-                pan_pd.reset(pan_out)
-            last_pan_cmd = pan_out
-            # servo.send() clamps to SERVO_MIN/MAX, so the offset can never drive into a stop.
-            servo.send(int(round(pan_out + sweep_off)), int(round(tilt_t)))
-            # Tracking sends every tick, so it needs no anchor-return of its own — it just has to leave
-            # the flag honest for whenever this drops into the hold branch.
-            sweep_settled = round(sweep_off) == 0
-
-        # Lightweight observability: effective control rate (shows decoupling working). Edge-
-        # triggered on face presence, plus a slow heartbeat — see CONTROL_LOG_INTERVAL_S for why.
-        # Reuses `now` from the top of the tick — a send takes well under the window's precision.
-        ticks += 1
-        elapsed = now - last_rate_t
-        if face_present != logged_face or elapsed >= CONTROL_LOG_INTERVAL_S:
-            # flush=True: stdout is block-buffered to the log file, so force this out for tuning
-            rate = ticks / elapsed if elapsed > 0 else 0.0
-            print(f"[control] {rate:.1f} Hz  face={face_present}", flush=True)
-            ticks = 0
-            last_rate_t = now
-            logged_face = face_present
-
-        next_tick += CONTROL_INTERVAL
-        delay = next_tick - time.monotonic()
-        if delay > 0:
-            stop_evt.wait(delay)           # sleep but wake immediately on shutdown
-        else:
-            next_tick = time.monotonic()   # fell behind — resync, don't spiral
 
 
 def _annotate_frame(frame, lm, pan: int, tilt: int, jaw: int | None,
@@ -506,7 +331,8 @@ def run(args: argparse.Namespace) -> None:
     target         = TrackingTarget()
     stop_evt       = threading.Event()
     control_thread = threading.Thread(
-        target=_control_loop, args=(servo, target, stop_evt), daemon=True, name="servo-control")
+        target=control_loop.run, args=(servo, target, _voice, stop_evt),
+        daemon=True, name="servo-control")
     control_thread.start()
 
     # Hands-free listening. Started here rather than in _start_web_server() so it comes up with
