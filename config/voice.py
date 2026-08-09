@@ -1,0 +1,399 @@
+"""Voice assistant: audio capture, Whisper STT, Ollama LLM, jaw-speaking pantomime.
+Consumed by ai/voice_assistant.py. (STATUS_* strings, NO_SPEECH_RESPONSE, PERSONA_PATH and
+the default persona stay in voice_assistant.py — protocol/structural, not tuning.)"""
+
+SAMPLE_RATE      = 16000   # Whisper's required input rate — captured audio is resampled to this
+CHANNELS         = 1
+
+# The Jetson's onboard analog input enumerates as a normal input device but isn't wired to
+# anything, so it only captures digital silence (which makes Whisper hallucinate filler like
+# "You"). resolve_input_device() probes candidates for real signal and skips silent ones.
+LIVE_PROBE_DURATION_S    = 0.3
+LIVE_PROBE_RMS_THRESHOLD = 5.0   # low bar — just rules out true digital silence
+# Ceiling on one probe. sd.wait() has no timeout of its own, and a device that opens but never
+# delivers frames (pulse holding the suspended APE card, a half-open I2S route, another opener on
+# the single-opener raw device) blocks it forever. That block lands on the session start path, so
+# without this a hung probe leaves hands-free permanently disabled — and silently, because
+# MicStream.start() never returns to report the failure or trigger the push-to-talk fallback.
+LIVE_PROBE_TIMEOUT_S     = 3.0
+
+# How many EXTRA times to re-read the I2S mic before believing it is silent, and how long to wait
+# between tries. Applies to the I2S device only — see resolve_input_device().
+#
+# The INMP441 can read as exact digital silence on the first capture taken shortly after the XBAR
+# route is applied, while reading normally a second or two later. Measured on 2026-08-09: the boot
+# probe returned rms=0.0, yet the same device on the same route, probed repeatedly from a shell,
+# returned rms 124-435 every time. `arecord` on the raw device confirmed real audio throughout, so
+# the mic and the wiring were never the problem — a single 0.3 s read simply landed too early.
+#
+# The cost of that one bad read is out of all proportion to it: a device that reads silent is
+# skipped for the entire lifetime of the process, so Kai spends the whole session on the fallback
+# USB mic and only a restart can reconsider. Retrying is bounded (retries x (probe + delay), once at
+# startup) and only ever runs for a device that has ALREADY read silent, so a genuinely dead mic
+# costs about two extra seconds at boot and nothing afterwards.
+#
+# Deliberately NOT applied to the USB/system-default devices: they have no such warm-up, so silence
+# from them is a real answer and retrying it would only slow startup down.
+I2S_PROBE_SILENT_RETRIES = 3
+I2S_PROBE_RETRY_DELAY_S  = 0.4
+
+# ── Mic preference ──────────────────────────────────────────────────────────────
+# Kai's default mic is the onboard INMP441 I2S MEMS mic (enabled at the hardware level — see
+# mictest/RESULTS.md); a USB mic is the fallback; anything else / the system default is the last
+# resort. resolve_input_device() classifies each input device by these name substrings
+# (case-insensitive) and probes them in that priority order, picking the first that captures real
+# signal. Requires the ALSA I2S2->ADMAIF1 route to be active (i2s-mic-route.service); if the I2S
+# mic is absent or reads silent, selection degrades gracefully to USB, then the system default.
+I2S_MIC_NAME_HINTS = ("APE", "tegra-dlink", "i2s")  # INMP441 enumerates on card "APE" / PCM "tegra-dlink-0"
+USB_MIC_NAME_HINTS = ("usb",)
+
+# Rates to try for a NON-I2S mic, in order, before giving up on that device. The I2S mic is
+# clock-locked to I2S_CAPTURE_RATE below and ignores this list.
+#
+# This is an arithmetic constraint, not a preference. MicStream resamples with an integer-ratio
+# decimator (ai/audio.py Decimator), so a capture rate that does not divide SAMPLE_RATE cannot be
+# used AT ALL — and the failure is not graceful. On 2026-08-09 the robot booted with the I2S mic
+# reading silent, fell back to the USB C-Media mic, and took the whole voice session down with it:
+#
+#   [mic] resolved device=0 rate=44100 ch=1 i2s=False - opening stream...
+#   [mic] ERROR: cannot resample 44100 Hz: decimation needs an integer ratio, got 44100 -> 16000
+#
+# MicStream.open() returned False, so ConversationSession.start() returned False, so there was no
+# capture stream at all — hands-free off, push-to-talk deaf, sess_state stuck on "disabled". The mic
+# hardware was fine the whole time; only the rate was wrong.
+#
+# resolve_input_device() used to hand back whatever ALSA advertised as `default_samplerate`, which
+# for that dongle is 44100 — the one rate it cannot use. The device's real capability (via
+# `arecord -D hw:0,0 --dump-hw-params`) is S16_LE mono at RATE: [44100 48000]: 16 kHz is impossible
+# and 48 kHz is the only usable rate on the whole device. Nothing about the advertised rate said so.
+#
+# So we no longer trust the advertised rate — we offer only divisible rates and let the liveness
+# probe, which opens the device for real, decide which one the hardware actually accepts. A device
+# where none of these open is skipped rather than returned, because returning it is the bug above.
+FALLBACK_CAPTURE_RATES = (16000, 48000, 32000)   # each must divide evenly into SAMPLE_RATE
+
+# The INMP441 records 2-channel S32 with real audio only in the LEFT slot (its L/R pin is tied to
+# GND); a raw hw: device won't down-mix, so capture stereo and keep this channel. USB/other mics
+# capture mono (CHANNELS above).
+I2S_CAPTURE_CHANNELS = 2
+I2S_TAKE_CHANNEL     = 0   # left channel = the live one
+# Capture the INMP441 at its true I2S clock rate. The route runs I2S2 at 48 kHz; if pulseaudio is
+# left in charge it locks the card to 44100 AND adds noise, which pitch-shifts/garbles speech so
+# Whisper hears nothing. We suspend pulse (see below) and open the raw hw device at this rate.
+# _transcribe resamples 48000 -> SAMPLE_RATE (16000). Set None to use the advertised rate instead.
+I2S_CAPTURE_RATE     = 48000
+
+# pulseaudio grabs the APE card and forces 44100 + injects noise (measured ambient RMS ~9500 vs
+# ~900 on the raw device), garbling the INMP441 so speech won't transcribe. Suspend its capture
+# source so the app can open the raw hw device cleanly at 48 kHz. The source name comes from
+# `pactl list sources short`. Best-effort; set False to disable (e.g. if pulse is removed).
+I2S_SUSPEND_PULSE = True
+I2S_PULSE_SOURCE  = "alsa_input.platform-sound.analog-stereo"
+
+# Release EVERY pulseaudio capture source, not just the I2S one, before probing mics.
+# Any source pulse holds makes the liveness probe of that device block until it times out, and a
+# timed-out probe is treated as "not live" — so the real mic gets skipped and Kai falls back to a
+# pulse-backed 44.1 kHz device, which then fails outright ("decimation needs an integer ratio, got
+# 44100 -> 16000") and takes hands-free down with it. Only became reachable once pulseaudio began
+# starting at boot (`loginctl enable-linger`, needed so replies are not silent before anyone logs in) —
+# before that nothing held the USB card this early. Monitors are skipped: they are output taps and hold
+# no capture hardware.
+PULSE_SUSPEND_ALL_SOURCES = True
+
+# ── I2S capture route (applied at app startup) ────────────────────────────────────
+# The INMP441 overlay is pinmux-only, so the ALSA XBAR/I2S2 capture path must be set up at
+# runtime (see mictest/RESULTS.md). Rather than depend on the external i2s-mic-route.service or a
+# manual SSH session, the app applies this route itself once, via `amixer`, right before it probes
+# for a mic (resolve_input_device -> apply_i2s_route). Best-effort: if `amixer` or the APE card is
+# absent (e.g. on a dev box, or before the device-tree overlay loads) it's skipped and selection
+# falls back to the USB mic. Set the toggle False to rely solely on the systemd service instead.
+I2S_APPLY_ROUTE_ON_STARTUP = True
+I2S_ROUTE_CARD = "APE"
+# (control name, value) pairs, applied in order — the exact working sequence from RESULTS.md.
+I2S_ROUTE_CONTROLS = (
+    ("I2S2 codec master mode",        "cbs-cfs"),   # Jetson = I2S master
+    ("I2S2 codec frame mode",         "i2s"),
+    ("I2S2 Sample Rate",              "48000"),
+    ("I2S2 Capture Audio Bit Format", "32"),
+    ("I2S2 Client Bit Format",        "32"),
+    ("I2S2 Client Channels",          "2"),
+    ("I2S2 Capture Audio Channels",   "2"),
+    ("I2S2 FSYNC Width",              "31"),
+    ("ADMAIF1 Mux",                   "I2S2"),       # XBAR: I2S2 -> ADMAIF1 (capture)
+)
+
+# "base" over "small" is the single biggest turn-latency win available. Measured on this box with a
+# 2.94 s utterance, int8/cpu/4-threads, vad_filter on, 3 runs each:
+#   small + auto-detect  7.81 s (2.66x realtime)  <- was the default, ~50% of the whole turn budget
+#   base  + auto-detect  2.38 s (0.81x realtime)  <- 5.4 s faster
+# The cost is accuracy, and it lands hardest on Tagalog — if transcripts start coming back wrong,
+# this line is the first thing to revert. REVERT: "small"
+WHISPER_MODEL    = "base"
+WHISPER_DEVICE   = "cpu"   # keep off CUDA — leaves iGPU memory for Ollama/MediaPipe
+WHISPER_COMPUTE  = "int8"
+WHISPER_LANGUAGE = None     # None = auto-detect within WHISPER_LANGUAGES; force one with "en"/"tl"
+# Restrict auto-detect to just the languages Kai is actually spoken to in. Whisper always picks from
+# all 99 otherwise, and on short or unclear audio it is confidently wrong: measured on this box, a
+# 2 s clip scored en 0.34, **cy (Welsh) 0.22, nn (Norwegian Nynorsk) 0.21** — which is why replies
+# came back in Spanish and Norwegian.
+#
+# Costs nothing in the normal case: `transcribe(language=None)` already returns probabilities for
+# every language, so the first pass is reused whenever it lands on an allowed one. Only an utterance
+# detected as something else pays a second pass, forced to the best allowed language — and that is
+# precisely the case that was previously returned as garbage. (A pre-emptive detect_language() pass
+# was measured at 88% of a full transcribe, so doing it every time would nearly double turn latency.)
+#
+# Empty tuple or None = allow all 99, i.e. the old behaviour.
+WHISPER_LANGUAGES = ("en", "tl")
+# ctranslate2 defaults to EVERY core, so one transcription takes ~40% of all six — competing with
+# MediaPipe and the servo control loop, and showing up as jittery face tracking rather than as
+# anything audio-shaped. That was tolerable when STT only ran on a button press; the whisper wake
+# tier runs it per nearby utterance. Capped at 4 of 6 to leave the tracking loop its headroom.
+# Watch `[control] N Hz` in the log after changing this. None = ctranslate2's default (all cores).
+WHISPER_CPU_THREADS = 4
+# Beam width for the turn transcribe. faster-whisper defaults to 5; greedy (1) measured 1.29 s vs
+# 1.44 s on base+forced-en and 4.05 s vs 4.46 s on small — a consistent ~10% off every turn, with no
+# transcript differences observed on the test utterances. Raise back to 5 if accuracy regresses.
+WHISPER_BEAM_SIZE = 1
+# Decoder bias for the turn transcribe. Whisper has never heard of DEVCON and renders it as
+# whatever it does know — "defcon", "dev com", "Devon" — which ai/query_alias.py then has to
+# repair by guesswork. Seeding the decoder with the vocabulary it is about to need is the cheaper
+# fix, and it is the only one that reaches multi-word names: "geeks on the beach" is a perfectly
+# ordinary English phrase, so no fuzzy matcher can safely flag it, but a primed decoder writes
+# "Geeks on a Beach" in the first place.
+#
+# Kept to a bare comma-separated name list, and deliberately short. faster-whisper prepends this
+# as previous-context tokens, so a long or sentence-shaped prompt gets *continued* rather than
+# used as vocabulary — that is the same mechanism that makes Whisper emit filler on silence (see
+# vad_filter in _transcribe), and it gets worse the more prose you give it. Not applied to the
+# wake scan: that tier only needs "hey kai" and runs on a weaker model, where the bias would
+# show up as invented DEVCON talk in overheard room noise. None/"" disables.
+WHISPER_INITIAL_PROMPT = ("DEVCON Philippines, DEVCON PH, DevConnect Philippines, Campus DEVCON, "
+                          "Geeks on a Beach, Jumpstart internships, Winston Damarillo, Kai.")
+
+# ── Input level normalisation (ASR only) ──────────────────────────────────────────
+# Whisper receives `audio / 32768.0` and nothing else — so how loud the speaker was is passed
+# straight through to the decoder. That is fine for someone leaning over the robot and bad for
+# someone across the room: level falls ~6 dB per doubling of distance, so a talker at 2 m arrives
+# several times quieter than the close-mic audio every other constant here was tuned against, and
+# Whisper degrades on quiet input for no reason other than the level.
+#
+# This is a LEVEL fix, not a noise fix. It changes no signal-to-noise ratio and cannot rescue audio
+# the mic never really captured; it only stops the decoder being handed a needlessly small number.
+# Applied in ai/voice_assistant._transcribe, i.e. to the ASR path ONLY — the VAD floors and the
+# acoustic wake engines work in absolute int16 units on the un-normalised signal and must keep
+# doing so (see MicStream._asr_signal in ai/session.py for where that split lives).
+ASR_NORMALIZE = True
+# Target RMS in float units (1.0 = full scale). 0.06 is about -24 dBFS — a normal speech level,
+# comfortably clear of the decoder's quiet end and still ~24 dB below clipping.
+ASR_NORMALIZE_TARGET_RMS = 0.06
+# Ceiling on the lift, for the same reason WAKE_AMBIENT_MAX_LIFT exists: an unbounded gain applied
+# to a near-silent buffer produces loud noise, and loud noise is exactly what Whisper hallucinates
+# sentences out of. 8x is ~18 dB, i.e. it reaches roughly 8 m of extra distance and then stops.
+ASR_NORMALIZE_MAX_GAIN = 8.0
+# Never let the lift clip. Checked against the actual peak, so a quiet utterance containing one
+# transient (a door, a table knock) is limited by that transient rather than squared off.
+ASR_NORMALIZE_PEAK_CEILING = 0.95
+# Below this input RMS the buffer is left alone. There is no speech in something this quiet, and
+# amplifying it only manufactures the near-silence hallucinations TRANSCRIPT_MAX_NO_SPEECH_PROB
+# below exists to catch. ~-66 dBFS.
+ASR_NORMALIZE_MIN_RMS = 0.0005
+# Whether the WAKE SCAN's audio is normalised too (the "tiny" model, tier 3). Separate from the
+# turn path on purpose: the scan runs on every nearby utterance including room noise, and that
+# model is documented here as confidently hallucinating whole sentences out of noise. Turn this
+# half off first if false wakes increase — it leaves the turn path, where the win is, untouched.
+ASR_NORMALIZE_SCAN = True
+
+# ── Transcript sanity gate ────────────────────────────────────────────────────────
+# WHISPER_LANGUAGES above restricts the detected-language LABEL. It never looks at the text, and that
+# is a real hole: on unintelligible audio Whisper routinely labels a clip "en" — which IS allowed, so
+# no re-transcribe fires — and then emits something that is not English or Tagalog at all. Observed
+# on this robot: "hey kai" decoded as '嘿哀' and 'Hẹc gai!'. That garbage reached the LLM as if it were
+# a question, and Kai answered it.
+#
+# So the OUTPUT gets checked too. English and Tagalog are both Latin script (Tagalog's only extras
+# are ñ and Spanish loanword accents, all Latin), which makes this an unusually clean test: a
+# transcript whose letters are mostly non-Latin cannot be either language, whatever the label says.
+TRANSCRIPT_SCRIPT_GUARD = True
+# Fraction of ALPHABETIC characters that must be Latin. Not 1.0 — one stray glyph in an otherwise
+# good sentence is not worth throwing a whole turn away. Punctuation, digits, spaces and emoji are
+# not alphabetic and are ignored, so they can neither trip the check nor mask a failure.
+TRANSCRIPT_MIN_LATIN_RATIO = 0.80
+
+# Confidence floor on the decode itself. faster-whisper applies its own log_prob_threshold to decide
+# whether to RETRY at a higher temperature, but it still returns whatever it ended up with — nothing
+# was rejecting a confidently-wrong decode of room noise.
+#
+# -1.0 is faster-whisper's own notion of "this decode went badly", so it is the natural bar. Move
+# toward -0.5 to reject more aggressively if noise still gets through; make it more negative if real
+# speech in a loud room starts being discarded. None disables this half.
+TRANSCRIPT_MIN_AVG_LOGPROB = -1.0
+# Whisper's own estimate that the clip is silence. vad_filter already drops non-speech stretches, so
+# this only catches what survives it — a high value WITH text attached means it decoded words out of
+# something it simultaneously believes is silence, which is the signature of hallucinated filler
+# ("Thank you.", "You", "Thanks for watching!"). None disables.
+TRANSCRIPT_MAX_NO_SPEECH_PROB = 0.80
+
+OLLAMA_URL       = "http://localhost:11434/api/chat"
+OLLAMA_MODEL     = "gemma2:2b"  # switched from gemma3:4b (~4.3GB) to fit the camera in 8GB. REVERT: "gemma3:4b"
+OLLAMA_TIMEOUT_S = 90      # generous — measured ~54s cold-load-to-response on-device
+# Kai is a single-purpose appliance, not a shared server — Ollama has no reason to evict
+# gemma3:4b between turns. A short keep_alive (Ollama's default is 5m) meant any gap longer
+# than that between push-to-talk uses paid the ~48s reload cost again. Keep it loaded for the
+# life of the Ollama service instead.
+OLLAMA_KEEP_ALIVE = -1     # must be a JSON number, not a string — Ollama treats "-1" (string)
+                           # as an invalid Go duration and returns 400 Bad Request
+# Our prompts (short system prompt + a few history turns + a short reply) need nowhere near
+# Ollama's 4096-token default context. On this 8GB Jetson, requesting the full default context
+# left gemma3:4b's KV cache too big to fit alongside the camera/MediaPipe process, so Ollama
+# split the model 45%/55% CPU/GPU (much slower generation). Trimming num_ctx frees enough
+# memory for a full GPU offload — measured ~2x faster token generation as a result.
+# 2048 (was 1024): that reasoning was measured on gemma3:4b, which no longer runs here. On
+# gemma2:2b the extra KV cache costs ~35MB (2232MB -> 2198MB available, measured on-device with
+# the camera up) and buys the headroom RAG turns actually need — a 6-turn session peaked at 959
+# tokens of the old 1024, i.e. 94% full, and Ollama silently drops history to fit (it preserves
+# the system prompt, so the documents survive and the conversation is what rots). 4096 is NOT
+# available: the llama runner terminates on load. Changing this forces one model reload, so do
+# it while face_track.py is stopped rather than mid-conversation.
+# The whole 8 GB shared-memory budget this number lives inside — what is resident, what is left,
+# and why the reload needs the camera down — is written up in README.md § Memory Budget. Read it
+# before changing this line or the model.
+OLLAMA_NUM_CTX   = 2048
+
+# GPU layers for Ollama. None = let Ollama auto-decide the GPU/CPU split (fast — gemma2:2b fits
+# the GPU alongside the camera on a freshly-booted/defragmented Jetson). 0 = force CPU (reliable
+# but too slow for conversation). A positive int forces that many layers on GPU.
+# The `cudaMalloc: out of memory` 500s seen earlier were GPU *fragmentation* after hours of model
+# thrashing — a reboot defragments and GPU inference is fast again. If OOM recurs on long uptimes,
+# free GPU headroom (e.g. disable the desktop GUI: `systemctl set-default multi-user.target`).
+OLLAMA_NUM_GPU   = None
+# Hard cap on generated tokens. Generation was previously unbounded while TTS_MAX_SPOKEN_CHARS (400)
+# silently discarded the overflow — so a long reply cost generation time AND synthesis time for text
+# nobody ever heard. persona.txt already asks for 1-3 sentences and measured replies run 36-52 tokens,
+# so 96 is ~2x typical: it only truncates runaways. Every token saved here is paid back twice, once
+# in generation (~27 tok/s) and again in Piper synthesis (~0.55x realtime). None = uncapped.
+OLLAMA_NUM_PREDICT = 96
+
+# Ceiling on the `/api/ps` placement probe (ai/voice_assistant.log_model_placement). Purely
+# diagnostic, and it runs on the startup warm path, so it must not be able to hold anything up if
+# the Ollama service is wedged — short on purpose, and every failure only logs.
+OLLAMA_PS_TIMEOUT_S = 3.0
+
+# Log Ollama's own per-request timings (prompt eval / generation / model load) after every reply.
+# One line per turn, and the only way to tell a slow prompt from slow generation from a model
+# reload — the three causes of "Kai feels slow", each with a different fix. Set False to quieten it.
+OLLAMA_LOG_TIMINGS = True
+
+# WHERE the retrieved RAG context is placed in the prompt.
+#   "user"   — prepended to the user's turn (default). Keeps the system prompt and the whole rolling
+#              history byte-identical between turns, so Ollama's KV cache can reuse them as a prefix
+#              and only the new context + question is evaluated.
+#   "system" — appended to the system prompt (the original behaviour). The retrieved text then sits
+#              at the FRONT of the prompt and changes every turn, which invalidates the cached
+#              prefix and re-evaluates the persona and all MAX_HISTORY_TURNS of history, every turn.
+# "user" is the faster placement and is also the shape Gemma2's chat template actually expects (it
+# alternates user/assistant strictly, so a mid-conversation system message is not representable).
+# REVERT to "system" if retrieved facts stop being treated as authoritative — ai/rag.format_context's
+# header was tuned with the block in the system position. Verify with the known DEVCON questions.
+RAG_CONTEXT_PLACEMENT = "user"
+
+# user+assistant pairs kept in the rolling context. 6 (was 3): at 3, Kai forgot the opening
+# question by turn 4 and then answered about it confidently anyway ("what was the first thing I
+# asked you?" -> the wrong program). This is the cap that was doing the forgetting, well before
+# Ollama's truncation would. Raise it only alongside OLLAMA_NUM_CTX — the two are one budget.
+MAX_HISTORY_TURNS = 6
+
+# ── Jaw "speaking" pantomime ────────────────────────────────────────────────────
+# Kai has no audio (yet), so when a reply is produced we drive the jaw servo for a window
+# sized to how long that text would take to say aloud. The mouth opens once per sentence:
+# ramps open at the start, holds open while "spoken", closes at the end, with a short closed
+# pause between sentences. face_track.py reads speaking_openness() each frame.
+SPEAK_SEC_PER_WORD   = 0.34   # ~175 wpm — sets how long each sentence stays open for N words
+SPEAK_MIN_SENTENCE_S = 0.6    # floor so a one-word sentence still visibly opens the jaw
+SPEAK_MAX_S          = 15.0   # overall ceiling so a runaway reply can't pin the jaw forever
+SPEAK_GAP_S          = 0.20   # closed pause between sentences
+SPEAK_AMP            = 1.00   # how far the mouth opens (1.0 = fully open) while a sentence is said
+SPEAK_OPEN_S         = 0.22   # ramp-open time at the start of a sentence (smooth, not a snap)
+SPEAK_CLOSE_S        = 0.22   # ramp-close time at the end of a sentence
+
+# ── Text-to-speech (Piper) ────────────────────────────────────────────────────────
+# Kai speaks its replies aloud through the USB audio dongle + PAM8403 amp (PulseAudio sink
+# TTS_SINK). ai/tts.py shells out to Piper (piper-tts, CPU/onnxruntime — no API key, no runtime
+# internet, ~tens of MB RAM, so it fits alongside Ollama/Whisper/MediaPipe on the 8GB Jetson) to
+# synthesize a WAV, then plays it with paplay. When TTS is unavailable (disabled, engine missing,
+# or the voice model absent) the assistant degrades to the silent jaw pantomime above.
+TTS_ENABLED      = True
+TTS_ENGINE       = "piper"
+# How to invoke Piper. `python3 -m piper` matches the installed piper-tts; swap to
+# ["/home/devconph/.local/bin/piper"] if the module entry point ever changes. Text is fed on stdin
+# and the WAV is written with `-m MODEL -f OUTFILE` (flags verified against piper-tts 1.4.2).
+TTS_PIPER_CMD    = ["python3", "-m", "piper"]
+# Voice model, relative to the project root (resolved in ai/tts.py). This is the she/they voice —
+# swap the file (and download its .onnx + .onnx.json) to change how Kai sounds:
+#   python3 -m piper.download_voices <name> --data-dir voices
+# Already downloaded here, all interchangeable by editing this one line:
+#   en_US-hfc_female-medium   natural US female  — the current pick (0.42x realtime synth)
+#   en_GB-jenny_dioco-medium  warm British female                (0.45x)
+#   en_US-libritts_r-medium   most expressive of the mediums     (0.59x)
+#   en_US-lessac-medium       the previous default               (0.30x)
+# AVOID the "-high" models for live conversation: en_US-lessac-high and en_US-ljspeech-high sound
+# better but synthesize at ~0.95x realtime on this Jetson's CPU, i.e. a 7 s reply costs ~7 s of dead
+# air before it starts. Both are in voices/ if you want to A/B them again (/tmp/kai_voice_ab holds
+# the last set of samples).
+TTS_VOICE_MODEL  = "voices/en_US-hfc_female-medium.onnx"
+TTS_LENGTH_SCALE = 1.0   # Piper phoneme length / speaking rate — >1 slower, <1 faster
+TTS_VOLUME       = 1.0   # playback volume, applied to paplay's sink input (1.0 = PA_VOLUME_NORM).
+                         # Applied at playback, NOT at synthesis: TTS_POST_EFFECTS below ends in
+                         # `gain -n -1`, which normalises a synthesis-time gain straight back out
+                         # (measured — identical output peak at 0.4 and 1.6, and 1.6 clipped the raw
+                         # audio). Dashboard-settable, 0..2.
+# PulseAudio sink for playback — the USB dongle/PAM8403. Named (not index 0) so it survives
+# re-enumeration. Find it with `pactl list short sinks`.
+TTS_SINK         = "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo"
+
+# ── Output card profile (asserted before playback) ──────────────────────────────
+# PulseAudio moves this dongle to its DIGITAL (S/PDIF) profile on its own. Observed live: the card
+# was on output:analog-stereo, and minutes later — with nothing reconfigured — had flipped to
+# output:iec958-stereo. When it flips, TTS_SINK above STOPS EXISTING (pactl answers "No such
+# entity"), every paplay exits non-zero, and Kai mimes replies in silence: the samples leave on the
+# optical path while the analog jack — the only one with an amp and speaker on it — stays quiet.
+# Nothing in the log looks audio-shaped, which is what makes this expensive to diagnose from the
+# symptom ("the speaker broke") rather than from the cause.
+# So assert the analog profile instead of trusting Pulse to keep it: once before the first reply,
+# and again before play()'s retry, since this flip is the likeliest reason a playback just failed.
+# Best-effort, exactly like the I2S capture route above — a missing pactl/card only logs.
+TTS_ASSERT_CARD_PROFILE = True
+TTS_CARD         = "alsa_card.usb-C-Media_Electronics_Inc._USB_Audio_Device-00"  # `pactl list short cards`
+# Keep the "+input:mono-fallback" half. This one card carries the dongle's mic as well, and the
+# bare "output:analog-stereo" profile drops that capture source entirely — so asserting the short
+# form here would fix playback by taking a mic away.
+TTS_CARD_PROFILE = "output:analog-stereo+input:mono-fallback"
+# Ceiling on the pactl call above, for the same reason MIXER_TIMEOUT_S exists in config/wake.py: an
+# unresponsive pulseaudio must not be able to wedge the speak worker thread indefinitely.
+TTS_PACTL_TIMEOUT_S = 5.0
+
+TTS_OUTPUT_DIR   = "/tmp"                 # where the transient reply WAV (kai_tts.wav) is written
+# paplay needs XDG_RUNTIME_DIR to find the PulseAudio socket in non-login contexts (the @reboot
+# cron autostart, or an SSH session). ai/tts.py forces this in the playback subprocess env.
+TTS_XDG_RUNTIME  = "/run/user/1000"
+# Ask PulseAudio for a small output buffer instead of its default. Measured on this box:
+#   `pactl list sinks` -> "Latency: 1904406 usec, configured 2000000 usec"
+# i.e. a TWO SECOND buffer, so paplay exited up to 1.9 s before the speaker actually went quiet.
+# That is what made Kai hear his own reply and answer it, and it forced a 2 s deaf window after every
+# reply just to cover the drain. At 200 ms the mic can reopen ~0.5 s after Kai stops (see
+# TTS_TAIL_MUTE_S in config/wake.py), which is the difference between feeling responsive and feeling
+# broken. Raise it if playback ever crackles or underruns; set None to use Pulse's default.
+TTS_LATENCY_MSEC = 200
+
+# ── TTS loudness post-processing ────────────────────────────────────────────────
+# Piper emits a quiet, MONO WAV (~6 dB lower RMS than typical playback, and mono routes to only
+# part of a stereo speaker path). Pipe it through sox to (a) duplicate to stereo so BOTH amp
+# channels are driven, and (b) compress + peak-normalize so speech is as loud as other audio.
+# Best-effort: if sox is missing or the filter fails, ai/tts.py falls back to the raw Piper WAV
+# unchanged (speech still plays, just quieter/mono). Set TTS_POST_PROCESS False to disable.
+TTS_POST_PROCESS  = True
+TTS_POST_SOX      = "sox"   # sox binary (on PATH); swap for an absolute path if needed
+TTS_POST_CHANNELS = 2       # 2 = duplicate mono -> stereo (drive both speaker channels)
+# sox effect chain applied after synthesis: light compression to lift perceived loudness, then
+# peak-normalize to -1 dB. Tune here without touching code (verified against sox 14.4.x).
+TTS_POST_EFFECTS  = ["compand", "0.3,1", "6:-70,-60,-20", "-5", "-90", "0.2", "gain", "-n", "-1"]

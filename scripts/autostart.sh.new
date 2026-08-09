@@ -1,0 +1,315 @@
+#!/bin/bash
+# Runs face_track.py on boot via cron @reboot (no sudo needed).
+# Install: bash autostart.sh --install
+# Remove:  bash autostart.sh --remove
+# Logs:    tail -f ~/kai-logs/face-servo.log     (previous boot: face-servo.log.1)
+#
+# The log deliberately does NOT live in /tmp any more. /tmp is tmpfs and is cleared at boot, so
+# the most common remedy for "Kai didn't start" — reboot it — used to destroy the only evidence of
+# why. The last 5 boots are now kept side by side, rotated by --rotate-log from the cron line
+# BEFORE the redirect opens the new file (rotating from inside this script cannot work: cron's
+# `>>` already holds an fd on the inode, and a mv would silently keep writing to the rotated file).
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"   # project root (face_track.py lives here)
+CRON_TAG="face-servo-autostart"
+
+# HOME is not guaranteed under @reboot cron (see the secrets note below), and an unset one would
+# resolve the log to /kai-logs and silently lose every line. Fall back to the passwd entry, then to
+# /tmp — logging must never be a reason the robot fails to start.
+KAI_HOME="${HOME:-$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)}"
+LOG_DIR="${KAI_LOG_DIR:-${KAI_HOME:-/tmp}/kai-logs}"
+LOG="${LOG_DIR}/face-servo.log"
+LOG_KEEP=5
+
+# ── log rotation ──────────────────────────────────────────────────────────────
+# Called from the cron line as `--rotate-log <path>` before the redirect. Takes the path as an
+# argument rather than recomputing it, so the rotated file and the redirected file can never
+# disagree about where the log lives (the cron line is generated with the path already expanded,
+# at --install time, when HOME is reliably set).
+if [[ "$1" == "--rotate-log" ]]; then
+    target="${2:-$LOG}"
+    mkdir -p "$(dirname "$target")" 2>/dev/null
+    for (( i = LOG_KEEP - 1; i >= 1; i-- )); do
+        [[ -f "${target}.${i}" ]] && mv -f "${target}.${i}" "${target}.$(( i + 1 ))" 2>/dev/null
+    done
+    [[ -f "$target" ]] && mv -f "$target" "${target}.1" 2>/dev/null
+    exit 0
+fi
+
+# ── install / remove helpers ──────────────────────────────────────────────────
+if [[ "$1" == "--install" ]]; then
+    mkdir -p "$LOG_DIR"
+    # `;` between rotate and launch, never `&&`: a rotation that fails for any reason must not be
+    # able to stop the robot from starting. That is the whole point of this file.
+    ( crontab -l 2>/dev/null | grep -v "$CRON_TAG" ; \
+      echo "@reboot sleep 15 && bash ${SCRIPT_DIR}/autostart.sh --rotate-log '${LOG}' >/dev/null 2>&1; bash ${SCRIPT_DIR}/autostart.sh >> '${LOG}' 2>&1  # $CRON_TAG" \
+    ) | crontab -
+    echo "Installed @reboot cron job."
+    echo "Logs will appear at: $LOG   (previous boots: ${LOG}.1 … ${LOG}.${LOG_KEEP})"
+    crontab -l | grep "$CRON_TAG"
+    exit 0
+fi
+
+if [[ "$1" == "--remove" ]]; then
+    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    echo "Removed cron job."
+    exit 0
+fi
+
+echo "[autostart] ===== boot $(date '+%Y-%m-%d %H:%M:%S') — starting Kai from ${ROOT} ====="
+
+# ── preflight: does the source tree still parse? ──────────────────────────────
+# The supervisor loop below restarts on any exit code except 0 and 3, backing off to 60 s and then
+# retrying FOREVER. A syntax error in a fresh edit therefore used to mean a robot that is silently
+# dead until a human notices — and the project is edited over a network share, live, so a half-
+# written file is a real state this can be in.
+#
+# Refusing to start is the right answer there, because the process genuinely cannot run: one clear
+# message naming the file and line beats an unbounded restart loop that buries the log.
+#
+# Two deliberate limits:
+#   - Only the packages the robot imports at runtime are checked. tests/ and scripts/ are excluded,
+#     because a broken test must never become a reason Kai will not boot.
+#   - It compiles in memory and writes no .pyc, so a read-only or full disk cannot turn the guard
+#     itself into a boot failure.
+# Fails SAFE: exit 2 means a syntax error was positively identified, and only that refuses to
+# start. Any other failure of the checker warns and continues.
+python3 - "$ROOT" <<'PYEOF'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+targets = ["face_track.py", "settings.py", "ai", "vision", "servo", "config"]
+bad = []
+for name in targets:
+    p = root / name
+    if p.is_file():
+        files = [p]
+    elif p.is_dir():
+        files = sorted(p.rglob("*.py"))
+    else:
+        print(f"[preflight] WARNING: {p} is missing")
+        continue
+    for f in files:
+        if "__pycache__" in f.parts:
+            continue
+        try:
+            compile(f.read_bytes(), str(f), "exec")
+        except SyntaxError as exc:
+            bad.append(f"{f}:{exc.lineno}: {exc.msg}")
+        except OSError as exc:
+            print(f"[preflight] WARNING: cannot read {f} ({exc}) — not treating as fatal")
+
+for b in bad:
+    print(f"[preflight] SYNTAX ERROR  {b}")
+sys.exit(2 if bad else 0)
+PYEOF
+preflight_rc=$?
+if [[ $preflight_rc -eq 2 ]]; then
+    echo "[autostart] FATAL: the source tree does not parse — refusing to start."
+    echo "[autostart] Fix the file and line named above, then: bash ${SCRIPT_DIR}/autostart.sh"
+    exit 1
+elif [[ $preflight_rc -ne 0 ]]; then
+    echo "[autostart] WARNING: preflight could not run (rc=${preflight_rc}) — starting anyway"
+else
+    echo "[autostart] preflight OK — source tree parses"
+fi
+
+# ── wait for nvargus-daemon ───────────────────────────────────────────────────
+for i in $(seq 1 10); do
+    systemctl is-active --quiet nvargus-daemon && break
+    echo "[autostart] Waiting for nvargus-daemon... ($i/10)"
+    sleep 2
+done
+
+# ── apply INMP441 I2S capture route (best-effort) ─────────────────────────────
+# The app itself also does this (ai/voice_assistant.py: apply_i2s_route) before probing the mic;
+# doing it here too means the route is up even if face_track.py is launched some other way. It is
+# idempotent, needs no sudo (user must be in the `audio` group), and mirrors mictest/RESULTS.md.
+# If the APE card / amixer is absent it's skipped and the app falls back to the USB mic.
+I2S_CARD="APE"
+apply_ctl() { amixer -c "$I2S_CARD" cset name="$1" "$2" >/dev/null 2>&1; }
+if amixer -c "$I2S_CARD" contents >/dev/null 2>&1; then
+    apply_ctl "I2S2 codec master mode"        "cbs-cfs"   # Jetson = I2S master
+    apply_ctl "I2S2 codec frame mode"         "i2s"
+    apply_ctl "I2S2 Sample Rate"              "48000"
+    apply_ctl "I2S2 Capture Audio Bit Format" "32"
+    apply_ctl "I2S2 Client Bit Format"        "32"
+    apply_ctl "I2S2 Client Channels"          "2"
+    apply_ctl "I2S2 Capture Audio Channels"   "2"
+    apply_ctl "I2S2 FSYNC Width"              "31"
+    apply_ctl "ADMAIF1 Mux"                   "I2S2"       # XBAR: I2S2 -> ADMAIF1 (capture)
+    echo "[autostart] applied I2S capture route on card ${I2S_CARD}"
+else
+    echo "[autostart] APE card not found — skipping I2S route (app will fall back to USB mic)"
+fi
+
+# ── PulseAudio access ─────────────────────────────────────────────────────────
+# @reboot cron starts us with no XDG_RUNTIME_DIR, so pactl/paplay can't find the user's
+# PulseAudio socket ($XDG_RUNTIME_DIR/pulse/native). Without it the app's mic setup
+# (ai/voice_assistant.py: free_i2s_device -> pactl suspend-source) fails with "Connection
+# refused", leaving pulse holding the INMP441's APE card at 44.1kHz + injecting noise, so
+# Whisper only ever hears garble (~0.2 language confidence) and voice turns never work.
+# Export it here (respecting an already-set value) so every pulse call in the app succeeds.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# ── secrets ───────────────────────────────────────────────────────────────────
+# Optional: put `export PICOVOICE_ACCESS_KEY=...` in ~/.kai_env to keep it out of the repo and out
+# of the crontab. The app also reads ~/.config/kai/porcupine.key directly, which is the more
+# reliable of the two under @reboot cron (no login shell, and HOME may not even be set) — either
+# source works, and with neither the wake word is simply off and push-to-talk still works.
+# shellcheck source=/dev/null
+[[ -f "${HOME}/.kai_env" ]] && source "${HOME}/.kai_env"
+
+# ── wait for PulseAudio to exist ──────────────────────────────────────────────
+# Exporting XDG_RUNTIME_DIR above only helps if a PulseAudio is actually LISTENING on that socket.
+# Pulse is a per-user-session service, so under @reboot cron -- with nobody logged in -- it may not be
+# running at all, and then every reply dies with "pa_context_connect() failed: Connection refused":
+# Kai looks completely healthy, speaks in the dashboard, animates the jaw, and is silent. That is
+# exactly the failure this waits for, and it is fixed permanently by letting the user manager start at
+# boot without a login:
+#
+#     sudo loginctl enable-linger devconph     # already applied on this robot
+#
+# Kept as a wait-and-warn rather than a hard failure: playback is not worth refusing to start over, and
+# the mic, camera, servos and dashboard are all unaffected.
+PULSE_SOCK="${XDG_RUNTIME_DIR}/pulse/native"
+for i in $(seq 1 20); do
+    [[ -S "$PULSE_SOCK" ]] && pactl info >/dev/null 2>&1 && break
+    echo "[autostart] waiting for PulseAudio at ${PULSE_SOCK}... ($i/20)"
+    sleep 1
+done
+if pactl info >/dev/null 2>&1; then
+    echo "[autostart] PulseAudio ready ($(pactl info 2>/dev/null | sed -n 's/^Default Sink: //p'))"
+    # Hand every capture card back to ALSA BEFORE the app probes mics. The app does this itself
+    # (free_i2s_device), but its first probe can start before the suspend has taken effect — and a probe
+    # of a pulse-held device blocks for 3 s, then reads as "not live", so the real mic gets skipped for a
+    # 44.1 kHz pulse device that cannot resample to 16 kHz and hands-free dies. Doing it here, once,
+    # removes that race. Monitors are left alone: they tap an output and hold no capture hardware.
+    while read -r _ name _; do
+        case "$name" in
+            *.monitor|"") continue;;
+        esac
+        pactl suspend-source "$name" 1 >/dev/null 2>&1 \
+            && echo "[autostart] released capture source from pulse: $name"
+    done < <(pactl list short sources 2>/dev/null)
+else
+    echo "[autostart] WARNING: no PulseAudio on ${PULSE_SOCK} — Kai will run but replies will be" \
+         "SILENT (jaw and dashboard still work). Fix: sudo loginctl enable-linger $(id -un)"
+fi
+
+# ── wait for Ollama to answer ─────────────────────────────────────────────────
+# The only boot dependency that had no wait at all. nvargus, PulseAudio and the capture device are
+# all waited for above; Ollama is `Restart=always` so it comes back on its own, but on a COLD boot it
+# is also loading gemma2:2b (~2.4 GB, and README § Memory Budget records a load that OOM'd once with
+# the camera up). If face_track's ensure_llm_warm fires into a socket that is not listening yet, the
+# warm silently does nothing and the first real turn of the day pays the full ~48 s load instead —
+# which is exactly the "it hung" report, on the first question someone asks at an event.
+#
+# Wait-and-warn, never fatal: wake word, tracking, jaw and the dashboard are all independent of the
+# LLM, and refusing to boot over it would trade a slow first answer for no robot at all.
+OLLAMA_URL="${OLLAMA_HOST:-http://localhost:11434}"
+if command -v curl >/dev/null 2>&1; then
+    for i in $(seq 1 30); do
+        curl -sf --max-time 2 "${OLLAMA_URL}/api/tags" >/dev/null 2>&1 && break
+        echo "[autostart] waiting for Ollama at ${OLLAMA_URL}... ($i/30)"
+        sleep 2
+    done
+    if curl -sf --max-time 2 "${OLLAMA_URL}/api/tags" >/dev/null 2>&1; then
+        echo "[autostart] Ollama ready at ${OLLAMA_URL}"
+    else
+        echo "[autostart] WARNING: no Ollama at ${OLLAMA_URL} after 60s — Kai will hear you and" \
+             "move, but cannot answer. Fix: sudo systemctl status ollama"
+    fi
+else
+    echo "[autostart] curl not found — skipping the Ollama readiness check"
+fi
+
+# ── wait for the capture device to be free ────────────────────────────────────
+# The INMP441 is opened as a RAW hw device, which admits exactly one opener, and opening it while
+# something else still holds it BLOCKS indefinitely rather than failing. On a cold boot nothing else
+# has it; on a manual restart the outgoing face_track may not have released it yet, and the symptom is
+# nasty — hands-free silently never comes up (sess_mic_live stays False) while face tracking runs
+# perfectly, with nothing in the log to say why. A few seconds of patience here avoids that entirely.
+# A function, not a one-shot: the supervisor below re-runs it before every relaunch, because a crash
+# is exactly the case where the device was NOT released tidily.
+wait_for_capture_device() {
+    for i in $(seq 1 15); do
+        busy=0
+        for f in /dev/snd/pcm*c; do fuser "$f" >/dev/null 2>&1 && busy=1; done
+        [[ "$busy" == 0 ]] && return 0
+        echo "[autostart] capture device busy, waiting... ($i/15)"
+        sleep 1
+    done
+}
+wait_for_capture_device
+
+# ── launch, and keep it running ───────────────────────────────────────────────
+# Run from the project root so the servo/ ai/ vision/ packages are importable.
+# --wake turns on hands-free listening ("Hey Kai" + VAD turn-taking, see config/wake.py). Drop it to
+# go back to push-to-talk only; the dashboard mic button works either way.
+#
+# Supervised rather than exec'd. face_track.py's main loop only catches KeyboardInterrupt, so any
+# other exception ends the process — and cron is @reboot, so nothing brought it back until somebody
+# rebooted the robot. Ollama has had Restart=always this whole time; the robot itself had nothing.
+#
+# Exit codes decide whether to restart:
+#   0                       — orderly shutdown (Ctrl-C, or SIGTERM now that face_track handles it).
+#                             Someone asked it to stop, so stop.
+#   3 (_EXIT_ALREADY_RUNNING) — another instance holds the lock. Restarting would spin forever
+#                             against a robot that is already healthy.
+#   7 (_EXIT_RESTART)       — the dashboard's restart button. Relaunch at once, and do NOT count it
+#                             as a failure: a deliberate restart is not a crash.
+#   anything else           — crash or kill: restart.
+#
+# Backoff exists so a start that fails instantly (missing hardware, a syntax error in a fresh edit)
+# does not become a hot loop that buries the log and eats the CPU the running services need. The
+# preflight above now catches the syntax-error case before the loop is ever entered.
+RESTART_DELAY=5          # seconds after a crash that had been running a while
+RESTART_DELAY_MAX=60     # ceiling for repeated fast failures
+MIN_HEALTHY_S=60         # ran at least this long => treat the next failure as a fresh one
+
+# Tells face_track.py that something WILL start it again, so the dashboard's restart button can
+# promise a robot that comes back. Exported here and nowhere else: a run started by hand
+# (scripts/run.sh, or python3 face_track.py over ssh) genuinely has no supervisor, and the button
+# warns instead of quietly leaving the robot off.
+export KAI_SUPERVISED=1
+
+fails=0
+while true; do
+    started=$SECONDS
+    echo "[autostart] $(date '+%Y-%m-%d %H:%M:%S') launching face_track.py"
+    python3 "${ROOT}/face_track.py" --jaw --rotate 90 --no-display --wake
+    rc=$?
+    ran=$(( SECONDS - started ))
+
+    if [[ $rc -eq 0 ]]; then
+        echo "[autostart] face_track exited cleanly (ran ${ran}s) — not restarting"
+        break
+    fi
+    if [[ $rc -eq 3 ]]; then
+        echo "[autostart] another face_track instance is already running — not restarting"
+        break
+    fi
+    if [[ $rc -eq 7 ]]; then
+        echo "[autostart] $(date '+%Y-%m-%d %H:%M:%S') restart requested from the dashboard" \
+             "(ran ${ran}s) — relaunching now"
+        fails=0
+        wait_for_capture_device
+        continue
+    fi
+
+    if [[ $ran -ge $MIN_HEALTHY_S ]]; then
+        fails=0                      # it was up and healthy; this is a new problem, not a loop
+    else
+        fails=$(( fails + 1 ))
+    fi
+    delay=$(( RESTART_DELAY * (fails > 0 ? fails : 1) ))
+    [[ $delay -gt $RESTART_DELAY_MAX ]] && delay=$RESTART_DELAY_MAX
+
+    echo "[autostart] $(date '+%Y-%m-%d %H:%M:%S') face_track exited rc=${rc} after ${ran}s" \
+         "(consecutive fast failures: ${fails}) — restarting in ${delay}s"
+    sleep "$delay"
+    wait_for_capture_device
+done

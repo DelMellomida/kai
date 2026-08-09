@@ -1,0 +1,1236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Meet Kai</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <style>
+    /* Tokens. Only the voice dock reads these so far — the rest of the sheet still uses literals.
+       Values mirror the JS `C` object below exactly; change both or neither. */
+    :root {
+      --accent:      #b6c93f;
+      --accent-text: #d9e88f;
+      --ok:          #34d399;
+      --busy:        #f59e0b;
+      --danger:      #f87171;
+      --mute:        #7b8494;
+      --on-accent:   #0b0b16;   /* text/glyph sitting on a filled accent surface */
+      --mic-color:   var(--accent);   /* rebound per state by .dock.is-* below */
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: radial-gradient(1200px 820px at 72% -12%, #14123c 0%, #070214 58%);
+      color: #eef1f6;
+      -webkit-font-smoothing: antialiased;
+    }
+    #root { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+
+    ::-webkit-scrollbar { width: 9px; height: 9px; }
+    ::-webkit-scrollbar-thumb { background: rgba(182,201,63,0.28); border-radius: 5px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(182,201,63,0.5); }
+
+    button { font-family: inherit; }
+    :focus-visible { outline: 2px solid #b6c93f; outline-offset: 2px; border-radius: 10px; }
+
+    @keyframes fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    /* Still used by the hands-free WakeChip dot (see WakeChip below) — not by the mic. */
+    @keyframes listen-pulse {
+      0%   { box-shadow: 0 0 0 0 rgba(248,113,113,0.55); }
+      70%  { box-shadow: 0 0 0 20px rgba(248,113,113,0); }
+      100% { box-shadow: 0 0 0 0 rgba(248,113,113,0); }
+    }
+
+    /* ── Voice dock: halo rings + breathing orb + processing dots ──
+       Rings scale rather than growing a box-shadow spread, so one keyframe follows the orb from
+       78px down to 68px on phones with no per-breakpoint tuning. The 1.5 cap is measured, not
+       taste: at 78px that puts the outermost ring ~19px past the orb, which the dock's top
+       padding (raised to 22px below) absorbs. Any wider and the ring crosses the dock's top
+       border and washes over the chat above it. */
+    @keyframes halo-ring {
+      0%   { transform: scale(1);   opacity: .55; }
+      70%  { transform: scale(1.5); opacity: 0; }
+      100% { transform: scale(1.5); opacity: 0; }
+    }
+    @keyframes mic-breathe {
+      0%, 100% { transform: scale(1); }
+      50%      { transform: scale(1.05); }
+    }
+    /* px, not em: the orb no longer sets a font-size (its glyph is an SVG), so an em-based
+       bounce would silently inherit the body's size instead of the orb's. */
+    @keyframes mic-dot-bounce {
+      0%, 80%, 100% { transform: translateY(0);    opacity: .55; }
+      40%           { transform: translateY(-6px); opacity: 1; }
+    }
+    @keyframes gesture-flash { 0% { opacity: 1; transform: scale(1.03); } 70% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: scale(0.98); } }
+
+    .fade { animation: fade-in .35s ease both; }
+    .gesture-badge { animation: gesture-flash 1.6s ease forwards; }
+
+    /* Header */
+    .hdr {
+      flex-shrink: 0; height: 58px; display: flex; align-items: center; gap: 14px;
+      padding: 0 20px; z-index: 5;
+      background: rgba(7,2,20,0.72);
+      backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+    .seg { display: flex; gap: 3px; padding: 3px; border-radius: 11px;
+      background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10); }
+    .seg button {
+      border: none; background: transparent; color: #aab3c2;
+      font-size: 13px; font-weight: 600; padding: 7px 16px; border-radius: 8px;
+      cursor: pointer; transition: background .15s, color .15s;
+    }
+    .seg button[aria-pressed="true"] { background: rgba(182,201,63,0.20); color: #d9e88f; }
+    .seg button:hover { color: #eef1f6; }
+
+    /* Body */
+    .body { flex: 1; min-height: 0; display: flex; padding: 20px; gap: 20px; overflow: hidden; }
+
+    /* Talk view. The camera panel (.eye/.eye-frame/.eye-overlay) was removed — the conversation
+       now owns the whole width. The live feed still lives on Telemetry as .cam. */
+    .talk { flex: 1; min-height: 0; display: flex; }
+    .convo { flex: 1; min-width: 0; display: flex; flex-direction: column;
+      background: rgba(10,14,42,0.55); border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 20px; overflow: hidden;
+      max-width: 820px; margin: 0 auto; }   /* a full-width chat line is unreadable on a desktop */
+    /* Hands-free status strip; only rendered when a session is running. */
+    .convo-bar { flex-shrink: 0; display: flex; justify-content: flex-end; padding: 10px 12px 0; }
+    .chat { flex: 1; min-height: 0; overflow-y: auto; padding: 22px;
+      display: flex; flex-direction: column; gap: 12px; }
+    .chat-empty { margin: auto; text-align: center; color: #7b8494; font-size: 15px;
+      max-width: 300px; line-height: 1.5; }
+    .bubble { max-width: 78%; padding: 11px 15px; border-radius: 16px; font-size: 15px;
+      line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; animation: fade-in .25s ease both; }
+    .b-user { align-self: flex-end; background: rgba(182,201,63,0.16);
+      border: 1px solid rgba(182,201,63,0.30); border-bottom-right-radius: 5px; }
+    .b-kai { align-self: flex-start; background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.11); border-bottom-left-radius: 5px; }
+    .bubble .who { display: block; font-size: 11px; font-weight: 700; letter-spacing: .06em;
+      text-transform: uppercase; margin-bottom: 3px; opacity: .75; }
+
+    /* ── Voice dock ──
+       One variable, --mic-color, carries the state: the orb fill, the halo rings, the shadow tint
+       and the label colour all read from it, and each .is-* class rebinds it once. The colours are
+       the same five the JS token object used before, so nothing shifts hue.
+       --mic-glow carries that hue pre-multiplied: color-mix() would be tidier but is dropped
+       whole-declaration on older WebKit, which would silently cost the orb its elevation. */
+    .dock { flex-shrink: 0; display: flex; flex-direction: column; align-items: center; gap: 9px;
+      padding: 22px 16px 18px;   /* top raised from 18px to clear the halo's outermost ring */
+      border-top: 1px solid rgba(255,255,255,0.08); background: rgba(7,2,20,0.35); }
+    .dock.is-idle      { --mic-color: var(--accent); --mic-glow: rgba(182,201,63,.34);  --mic-glow-lift: rgba(182,201,63,.46); }
+    .dock.is-listening { --mic-color: var(--danger); --mic-glow: rgba(248,113,113,.36); --mic-glow-lift: rgba(248,113,113,.48); }
+    .dock.is-thinking  { --mic-color: var(--busy);   --mic-glow: rgba(245,158,11,.34);  --mic-glow-lift: rgba(245,158,11,.46); }
+    .dock.is-speaking  { --mic-color: var(--accent); --mic-glow: rgba(182,201,63,.34);  --mic-glow-lift: rgba(182,201,63,.46); }
+    .dock.is-error     { --mic-color: var(--danger); --mic-glow: rgba(248,113,113,.36); --mic-glow-lift: rgba(248,113,113,.48); }
+
+    /* The rings live on this wrapper, not on .mic: .mic is a flex container, so pseudo-elements
+       there would join the flex flow and push the glyph off-centre. */
+    .mic-wrap { position: relative; display: grid; place-items: center; }
+    .mic-wrap::before, .mic-wrap::after {
+      content: ''; position: absolute; inset: 0; border-radius: 50%;
+      border: 2px solid var(--mic-color); opacity: 0; pointer-events: none; z-index: 0;
+    }
+    .dock.is-listening .mic-wrap::before,
+    .dock.is-listening .mic-wrap::after { animation: halo-ring 1.9s cubic-bezier(.22,.61,.36,1) infinite; }
+    .dock.is-listening .mic-wrap::after { animation-delay: .95s; }
+    /* Speaking is Kai's turn, not yours: one slower ring, so it never reads as "recording". */
+    .dock.is-speaking .mic-wrap::before { animation: halo-ring 2.6s ease-out infinite; }
+
+    .mic { position: relative; z-index: 1;
+      width: 78px; height: 78px; border-radius: 50%; border: none; cursor: pointer;
+      background: var(--mic-color); color: var(--on-accent);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 16px var(--mic-glow);
+      transition: transform .12s ease, background .2s, box-shadow .2s; }
+    .mic svg { display: block; width: 34px; height: 34px; }
+    .mic:hover:not(:disabled) { box-shadow: 0 7px 22px var(--mic-glow-lift); }
+    .mic:active { transform: scale(0.94); }
+    .mic:disabled { cursor: default; }
+    .dock.is-listening .mic { animation: mic-breathe 1.9s ease-in-out infinite; }
+
+    /* Processing: Google's three-dot bounce, replacing the old rotating spinner. */
+    .mic-dots { display: flex; align-items: center; gap: 5px; }
+    .mic-dots span { width: 8px; height: 8px; border-radius: 50%; background: var(--on-accent);
+      animation: mic-dot-bounce 1.1s ease-in-out infinite; }
+    .mic-dots span:nth-child(2) { animation-delay: .15s; }
+    .mic-dots span:nth-child(3) { animation-delay: .3s; }
+
+    .state-label { font-size: 15px; font-weight: 700; min-height: 21px; text-align: center;
+      color: var(--mic-color); }
+    /* min-height, and always rendered: the 'speaking' state has no sub-line, and letting the
+       element disappear shortened the dock by ~21px, so the orb and the whole chat above it
+       jumped every time Kai started talking. */
+    .hint { font-size: 12px; color: var(--mute); min-height: 15px; text-align: center; }
+    .errbar { margin: 0 16px; font-size: 12px; color: #fca5a5; background: rgba(248,113,113,0.12);
+      border: 1px solid rgba(248,113,113,0.35); border-radius: 8px; padding: 6px 10px; text-align: center; }
+
+    .chip { display: flex; align-items: center; gap: 7px; padding: 6px 11px; border-radius: 20px;
+      font-size: 12px; font-weight: 600; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); pointer-events: auto; }
+
+    /* Telemetry view */
+    .tele { flex: 1; min-height: 0; display: flex; gap: 20px; overflow: auto; }
+    .cam { flex-shrink: 0; width: 420px; max-width: 52vw; align-self: flex-start;
+      border-radius: 16px; overflow: hidden; background: #000219;
+      box-shadow: 0 8px 40px rgba(0,0,0,.5), 0 0 0 1px rgba(182,201,63,.18); }
+    .cam .cw { position: relative; width: 100%; aspect-ratio: 1 / 1; }
+    .cam .cw img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    .panel { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+    /* Settings owns its own scrolling. On Telemetry the panel sits inside .tele, which is the
+       scroll container; Settings renders the panel straight into .body, and .body is
+       `overflow: hidden` — so without this the cards past the fold (Restore defaults and the
+       whole mic → restart → reboot recovery ladder) were clipped and unreachable, with no
+       scrollbar to hint they existed. min-height: 0 is what lets a flex child shrink below its
+       content height and actually scroll. */
+    .panel-scroll { overflow-y: auto; min-height: 0; padding-right: 4px; padding-bottom: 4px; }
+    .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+    .grid > *:last-child:nth-child(odd) { grid-column: 1 / -1; }
+    .card2 { background: rgba(10,14,42,0.55); border: 1px solid rgba(255,255,255,0.09);
+      border-radius: 14px; padding: 16px; }
+    .adv-toggle { width: 100%; text-align: left; background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.09); color: #aab3c2; font-size: 13px; font-weight: 600;
+      padding: 10px 14px; border-radius: 12px; cursor: pointer; transition: background .15s; }
+    .adv-toggle:hover { background: rgba(255,255,255,0.07); color: #eef1f6; }
+
+    /* Responsive */
+    @media (max-width: 900px) {
+      #root { overflow: auto; height: auto; min-height: 100%; }
+      .body { padding: 14px; gap: 14px; overflow: visible; }
+      .convo { min-height: 60vh; max-width: 100%; }
+      .tele { flex-direction: column; overflow: visible; }
+      /* Narrow layout scrolls at #root, so the panel must not become a second scroll container. */
+      .panel-scroll { overflow: visible; padding-right: 0; }
+      .cam { width: 100%; max-width: 100%; }
+    }
+    /* Phones — keep the header on one row and the chat + mic comfortably reachable */
+    @media (max-width: 640px) {
+      .hdr { min-height: 52px; gap: 10px; flex-wrap: nowrap;
+             padding: 8px 12px; padding-top: max(8px, env(safe-area-inset-top)); }
+      .brand-logo { height: 16px !important; max-width: 88px !important; object-fit: contain; }  /* wide DEVCON wordmark — cap so it can't blow out the header */
+      .brand-title { display: none !important; }      /* "Meet Kai" text is redundant on mobile */
+      .seg-label { display: none; }                   /* icon-only view toggle */
+      .conn-text { display: none; }                   /* connection = dot only on mobile */
+      .conn-pill { padding: 6px 8px !important; }
+      .seg button { padding: 6px 11px; font-size: 15px; line-height: 1; }
+      .body { gap: 12px;
+              padding: 12px max(12px, env(safe-area-inset-right)) 12px max(12px, env(safe-area-inset-left)); }
+      .convo { min-height: 48vh; }
+      .chat { padding: 16px; }
+      .bubble { max-width: 88%; }
+      .mic { width: 68px; height: 68px; }
+      .mic svg { width: 30px; height: 30px; }          /* rings are scale-based, so only the glyph needs this */
+      .mic-dots span { width: 7px; height: 7px; }
+      .dock { padding: 18px 12px 14px;   /* 18px top: halo clearance at the 68px orb (~17px) */
+              padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+    }
+    @media (max-width: 560px) {
+      .grid { grid-template-columns: 1fr; }
+      .grid > *:last-child:nth-child(odd) { grid-column: 1; }
+    }
+    /* Small phones */
+    @media (max-width: 400px) {
+      .hdr { padding: 8px 10px; gap: 6px; }
+      .seg button { padding: 6px 8px; font-size: 11px; }
+      .bubble { font-size: 14px; }
+    }
+
+    /* Settings controls — the only new CSS the settings view needs; everything else reuses
+       .panel / .grid / .card2 so both views read as one system. */
+    .set-range { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; border-radius: 3px;
+      background: rgba(255,255,255,0.08); outline: none; cursor: pointer; }
+    .set-range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 17px; height: 17px;
+      border-radius: 50%; background: #b6c93f; border: 2px solid #0b0b16; cursor: pointer; }
+    .set-range::-moz-range-thumb { width: 15px; height: 15px; border-radius: 50%; background: #b6c93f;
+      border: 2px solid #0b0b16; cursor: pointer; }
+    .set-range:disabled { cursor: not-allowed; opacity: .45; }
+    .set-range:focus-visible { box-shadow: 0 0 0 3px rgba(182,201,63,0.35); }
+    .switch { position: relative; width: 42px; height: 23px; border-radius: 12px; border: none; flex-shrink: 0;
+      background: rgba(255,255,255,0.14); cursor: pointer; transition: background .15s linear; }
+    .switch[aria-checked="true"] { background: #b6c93f; }
+    .switch:disabled { cursor: not-allowed; opacity: .45; }
+    .switch:focus-visible { box-shadow: 0 0 0 3px rgba(182,201,63,0.35); }
+    .switch::after { content: ''; position: absolute; top: 3px; left: 3px; width: 17px; height: 17px;
+      border-radius: 50%; background: #eef1f6; transition: transform .15s ease; }
+    .switch[aria-checked="true"]::after { transform: translateX(19px); background: #0b0b16; }
+    .set-select { width: 100%; font-size: 13px; color: #eef1f6; background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.14); border-radius: 8px; padding: 7px 9px; cursor: pointer; }
+    .set-select:disabled { cursor: not-allowed; opacity: .5; }
+
+    /* Respect reduced-motion (WCAG 2.3.3) */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function () {
+'use strict';
+const h = React.createElement;
+const { useState, useEffect, useRef } = React;
+
+/* ── Semantic tokens: one brand accent + reserved status colors ── */
+const C = {
+  text:    '#eef1f6',
+  dim:     '#aab3c2',
+  mute:    '#7b8494',
+  accent:  '#b6c93f',
+  accentText: '#d9e88f',
+  ok:      '#34d399',
+  okText:  '#6ee7b7',
+  busy:    '#f59e0b',
+  danger:  '#f87171',
+};
+
+/* ── Telemetry groups (advanced ones collapse) ── */
+const GROUPS = [
+  { id: 'position', label: 'Position', params: [
+    { key: 'x', label: 'X', max: 99 }, { key: 'y', label: 'Y', max: 99 }, { key: 'distance', label: 'Distance', max: 99 },
+  ]},
+  { id: 'servo', label: 'Servo', params: [
+    { key: 'pan', label: 'Pan', unit: '°', max: 180 }, { key: 'tilt', label: 'Tilt', unit: '°', max: 180 }, { key: 'jaw', label: 'Jaw', unit: '°', max: 180 },
+  ]},
+  { id: 'system', label: 'System', params: [ { key: 'fps', label: 'FPS', max: 60 } ]},
+  { id: 'pose', label: 'Head Pose', advanced: true, params: [
+    { key: 'yaw', label: 'Yaw', max: 99 }, { key: 'pitch', label: 'Pitch', max: 99 }, { key: 'roll', label: 'Roll', max: 9 },
+  ]},
+  { id: 'expr', label: 'Expression', advanced: true, params: [
+    { key: 'mouth', label: 'Mouth', max: 99 }, { key: 'left_eye', label: 'Left Eye', max: 99 },
+    { key: 'right_eye', label: 'Right Eye', max: 99 }, { key: 'smile_kiss', label: 'Smile', max: 9 },
+  ]},
+];
+
+const EMOTION_CFG = {
+  happy:     { icon: '😊', color: '#f472b6' },
+  surprised: { icon: '😲', color: '#fb923c' },
+  sleepy:    { icon: '😴', color: '#a78bfa' },
+  neutral:   { icon: '😐', color: '#38bdf8' },
+};
+const GESTURE_CFG = {
+  nod:         { icon: '↕',  label: 'NOD',         color: '#60a5fa' },
+  shake:       { icon: '↔',  label: 'SHAKE',       color: '#fb923c' },
+  approach:    { icon: '▶▶', label: 'APPROACH',    color: '#34d399' },
+  retreat:     { icon: '◀◀', label: 'RETREAT',     color: '#a78bfa' },
+  mouth_open:  { icon: '👄', label: 'MOUTH OPEN',  color: '#f472b6' },
+  mouth_close: { icon: '🤐', label: 'MOUTH CLOSE', color: '#38bdf8' },
+};
+
+/* ── Small shared bits ── */
+function ConnectionPill({ connected }) {
+  return h('div', { className: 'conn-pill', title: connected ? 'LIVE' : 'OFFLINE', style: {
+      display: 'flex', alignItems: 'center', gap: 6, padding: '5px 12px', borderRadius: 20, flexShrink: 0,
+      background: connected ? 'rgba(52,211,153,0.16)' : 'rgba(248,113,113,0.16)',
+      border: `1px solid ${connected ? 'rgba(52,211,153,0.45)' : 'rgba(248,113,113,0.45)'}`,
+    }},
+    h('span', { style: { width: 7, height: 7, borderRadius: '50%', background: connected ? C.ok : C.danger } }),
+    h('span', { className: 'conn-text', style: { fontSize: 11, fontWeight: 700, letterSpacing: '.05em', color: connected ? C.okText : '#fca5a5' } },
+      connected ? 'LIVE' : 'OFFLINE')
+  );
+}
+
+/* StatusChip (face_visible) and EmotionChip lived on the Talk camera overlay and went with it.
+   Telemetry's FaceStatus and EmotionBadge already show both, so nothing was lost. */
+
+/* Hands-free status, from the additive sess_* fields on /params. Renders nothing when they're
+   absent (no session running), so a push-to-talk-only setup looks exactly as it did before. */
+const WAKE_CHIP = {
+  idle:          { c: C.accent, pulse: true,  text: 'Say “Hey Kai”' },
+  ack:           { c: C.accent, pulse: false, text: 'Answering…' },
+  cooldown:      { c: C.accent, pulse: false, text: 'Answering…' },
+  listen_wait:   { c: C.ok,     pulse: true,  text: 'Listening — go ahead' },
+  listen_speech: { c: C.ok,     pulse: true,  text: 'Hearing you…' },
+  busy:          { c: C.busy,   pulse: false, text: 'Thinking…' },
+  speaking:      { c: C.accent, pulse: false, text: 'Kai is speaking' },
+};
+
+function WakeChip({ p }) {
+  const state = p.sess_state;
+  if (!state) return null;                     // hands-free not running at all
+  if (state === 'disabled') {
+    /* The wake word could not load — no key, no .ppn, wrong platform, or the package is missing.
+       Say so plainly: otherwise this is indistinguishable from a working robot that just isn't
+       hearing you, which is the single most confusing way for this to fail. */
+    return h('div', { className: 'chip', title: p.sess_wake_error || 'hands-free disabled',
+        style: { background: 'rgba(123,132,148,0.18)', border: '1px solid rgba(123,132,148,0.42)',
+                 color: C.mute } },
+      h('span', null, '\u{1F399}'), 'Push-to-talk only');
+  }
+  const s = WAKE_CHIP[state] || WAKE_CHIP.idle;
+  return h('div', { className: 'chip', title: `session: ${state}`,
+      style: { background: s.c + '22', border: `1px solid ${s.c}55`, color: s.c } },
+    h('span', { style: { width: 8, height: 8, borderRadius: '50%', background: s.c,
+                         display: 'inline-block',
+                         animation: s.pulse ? 'listen-pulse 1.6s infinite' : 'none' } }),
+    s.text
+  );
+}
+
+/* ── Voice: hero mic button (the primary action) ──
+   Colour and animation used to be inline styles here. They now come from a `.dock.is-<state>`
+   class that rebinds one CSS variable, because inline styles win over any stylesheet rule and so
+   made the orb impossible to style from CSS. `icon` names an SVG below instead of an emoji: at
+   78px the 🎤 glyph rendered as a full-colour 3D graphic on Windows and iOS and read as an emoji
+   rather than as a control. */
+const MIC_ICONS = {
+  /* Rounded, single-path glyphs — no strokes, so they inherit .mic's colour via currentColor. */
+  mic:  'M12 15.5a3.5 3.5 0 0 0 3.5-3.5V5.5a3.5 3.5 0 1 0-7 0V12a3.5 3.5 0 0 0 3.5 3.5zm6.5-3.5a1 1 0 1 0-2 0 4.5 4.5 0 0 1-9 0 1 1 0 1 0-2 0 6.5 6.5 0 0 0 5.5 6.42V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.08A6.5 6.5 0 0 0 18.5 12z',
+  stop: 'M8 6h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z',
+  wave: 'M4 10a1 1 0 0 1 1 1v2a1 1 0 1 1-2 0v-2a1 1 0 0 1 1-1zm4-4a1 1 0 0 1 1 1v10a1 1 0 1 1-2 0V7a1 1 0 0 1 1-1zm4 3a1 1 0 0 1 1 1v4a1 1 0 1 1-2 0v-4a1 1 0 0 1 1-1zm4-5a1 1 0 0 1 1 1v12a1 1 0 1 1-2 0V5a1 1 0 0 1 1-1zm4 4a1 1 0 0 1 1 1v4a1 1 0 1 1-2 0v-4a1 1 0 0 1 1-1z',
+};
+
+/* aria-hidden throughout: the button's aria-label is the accessible name and must stay the only one. */
+function MicGlyph({ name }) {
+  return h('svg', { viewBox: '0 0 24 24', fill: 'currentColor', 'aria-hidden': 'true', focusable: 'false' },
+    h('path', { d: MIC_ICONS[name] }));
+}
+
+const MIC_STATES = {
+  idle:      { icon: 'mic',  label: 'Tap to talk',          sub: 'or press Space',        disabled: false, aria: 'Start talking to Kai' },
+  listening: { icon: 'stop', label: 'Listening…',           sub: 'tap to send',           disabled: false, aria: 'Stop recording and send' },
+  thinking:  { icon: null,   label: 'Thinking…',            sub: 'Kai is working it out', disabled: true,  aria: 'Kai is thinking' },
+  speaking:  { icon: 'wave', label: 'Kai is speaking…',     sub: '',                      disabled: true,  aria: 'Kai is speaking' },
+  error:     { icon: 'mic',  label: 'Something went wrong', sub: 'tap to try again',      disabled: false, aria: 'Try again' },
+};
+
+function MicButton({ vstate, onClick, sess }) {
+  const s = MIC_STATES[vstate] || MIC_STATES.idle;
+  let label = s.label, sub = s.sub;
+  /* Hands-free reuses the 'listening' visual, but the two session states mean different things and
+     the button does something different in each: while waiting there is nothing to send yet, so a
+     tap ends the session instead. Say that, rather than inviting "tap to send" with no utterance. */
+  if (vstate === 'listening' && sess === 'listen_wait') {
+    label = 'Listening…'; sub = 'go ahead — or tap to stop';
+  } else if (vstate === 'listening' && sess === 'listen_speech') {
+    label = 'Hearing you…'; sub = 'pause when done, or tap to send';
+  } else if (vstate === 'idle' && sess === 'idle') {
+    label = 'Say “Hey Kai”'; sub = 'or tap / press Space';
+  }
+  /* The state class sits on .dock so the orb, its halo rings and the label can all read one
+     --mic-color; vstate is already whitelisted by the derivation in App, so it is safe in a class. */
+  return h('div', { className: 'dock is-' + vstate },
+    h('div', { className: 'mic-wrap' },
+      h('button', {
+          className: 'mic', onClick, disabled: s.disabled,
+          'aria-label': s.aria, 'aria-pressed': vstate === 'listening',
+        },
+        s.icon
+          ? h(MicGlyph, { name: s.icon })
+          : h('div', { className: 'mic-dots', 'aria-hidden': 'true' },
+              h('span'), h('span'), h('span'))
+      )
+    ),
+    h('div', { className: 'state-label', 'aria-live': 'polite' }, label),
+    /* Always rendered, even when empty, so the dock keeps one height across every state. */
+    h('div', { className: 'hint' }, sub || '')
+  );
+}
+
+function ChatLog({ messages }) {
+  const ref = useRef(null);
+  useEffect(() => { const el = ref.current; if (el) el.scrollTop = el.scrollHeight; }, [messages.length]);
+  return h('div', { className: 'chat', ref, role: 'log', 'aria-live': 'polite', 'aria-label': 'Conversation with Kai' },
+    messages.length === 0
+      ? h('div', { className: 'chat-empty' },
+          h('div', { style: { fontSize: 38, marginBottom: 10 } }, '👋'),
+          'Say hi to Kai — tap the mic below and start talking.')
+      : messages.map((m, i) => h('div', { key: i, className: 'bubble ' + (m.role === 'user' ? 'b-user' : 'b-kai') },
+          h('span', { className: 'who', style: { color: m.role === 'user' ? C.accentText : C.dim } }, m.role === 'user' ? 'You' : 'Kai'),
+          m.text))
+  );
+}
+
+/* ── Telemetry building blocks ── */
+function ParamRow({ label, max, unit, value }) {
+  const val = value != null ? value : 0;
+  const pct = max ? Math.min(100, Math.round((val / max) * 100)) : 0;
+  return h('div', { style: { padding: '6px 0', borderBottom: '1px solid rgba(255,255,255,0.06)' } },
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 5 } },
+      h('span', { style: { fontSize: 13, color: C.dim } }, label),
+      h('span', { style: { fontSize: 14, fontWeight: 700, color: C.accentText, fontVariantNumeric: 'tabular-nums' } }, val + (unit || ''))),
+    h('div', { style: { height: 6, borderRadius: 3, background: 'rgba(255,255,255,0.08)', overflow: 'hidden' } },
+      h('div', { style: { width: pct + '%', height: '100%', borderRadius: 3,
+        background: 'linear-gradient(90deg, rgba(182,201,63,0.55), #b6c93f)', transition: 'width .15s linear' } }))
+  );
+}
+
+function GroupCard({ group, data }) {
+  return h('div', { className: 'card2', style: { padding: '12px 15px' } },
+    h('div', { style: { fontSize: 11, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase', color: C.mute, marginBottom: 8 } }, group.label),
+    ...group.params.map(p => h(ParamRow, { key: p.key, value: data[p.key] != null ? data[p.key] : 0, ...p }))
+  );
+}
+
+function FaceStatus({ on }) {
+  return h('div', { className: 'card2', style: { display: 'flex', alignItems: 'center', gap: 12, padding: '13px 16px' } },
+    h('span', { style: { width: 11, height: 11, borderRadius: '50%', background: on ? C.ok : C.danger, display: 'inline-block' } }),
+    h('span', { style: { flex: 1, fontSize: 14, fontWeight: 600, color: on ? C.okText : '#fca5a5' } }, on ? 'Face detected' : 'No face'),
+    h('span', { style: { fontSize: 11, fontWeight: 700, letterSpacing: '.06em', color: on ? C.ok : C.danger,
+      background: on ? 'rgba(52,211,153,0.14)' : 'rgba(248,113,113,0.12)', padding: '2px 9px', borderRadius: 10 } }, on ? 'TRACKING' : 'SEARCHING')
+  );
+}
+
+function EmotionBadge({ emotion }) {
+  const c = EMOTION_CFG[emotion] || { icon: '❓', color: '#94a3b8' };
+  return h('div', { className: 'card2', style: { display: 'flex', alignItems: 'center', gap: 12, padding: '13px 16px' } },
+    h('span', { style: { fontSize: 20, lineHeight: 1 } }, c.icon),
+    h('span', { style: { flex: 1, fontSize: 14, fontWeight: 600, color: C.dim } }, 'Emotion'),
+    h('span', { style: { fontSize: 12, fontWeight: 700, letterSpacing: '.05em', textTransform: 'uppercase', color: c.color,
+      background: c.color + '1e', border: `1px solid ${c.color}44`, padding: '2px 10px', borderRadius: 10 } }, emotion)
+  );
+}
+
+function GestureBadge({ gesture }) {
+  const g = GESTURE_CFG[gesture];
+  if (!g) return null;
+  return h('div', { className: 'gesture-badge card2', style: { display: 'flex', alignItems: 'center', gap: 10, padding: '11px 15px', borderColor: g.color + '55' } },
+    h('span', { style: { fontSize: 17 } }, g.icon),
+    h('span', { style: { fontSize: 12, fontWeight: 800, letterSpacing: '.1em', textTransform: 'uppercase', color: g.color } }, 'Gesture'),
+    h('span', { style: { marginLeft: 'auto', fontSize: 13, fontWeight: 700, color: g.color } }, g.label)
+  );
+}
+
+function InfoStrip({ data }) {
+  const items = [
+    { label: 'PAN', val: (data.pan ?? 90) + '°' },
+    { label: 'TILT', val: (data.tilt ?? 90) + '°' },
+    { label: 'JAW', val: (data.jaw ?? 90) + '°' },
+    { label: 'FPS', val: (data.fps ?? 0) + '' },
+  ];
+  return h('div', { style: { display: 'flex', background: 'rgba(7,2,20,0.9)' } },
+    ...items.map((it, i) => h('div', { key: it.label, style: { flex: 1, padding: '8px 6px', textAlign: 'center',
+        borderRight: i < items.length - 1 ? '1px solid rgba(255,255,255,0.07)' : 'none' } },
+      h('div', { style: { fontSize: 9, fontWeight: 700, letterSpacing: '.12em', color: C.mute, marginBottom: 3 } }, it.label),
+      h('div', { style: { fontSize: 15, fontWeight: 700, color: C.accentText, fontVariantNumeric: 'tabular-nums' } }, it.val)))
+  );
+}
+
+function VideoSourceCard({ camSource, camReason }) {
+  const [file, setFile] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [warnings, setWarnings] = useState([]);
+  const [uploadErr, setUploadErr] = useState('');
+  const isPlaying = camSource === 'video_file';
+  const noCamera = camSource === 'none';
+
+  function handleUpload() {
+    if (!file || uploading) return;
+    setUploading(true); setWarnings([]); setUploadErr('');
+    const fd = new FormData(); fd.append('video', file);
+    fetch('/upload_video', { method: 'POST', body: fd })
+      .then(r => r.json())
+      .then(data => { if (data.error) setUploadErr(data.error); else setWarnings(data.warnings || []); })
+      .catch(e => setUploadErr(String(e)))
+      .finally(() => setUploading(false));
+  }
+  function handleStop() {
+    fetch('/stop_video', { method: 'POST' }).catch(() => {});
+    setWarnings([]); setUploadErr(''); setFile(null);
+  }
+
+  /* 'none' must not fall through to LIVE — claiming a camera that isn't attached is how this view used
+     to look fine on a robot that could not see anything at all. */
+  const label = isPlaying ? 'PLAYING' : uploading ? 'UPLOADING…' : noCamera ? 'NO CAMERA' : 'LIVE';
+  const col = isPlaying ? C.busy : uploading ? C.mute : noCamera ? C.danger : C.ok;
+
+  return h('div', { className: 'card2' },
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 } },
+      h('span', { style: { flex: 1, fontSize: 11, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase', color: C.mute } }, 'Video Source'),
+      h('span', { style: { fontSize: 10, fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase', color: col,
+        background: col + '1e', border: `1px solid ${col}44`, padding: '2px 8px', borderRadius: 10 } }, label)),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+      h('label', { style: { fontSize: 12, fontWeight: 600, color: '#0b0b16', background: C.accent, padding: '6px 12px',
+          borderRadius: 8, cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 } },
+        'Choose file',
+        h('input', { type: 'file', accept: 'video/*', style: { display: 'none' },
+          onChange: e => { setFile(e.target.files[0] || null); setUploadErr(''); setWarnings([]); } })),
+      h('span', { style: { fontSize: 12, color: file ? C.text : C.mute, overflow: 'hidden', textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap', flex: 1, minWidth: 0 } }, file ? file.name : 'No file chosen'),
+      h('button', { onClick: handleUpload, disabled: !file || uploading,
+        style: { fontSize: 12, fontWeight: 700, color: '#0b0b16', background: (!file || uploading) ? '#6b7280' : C.busy,
+          border: 'none', padding: '6px 12px', borderRadius: 8, cursor: (!file || uploading) ? 'default' : 'pointer', whiteSpace: 'nowrap', flexShrink: 0 } },
+        uploading ? 'Uploading…' : 'Upload ▶')),
+    noCamera && camReason ? h('div', { style: { fontSize: 12, color: '#fca5a5', marginBottom: 8 } },
+      camReason + ' — see Settings') : null,
+    h('div', { style: { fontSize: 11, color: C.mute, marginBottom: warnings.length || uploadErr ? 8 : 0 } },
+      'Rec: 640×480+ · 15fps+ · ≤200 MB · 1 face · MP4 / AVI / MOV / MKV'),
+    ...warnings.map((w, i) => h('div', { key: i, style: { fontSize: 12, color: '#fcd34d', background: 'rgba(245,158,11,0.12)',
+      border: '1px solid rgba(245,158,11,0.35)', borderRadius: 8, padding: '4px 9px', marginBottom: 4 } }, '⚠ ' + w)),
+    uploadErr ? h('div', { style: { fontSize: 12, color: '#fca5a5', background: 'rgba(248,113,113,0.12)',
+      border: '1px solid rgba(248,113,113,0.35)', borderRadius: 8, padding: '4px 9px', marginBottom: 4 } }, '✕ ' + uploadErr) : null,
+    isPlaying ? h('button', { onClick: handleStop, style: { width: '100%', marginTop: 4, fontSize: 12, fontWeight: 700,
+      color: C.text, background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.14)', padding: '8px 0', borderRadius: 8, cursor: 'pointer' } },
+      '■  Stop — Return to Live') : null
+  );
+}
+
+/* ── Settings ──
+   Declarative, the same way GROUPS drives the telemetry cards: presentation lives here, validation
+   lives on the server. Every knob below applies the instant it changes — there is deliberately no
+   "restart required" category and no restart button. */
+const SETTINGS = [
+  { id: 'camera', label: 'Camera', items: [
+    { key: 'camera_mode', kind: 'select', label: 'Camera', options: [
+        ['auto', 'Auto — use it whenever available'], ['off', 'Off'] ],
+      hint: 'Auto keeps checking, so a camera plugged in later is picked up without a restart.' },
+  ]},
+  { id: 'voice', label: 'Voice', items: [
+    { key: 'hands_free', kind: 'toggle', label: 'Hands-free wake word', hint: 'Listen for “Hey Kai”' },
+    { key: 'wake_sensitivity', kind: 'slider', label: 'Wake sensitivity', min: 0, max: 1, step: 0.05,
+      hint: 'Higher catches more — and false-triggers more.' },
+    { key: 'vad_rms_floor', kind: 'slider', label: 'Mic noise floor', min: 100, max: 3000, step: 25,
+      live: 'sess_rms', hint: 'Set it just above the idle level marked on the track.' },
+    { key: 'tts_enabled', kind: 'toggle', label: 'Speak replies',
+      hint: 'Off still animates the jaw, silently.' },
+    { key: 'tts_volume', kind: 'slider', label: 'Volume', min: 0, max: 2, step: 0.05 },
+    { key: 'tts_length_scale', kind: 'slider', label: 'Speaking rate', min: 0.5, max: 2, step: 0.05,
+      hint: 'Higher is slower.' },
+    { key: 'thinking_sounds', kind: 'toggle', label: 'Think out loud',
+      hint: 'A short “hmm” on longer replies.' },
+  ]},
+  { id: 'movement', label: 'Movement', items: [
+    { key: 'servo_tracking', kind: 'toggle', label: 'Follow faces',
+      hint: 'Off relaxes the servos where they are.' },
+    { key: 'jaw_enabled', kind: 'toggle', label: 'Move the jaw' },
+    { key: 'thinking_sweep', kind: 'toggle', label: 'Sweep while thinking',
+      hint: 'Gentle head movement while Kai works out a reply. Needs Follow faces on.' },
+  ]},
+];
+
+const HOLD_MS = 1200;   /* how long a just-committed control ignores the 20 Hz echo */
+const COALESCE_MS = 150;
+
+/* Controls that cannot do anything right now, and WHY. A disabled control with a reason beats one
+   that silently accepts a change and ignores it — the same convention as the wake chip's tooltip. */
+function settingsLocked(p) {
+  const out = {};
+  if (p.cam_mode_locked)
+    out.camera_mode = 'Locked off by --no-camera for this run';
+  if (p.sess_wake_kind === 'utterance')
+    out.wake_sensitivity = 'The active wake tier (' + (p.sess_wake_engine || 'whisper') +
+      ') matches transcribed text, not a score — there is no threshold to tune. '
+      + 'Add a Picovoice key or train the openWakeWord model to get a tunable tier.';
+  return out;
+}
+
+/* One source of truth for "what should this control show", reconciling the user's in-flight edit
+   against the server state that streams back 20x a second. Without this a slider fights the drag. */
+function useSettings(params) {
+  const [local, setLocal] = useState({});
+  const [errors, setErrors] = useState({});
+  const [seed, setSeed] = useState(null);
+  const holdUntil = useRef({});
+  const timers = useRef({});
+
+  useEffect(() => () => Object.values(timers.current).forEach(clearTimeout), []);
+
+  /* Seed from GET /settings once on mount. The SSE snapshot carries the same values, but not until its
+     first frame — without this the whole panel reads "—" for a beat on every page load. */
+  useEffect(() => {
+    let live = true;
+    fetch('/settings').then(r => r.json())
+      .then(b => { if (live && b && b.values) setSeed(b.values); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, []);
+
+  /* Adopt the server value once our hold expires. If it matches, the echo confirmed the write; if it
+     differs, the SERVER WINS — that is what makes a server-side clamp visible (drag volume past the
+     top, watch it settle) instead of silently reverting, and it lets a second browser's change land. */
+  useEffect(() => {
+    setLocal(prev => {
+      const keys = Object.keys(prev);
+      if (!keys.length) return prev;
+      const next = {}; let changed = false;
+      keys.forEach(k => {
+        const server = params['set_' + k];
+        const held = (holdUntil.current[k] || 0) > Date.now();
+        if (server !== undefined && (server === prev[k] || !held)) changed = true;
+        else next[k] = prev[k];
+      });
+      return changed ? next : prev;
+    });
+  }, [params]);
+
+  function clearLocal(key) {
+    holdUntil.current[key] = 0;
+    setLocal(p => { if (!(key in p)) return p; const n = { ...p }; delete n[key]; return n; });
+  }
+
+  function send(key, value) {
+    fetch('/settings', { method: 'POST', headers: { 'content-type': 'application/json' },
+                         body: JSON.stringify({ [key]: value }) })
+      .then(r => r.json().then(b => ({ ok: r.ok, b })))
+      .then(({ ok, b }) => {
+        if (ok) setErrors(e => (e[key] ? (({ [key]: _, ...rest }) => rest)(e) : e));
+        else { setErrors(e => ({ ...e, [key]: b.error || 'rejected' })); clearLocal(key); }
+      })
+      .catch(err => { setErrors(e => ({ ...e, [key]: String(err) })); clearLocal(key); });
+  }
+
+  /* Dragging: update the display only, never the network. */
+  function preview(key, value) { setLocal(p => ({ ...p, [key]: value })); }
+
+  /* Released / toggled / picked: hold the display, then POST (newest wins per key). */
+  function commit(key, value) {
+    setLocal(p => ({ ...p, [key]: value }));
+    holdUntil.current[key] = Date.now() + HOLD_MS;
+    clearTimeout(timers.current[key]);
+    timers.current[key] = setTimeout(() => send(key, value), COALESCE_MS);
+  }
+
+  /* Precedence: the user's in-flight edit, then the live stream, then the mount-time seed. */
+  const value = key => {
+    if (key in local) return local[key];
+    const streamed = params['set_' + key];
+    if (streamed !== undefined) return streamed;
+    return seed ? seed[key] : undefined;
+  };
+  return { value, preview, commit, errors };
+}
+
+function RowShell({ label, hint, right, error, children }) {
+  return h('div', { style: { padding: '9px 0', borderBottom: '1px solid rgba(255,255,255,0.06)' } },
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 } },
+      h('span', { style: { fontSize: 13, color: C.dim } }, label),
+      right),
+    children,
+    hint ? h('div', { style: { fontSize: 11, color: C.mute, marginTop: 5 } }, hint) : null,
+    error ? h('div', { style: { fontSize: 11, color: '#fca5a5', marginTop: 5 } }, '✕ ' + error) : null
+  );
+}
+
+function ToggleRow({ item, on, disabled, reason, error, onChange }) {
+  return h(RowShell, { label: item.label, hint: reason || item.hint, error,
+      right: on == null
+        ? h('span', { style: { fontSize: 13, color: C.mute } }, '—')
+        : h('button', { className: 'switch', role: 'switch', 'aria-checked': !!on,
+            'aria-label': item.label, disabled, title: reason || '',
+            onClick: () => onChange(!on) }) });
+}
+
+function SliderRow({ item, value, liveValue, disabled, reason, error, onPreview, onCommit }) {
+  /* Until the first snapshot arrives we do not know the value. Showing item.min would be a made-up
+     number the user could commit by touching the control, so the row reads "—" and stays inert. */
+  if (value == null)
+    return h(RowShell, { label: item.label, hint: item.hint,
+      right: h('span', { style: { fontSize: 13, color: C.mute } }, '—') });
+  const val = value;
+  const span = item.max - item.min;
+  /* The live measurement (mic RMS) as a marker on the track — this is what makes the noise floor
+     tunable by eye instead of by guesswork over ssh. */
+  const livePct = liveValue != null ? Math.min(100, Math.max(0, ((liveValue - item.min) / span) * 100)) : null;
+  const decimals = item.step < 1 ? 2 : 0;
+  return h(RowShell, { label: item.label, hint: reason || item.hint, error,
+      right: h('span', { style: { fontSize: 14, fontWeight: 700, color: disabled ? C.mute : C.accentText,
+        fontVariantNumeric: 'tabular-nums' } },
+        Number(val).toFixed(decimals) + (liveValue != null ? '  (now ' + Math.round(liveValue) + ')' : '')) },
+    h('div', { style: { position: 'relative', marginTop: 6 } },
+      h('input', { type: 'range', className: 'set-range', min: item.min, max: item.max, step: item.step,
+        value: val, disabled, title: reason || '', 'aria-label': item.label,
+        onChange: e => onPreview(Number(e.target.value)),
+        onPointerUp: e => onCommit(Number(e.target.value)),
+        onKeyUp: e => onCommit(Number(e.target.value)),
+        onBlur: e => onCommit(Number(e.target.value)) }),
+      livePct != null ? h('div', { title: 'current level',
+        style: { position: 'absolute', left: 'calc(' + livePct + '% - 1px)', top: -4, width: 2, height: 14,
+          background: C.ok, borderRadius: 1, pointerEvents: 'none' } }) : null)
+  );
+}
+
+function SelectRow({ item, value, disabled, reason, error, onCommit }) {
+  if (value == null)
+    return h(RowShell, { label: item.label, hint: item.hint,
+      right: h('span', { style: { fontSize: 13, color: C.mute } }, '—') });
+  return h(RowShell, { label: item.label, hint: reason || item.hint, error },
+    h('select', { className: 'set-select', value: value, disabled,
+        title: reason || '', 'aria-label': item.label, style: { marginTop: 6 },
+        onChange: e => onCommit(e.target.value) },
+      ...item.options.map(([v, text]) => h('option', { key: v, value: v }, text)))
+  );
+}
+
+function SettingsCard({ group, s, params, locked }) {
+  return h('div', { className: 'card2', style: { padding: '12px 15px' } },
+    h('div', { style: { fontSize: 11, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase',
+      color: C.mute, marginBottom: 4 } }, group.label),
+    ...group.items.map(item => {
+      const reason = locked[item.key];
+      const disabled = !!reason;
+      const common = { key: item.key, item, disabled, reason, error: s.errors[item.key] };
+      if (item.kind === 'toggle')
+        return h(ToggleRow, { ...common, on: s.value(item.key),
+          onChange: v => s.commit(item.key, v) });
+      if (item.kind === 'select')
+        return h(SelectRow, { ...common, value: s.value(item.key),
+          onCommit: v => s.commit(item.key, v) });
+      return h(SliderRow, { ...common, value: s.value(item.key),
+        liveValue: item.live ? params[item.live] : null,
+        onPreview: v => s.preview(item.key, v),
+        onCommit: v => s.commit(item.key, v) });
+    })
+  );
+}
+
+function CameraStatusCard({ data }) {
+  const [probing, setProbing] = useState(false);
+  const live = data.cam_source && data.cam_source !== 'none';
+  const col = live ? C.ok : C.danger;
+  const retry = data.cam_retry_in_s;
+
+  function probe() {
+    setProbing(true);
+    fetch('/camera/probe', { method: 'POST' })
+      .catch(() => {})
+      .finally(() => setTimeout(() => setProbing(false), 1200));
+  }
+
+  return h('div', { className: 'card2', style: { padding: '12px 15px' } },
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },
+      h('span', { style: { flex: 1, fontSize: 11, fontWeight: 800, letterSpacing: '.12em',
+        textTransform: 'uppercase', color: C.mute } }, 'Camera'),
+      h('span', { style: { fontSize: 10, fontWeight: 700, letterSpacing: '.06em', textTransform: 'uppercase',
+        color: col, background: col + '1e', border: `1px solid ${col}44`, padding: '2px 8px',
+        borderRadius: 10 } }, live ? String(data.cam_source) : 'NO CAMERA')),
+    data.cam_reason ? h('div', { style: { fontSize: 12, color: C.dim, marginBottom: 8 } }, data.cam_reason) : null,
+    !live ? h('div', { style: { fontSize: 11, color: C.mute, marginBottom: 8 } },
+      retry ? 'Next check in ' + retry + 's' : 'Not checking') : null,
+    !live ? h('button', { onClick: probe, disabled: probing,
+      style: { width: '100%', fontSize: 12, fontWeight: 700, color: C.text,
+        background: 'rgba(255,255,255,0.08)', border: '1px solid rgba(255,255,255,0.14)',
+        padding: '8px 0', borderRadius: 8, cursor: probing ? 'default' : 'pointer' } },
+      probing ? 'Checking…' : '⟳  Check for a camera now') : null
+  );
+}
+
+/* The cheap rung of the recovery ladder, above the restart button because it should be tried first.
+   A mic that failed at startup is usually fine a minute later — measured across three boots, the
+   I2S mic read silent on one, timed out on the next and worked on a third, with arecord finding
+   real audio every time — but until this existed the only way to take that second look was
+   restarting the whole process. One tap, no confirmation: it costs a couple of seconds, keeps the
+   camera and the conversation up, and the worst case is that it changes nothing. */
+function MicRecoveryCard({ data }) {
+  const [phase, setPhase] = useState('idle');   /* idle | sending | done | error */
+  const [msg, setMsg] = useState('');
+  const timer = useRef(null);
+
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  function reresolve() {
+    clearTimeout(timer.current);
+    setPhase('sending');
+    setMsg('');
+    fetch('/audio/reresolve', { method: 'POST' })
+      .then(r => r.json())
+      .then(b => {
+        if (b && b.ok) {
+          /* Which mic it landed on is the whole point of the reply: "it worked" is not useful if
+             Kai is still on the fallback dongle when it should be on the I2S mic. */
+          setPhase('done');
+          setMsg((b.is_i2s ? 'Now on the I2S mic' : 'Now on the fallback mic')
+                 + ' (device ' + b.device + ', ' + Math.round(b.rate / 1000) + ' kHz)'
+                 + (b.restarted_session ? ' — hands-free is back up.' : '.'));
+        } else {
+          setPhase('error');
+          setMsg((b && b.error) || 'no reason reported');
+        }
+        timer.current = setTimeout(() => setPhase('idle'), 12000);
+      })
+      .catch(err => {
+        setPhase('error');
+        setMsg(String(err));
+        timer.current = setTimeout(() => setPhase('idle'), 8000);
+      });
+  }
+
+  const sending = phase === 'sending';
+  /* sess_mic_live false is the symptom this button is for, so say so rather than making the
+     operator infer it from a telemetry card further up the page. */
+  const deaf = data.sess_mic_live === false;
+
+  return h('div', { className: 'card2', style: { padding: '12px 15px' } },
+    h('div', { style: { fontSize: 11, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase',
+      color: C.mute, marginBottom: 6 } }, 'Microphone'),
+    h('div', { style: { fontSize: 12, color: C.dim, marginBottom: 8 } },
+      'Looks for a working microphone again and reopens the audio stream. Try this before '
+      + 'restarting — it takes a couple of seconds and nothing else is interrupted.'),
+    deaf && phase === 'idle' ? h('div', { style: { fontSize: 11, color: '#fcd34d', marginBottom: 8 } },
+      '⚠ No microphone is open right now — this is the button for that.') : null,
+    phase === 'done' ? h('div', { style: { fontSize: 12, color: '#86efac', marginBottom: 8 } },
+      '✓ ' + msg) : null,
+    phase === 'error' ? h('div', { style: { fontSize: 11, color: '#fca5a5', marginBottom: 8 } },
+      '✕ Could not open a microphone: ' + msg) : null,
+    h('button', { onClick: reresolve, disabled: sending, 'aria-label': 'Re-resolve microphone',
+      style: { width: '100%', fontSize: 12, fontWeight: 700, color: C.dim,
+        background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.12)',
+        padding: '9px 0', borderRadius: 8, cursor: sending ? 'default' : 'pointer' } },
+      sending ? 'Looking for a microphone…' : '🎙  Find the microphone again')
+  );
+}
+
+/* The heavy hammer, kept visually apart from the knobs above it and deliberately two clicks deep.
+   It exists for the failures no setting can reach — a wedged capture device, a wake engine that
+   stopped hearing, an Ollama that came back after Kai gave up on it — where the fix is genuinely
+   "start the process again" and the alternative in the room is ssh or the power switch. */
+function RestartCard({ connected, busy }) {
+  const [phase, setPhase] = useState('idle');   /* idle | confirm | sent | orphaned | error */
+  const [error, setError] = useState('');
+  const dropped = useRef(false);
+  const timer = useRef(null);
+
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  /* Back to idle once the stream has actually gone away and come back — the reconnect IS the
+     evidence the restart finished, so the button never claims success on a robot that did not
+     come back. The timeout is only a backstop for the case where it never returns. */
+  useEffect(() => {
+    if (phase !== 'sent') { dropped.current = false; return; }
+    if (!connected) dropped.current = true;
+    else if (dropped.current) { clearTimeout(timer.current); setPhase('idle'); }
+  }, [connected, phase]);
+
+  function confirm() {
+    setPhase('confirm');
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setPhase('idle'), 6000);   /* a stray tap must not stay armed */
+  }
+
+  function restart() {
+    clearTimeout(timer.current);
+    setPhase('sent');
+    setError('');
+    fetch('/restart', { method: 'POST' })
+      .then(r => r.json())
+      .then(b => {
+        /* The one thing the operator cannot see from here: whether anything will start Kai again.
+           Unsupervised, this click is a shutdown, and saying so is the whole point of the field. */
+        if (b && b.supervised === false) { setPhase('orphaned'); return; }
+        timer.current = setTimeout(() => setPhase('idle'), 90000);
+      })
+      .catch(err => {
+        /* The reply is sent before the teardown starts, so a failure here really is a failure —
+           except for the race where the socket closes first, which the reconnect above resolves. */
+        setError(String(err));
+        setPhase('error');
+        timer.current = setTimeout(() => setPhase('idle'), 6000);
+      });
+  }
+
+  const armed = phase === 'confirm';
+  const running = phase === 'sent';
+  const label = running ? 'Restarting… waiting for Kai to come back'
+              : phase === 'orphaned' ? 'Stopped'
+              : armed ? '⚠  Tap again to restart Kai'
+              : '⟳  Restart Kai';
+
+  return h('div', { className: 'card2', style: { padding: '12px 15px' } },
+    h('div', { style: { fontSize: 11, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase',
+      color: C.mute, marginBottom: 6 } }, 'Service'),
+    h('div', { style: { fontSize: 12, color: C.dim, marginBottom: 8 } },
+      armed ? 'Kai stops talking, the camera and mic are released, and it comes back in about half a '
+              + 'minute. Anything being said right now is cut off.'
+            : 'Starts Kai over — reopens the camera, microphone and servos. Use it when something is '
+              + 'stuck in a way no setting above can fix.'),
+    busy && !running ? h('div', { style: { fontSize: 11, color: '#fcd34d', marginBottom: 8 } },
+      '⚠ A conversation is in progress — restarting now will cut it off.') : null,
+    phase === 'orphaned' ? h('div', { style: { fontSize: 12, color: '#fca5a5', marginBottom: 8 } },
+      'Kai was shut down, but nothing is supervising this process, so it will NOT come back on its own. '
+      + 'Start it again on the Jetson: bash scripts/autostart.sh') : null,
+    phase === 'error' ? h('div', { style: { fontSize: 11, color: '#fca5a5', marginBottom: 8 } },
+      '✕ Could not reach Kai: ' + error) : null,
+    h('button', { onClick: armed ? restart : confirm, disabled: running || phase === 'orphaned',
+      'aria-label': 'Restart Kai',
+      style: { width: '100%', fontSize: 12, fontWeight: 700,
+        color: armed ? '#fecaca' : C.dim,
+        background: armed ? 'rgba(239,68,68,0.16)' : 'rgba(255,255,255,0.05)',
+        border: '1px solid ' + (armed ? 'rgba(239,68,68,0.45)' : 'rgba(255,255,255,0.12)'),
+        padding: '9px 0', borderRadius: 8,
+        cursor: (running || phase === 'orphaned') ? 'default' : 'pointer' } }, label),
+    armed ? h('button', { onClick: () => { clearTimeout(timer.current); setPhase('idle'); },
+      style: { width: '100%', marginTop: 6, fontSize: 11, fontWeight: 600, color: C.mute,
+        background: 'transparent', border: 0, padding: '4px 0', cursor: 'pointer' } }, 'Cancel') : null
+  );
+}
+
+/* The bottom rung, and the only control here that is not recoverable in place. Rendered ONLY when
+   the server says it is configured (reboot_enabled), so a robot nobody set this up on shows no
+   button at all rather than one that always answers 403 — an operator reaching for a recovery
+   control should not have to discover it was never switched on.
+
+   Same two-tap arming as the restart, a longer wait, and a blunter warning: this is ~90 seconds of
+   nothing, and it is the one action here that can fail to come back. */
+function RebootCard({ connected, busy }) {
+  const [phase, setPhase] = useState('idle');   /* idle | confirm | sent | error */
+  const [error, setError] = useState('');
+  const dropped = useRef(false);
+  const timer = useRef(null);
+
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  /* Same evidence rule as the restart: the reconnect is what proves it came back. */
+  useEffect(() => {
+    if (phase !== 'sent') { dropped.current = false; return; }
+    if (!connected) dropped.current = true;
+    else if (dropped.current) { clearTimeout(timer.current); setPhase('idle'); }
+  }, [connected, phase]);
+
+  function confirm() {
+    setPhase('confirm');
+    clearTimeout(timer.current);
+    timer.current = setTimeout(() => setPhase('idle'), 6000);
+  }
+
+  function reboot() {
+    clearTimeout(timer.current);
+    setPhase('sent');
+    setError('');
+    /* The confirm token is what stops a stray or replayed POST from taking the robot down; the
+       server rejects the request without it. The two taps above are for the human, this is for
+       everything else that can reach an unauthenticated endpoint. */
+    fetch('/system/reboot', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: 'reboot' }) })
+      .then(r => r.json().then(b => ({ ok: r.ok, b })))
+      .then(({ ok, b }) => {
+        if (!ok) {
+          setError((b && b.error) || 'refused');
+          setPhase('error');
+          timer.current = setTimeout(() => setPhase('idle'), 12000);
+          return;
+        }
+        timer.current = setTimeout(() => setPhase('idle'), 180000);
+      })
+      .catch(err => {
+        setError(String(err));
+        setPhase('error');
+        timer.current = setTimeout(() => setPhase('idle'), 8000);
+      });
+  }
+
+  const armed = phase === 'confirm';
+  const running = phase === 'sent';
+  const label = running ? 'Rebooting… Kai will be back in about 90 seconds'
+              : armed ? '⚠  Tap again to REBOOT the Jetson'
+              : '⏻  Reboot the Jetson';
+
+  return h('div', { className: 'card2', style: { padding: '12px 15px' } },
+    h('div', { style: { fontSize: 11, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase',
+      color: C.mute, marginBottom: 6 } }, 'Reboot'),
+    h('div', { style: { fontSize: 12, color: C.dim, marginBottom: 8 } },
+      armed ? 'The whole board goes down for about 90 seconds — camera, servos, dashboard, all of it. '
+              + 'Only do this if finding the microphone again and restarting Kai have both failed.'
+            : 'Restarts the whole board. Needed only for things a restart cannot clear, like wedged '
+              + 'audio in the kernel or fragmented GPU memory.'),
+    busy && !running ? h('div', { style: { fontSize: 11, color: '#fcd34d', marginBottom: 8 } },
+      '⚠ A conversation is in progress — rebooting now will cut it off.') : null,
+    phase === 'error' ? h('div', { style: { fontSize: 11, color: '#fca5a5', marginBottom: 8 } },
+      '✕ ' + error) : null,
+    h('button', { onClick: armed ? reboot : confirm, disabled: running,
+      'aria-label': 'Reboot the Jetson',
+      style: { width: '100%', fontSize: 12, fontWeight: 700,
+        color: armed ? '#fecaca' : C.dim,
+        background: armed ? 'rgba(239,68,68,0.22)' : 'rgba(255,255,255,0.05)',
+        border: '1px solid ' + (armed ? 'rgba(239,68,68,0.55)' : 'rgba(255,255,255,0.12)'),
+        padding: '9px 0', borderRadius: 8, cursor: running ? 'default' : 'pointer' } }, label),
+    armed ? h('button', { onClick: () => { clearTimeout(timer.current); setPhase('idle'); },
+      style: { width: '100%', marginTop: 6, fontSize: 11, fontWeight: 600, color: C.mute,
+        background: 'transparent', border: 0, padding: '4px 0', cursor: 'pointer' } }, 'Cancel') : null
+  );
+}
+
+function Settings({ data, locked, connected }) {
+  const s = useSettings(data);
+  const [resetting, setResetting] = useState(false);
+
+  function reset() {
+    setResetting(true);
+    fetch('/settings/reset', { method: 'POST' })
+      .catch(() => {})
+      .finally(() => setTimeout(() => setResetting(false), 600));
+  }
+
+  return h('div', { className: 'panel panel-scroll' },
+    data.set_error ? h('div', { className: 'card2', style: { padding: '10px 14px', fontSize: 12,
+      color: '#fcd34d', borderColor: 'rgba(245,158,11,0.35)' } },
+      '⚠ Changes apply now but cannot be saved: ' + data.set_error) : null,
+    h(CameraStatusCard, { data }),
+    h('div', { className: 'grid' },
+      ...SETTINGS.map(g => h(SettingsCard, { key: g.id, group: g, s, params: data, locked }))),
+    h('button', { onClick: reset, disabled: resetting,
+      style: { width: '100%', fontSize: 12, fontWeight: 700, color: C.dim,
+        background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.12)',
+        padding: '9px 0', borderRadius: 8, cursor: resetting ? 'default' : 'pointer' } },
+      resetting ? 'Restoring…' : 'Restore defaults'),
+    h('div', { style: { fontSize: 11, color: C.mute, textAlign: 'center' } },
+      'Every setting here takes effect immediately and survives a restart.'),
+    /* Cheapest first. The order on screen IS the order to try them in — mic, then process, then
+       board — so an operator working top to bottom escalates instead of reaching for the reboot. */
+    h(MicRecoveryCard, { data }),
+    h(RestartCard, { connected,
+      busy: !!(data.voice_speaking || ['recording', 'transcribing', 'thinking'].includes(data.voice_status)) }),
+    data.reboot_enabled ? h(RebootCard, { connected,
+      busy: !!(data.voice_speaking || ['recording', 'transcribing', 'thinking'].includes(data.voice_status)) }) : null
+  );
+}
+
+function Telemetry({ data, gesture, gestureKey }) {
+  const [showAdv, setShowAdv] = useState(false);
+  const primary = GROUPS.filter(g => !g.advanced);
+  const advanced = GROUPS.filter(g => g.advanced);
+  return h('div', { className: 'tele' },
+    h('div', { className: 'cam' },
+      h('div', { className: 'cw' }, h('img', { src: '/video', alt: 'Live camera feed' })),
+      h(InfoStrip, { data })),
+    h('div', { className: 'panel' },
+      gesture && GESTURE_CFG[gesture] ? h(GestureBadge, { key: gestureKey, gesture }) : null,
+      h(FaceStatus, { on: data.face_visible === 1 }),
+      data.emotion ? h(EmotionBadge, { emotion: data.emotion }) : null,
+      h('div', { className: 'grid' }, ...primary.map(g => h(GroupCard, { key: g.id, group: g, data }))),
+      h('button', { className: 'adv-toggle', onClick: () => setShowAdv(s => !s), 'aria-expanded': showAdv },
+        (showAdv ? '▾  Hide' : '▸  Show') + ' detailed face metrics'),
+      showAdv ? h('div', { className: 'grid' }, ...advanced.map(g => h(GroupCard, { key: g.id, group: g, data }))) : null,
+      h(VideoSourceCard, { camSource: data.cam_source || 'live', camReason: data.cam_reason }))
+  );
+}
+
+/* ── App ── */
+function App() {
+  const [params, setParams] = useState({});
+  const [connected, setConnected] = useState(false);
+  const [lastGesture, setLastGesture] = useState('');
+  const [gestureKey, setGestureKey] = useState(0);
+  const [messages, setMessages] = useState([]);
+  /* Whitelisted, not just defaulted: the body dispatches on this, so an unrecognised stored value
+     (an older build's name, a hand-edited key) would silently render the wrong view. */
+  const [view, setView] = useState(() => {
+    try { const v = localStorage.getItem('kai_view');
+          return ['talk', 'telemetry', 'settings'].includes(v) ? v : 'talk'; }
+    catch (_) { return 'talk'; }
+  });
+  const prevTurnId = useRef(null);
+  const pending = useRef(false);
+
+  useEffect(() => { try { localStorage.setItem('kai_view', view); } catch (_) {} }, [view]);
+
+  useEffect(() => {
+    let prevTs = 0, clearTimer = null;
+    const es = new EventSource('/params');
+    es.onopen = () => setConnected(true);
+    es.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        setParams(data);
+
+        /* Gesture flash */
+        if (data.gesture && data.gesture_ts !== prevTs) {
+          prevTs = data.gesture_ts;
+          setLastGesture(data.gesture);
+          setGestureKey(k => k + 1);
+          clearTimeout(clearTimer);
+          clearTimer = setTimeout(() => setLastGesture(''), 1500);
+        }
+
+        /* Append a chat turn once per COMPLETED turn.
+           Keyed on voice_turn_id, a counter the assistant bumps only when a turn actually finished —
+           NOT on voice_status reaching 'done'. That field is driven by both the assistant and the
+           session's state projection, so any momentary gap between them looked like a fresh turn and
+           re-posted the previous exchange verbatim (three separate races did exactly that).
+           The first message only establishes a baseline, so a page reload never replays the last turn. */
+        const turnId = data.voice_turn_id;
+        if (turnId !== undefined) {
+          if (prevTurnId.current !== null && turnId !== prevTurnId.current && data.voice_response) {
+            setMessages(prev => {
+              const next = prev.slice();
+              if (data.voice_transcript && data.voice_transcript.trim()) next.push({ role: 'user', text: data.voice_transcript });
+              next.push({ role: 'kai', text: data.voice_response });
+              return next;
+            });
+          }
+          prevTurnId.current = turnId;
+        }
+      } catch (_) {}
+    };
+    es.onerror = () => setConnected(false);
+    return () => { es.close(); clearTimeout(clearTimer); };
+  }, []);
+
+  function toggleVoice() {
+    if (pending.current) return;
+    const st = params.voice_status;
+    if (st === 'transcribing' || st === 'thinking' || params.voice_speaking) return;
+    pending.current = true;
+    const rec = st === 'recording';
+    fetch(rec ? '/voice/stop' : '/voice/start', { method: 'POST' })
+      .catch(() => {})
+      .finally(() => { setTimeout(() => { pending.current = false; }, 250); });
+  }
+
+  /* Spacebar push-to-talk (talk view only, ignore when typing) */
+  useEffect(() => {
+    function onKey(e) {
+      if (e.code !== 'Space' || view !== 'talk') return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      e.preventDefault();
+      toggleVoice();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [view, params.voice_status, params.voice_speaking]);
+
+  /* Derive the single voice state for the mic + banner */
+  const st = params.voice_status || 'idle';
+  let vstate = 'idle';
+  if (st === 'recording') vstate = 'listening';
+  else if (st === 'transcribing' || st === 'thinking') vstate = 'thinking';
+  else if (params.voice_speaking) vstate = 'speaking';
+  else if (st === 'error') vstate = 'error';
+
+  return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%' } },
+    /* Header */
+    h('header', { className: 'hdr' },
+      h('img', { src: 'data:image/png;base64,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', alt: 'Devcon Philippines', className: 'brand-logo', style: { height: 30, width: 'auto', objectFit: 'contain', flexShrink: 0 } }),
+      h('div', { className: 'brand-title', style: { display: 'flex', alignItems: 'baseline', gap: 6 } },
+        h('span', { style: { fontSize: 14, color: 'rgba(182,201,63,0.75)' } }, 'Meet'),
+        h('span', { style: { fontSize: 16, fontWeight: 700, color: C.accentText, letterSpacing: '-0.02em' } }, 'Kai')),
+      h('div', { style: { flex: 1 } }),
+      h('div', { className: 'seg', role: 'tablist', 'aria-label': 'Choose view' },
+        h('button', { role: 'tab', 'aria-label': 'Talk', 'aria-pressed': view === 'talk', onClick: () => setView('talk') }, '💬 ', h('span', { className: 'seg-label' }, 'Talk')),
+        h('button', { role: 'tab', 'aria-label': 'Telemetry', 'aria-pressed': view === 'telemetry', onClick: () => setView('telemetry') }, '📊 ', h('span', { className: 'seg-label' }, 'Telemetry')),
+        h('button', { role: 'tab', 'aria-label': 'Settings', 'aria-pressed': view === 'settings', onClick: () => setView('settings') }, '⚙ ', h('span', { className: 'seg-label' }, 'Settings'))),
+      h(ConnectionPill, { connected })
+    ),
+
+    /* Body — explicit three-way dispatch */
+    h('main', { className: 'body' },
+      view === 'settings'
+        ? h(Settings, { data: params, locked: settingsLocked(params), connected })
+      : view === 'talk'
+        /* No camera here: Talk is about the conversation, and the vision readouts it used to
+           overlay (face_visible, emotion) are already on Telemetry as FaceStatus/EmotionBadge.
+           Dropping the panel also stops this view pulling the MJPEG stream, which the Jetson was
+           encoding for a picture nobody was reading. WakeChip stays — it lives nowhere else, and
+           its 'disabled' case is the only place the UI admits hands-free failed to load. */
+        ? h('div', { className: 'talk' },
+            h('div', { className: 'convo' },
+              /* Only when a session is actually running — WakeChip renders nothing without
+                 sess_state, and an empty bordered strip is worse than no strip. */
+              params.sess_state ? h('div', { className: 'convo-bar' }, h(WakeChip, { p: params })) : null,
+              h(ChatLog, { messages }),
+              (params.voice_error && vstate === 'error') ? h('div', { className: 'errbar' }, params.voice_error) : null,
+              h(MicButton, { vstate, onClick: toggleVoice, sess: params.sess_state })))
+        : h(Telemetry, { data: params, gesture: lastGesture, gestureKey })
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(h(App));
+})();
+</script>
+</body>
+</html>

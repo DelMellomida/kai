@@ -1,0 +1,1021 @@
+<!doctype html>
+<title>Devcon Face Tracking Robot — Setup Guide</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+/* ── Reset & tokens ──────────────────────────────────────────────── */
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b0e18;
+  --nav:#111624;
+  --surface:#161c2d;
+  --surface2:#1c2338;
+  --border:#222d45;
+  --border2:#2a3655;
+  --accent:#5b9cf6;
+  --accent2:#8b6cf7;
+  --green:#3dd68c;
+  --yellow:#f5a623;
+  --red:#f05252;
+  --text:#dde3f0;
+  --muted:#6b7a99;
+  --dim:#3a4560;
+  --code:#141a2c;
+}
+
+/* ── Layout shell ────────────────────────────────────────────────── */
+html{scroll-behavior:smooth}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  line-height:1.75;
+  font-size:15px;
+  display:flex;
+  min-height:100vh;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────── */
+nav{
+  width:220px;
+  min-width:220px;
+  background:var(--nav);
+  border-right:1px solid var(--border);
+  padding:0;
+  position:sticky;
+  top:0;
+  height:100vh;
+  overflow-y:auto;
+  flex-shrink:0;
+  display:flex;
+  flex-direction:column;
+}
+
+.nav-brand{
+  padding:22px 20px 18px;
+  border-bottom:1px solid var(--border);
+}
+
+.nav-brand-name{
+  font-size:15px;
+  font-weight:800;
+  letter-spacing:-.01em;
+  background:linear-gradient(120deg,var(--accent),var(--accent2));
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+  background-clip:text;
+}
+
+.nav-brand-sub{
+  font-size:11px;
+  color:var(--muted);
+  margin-top:3px;
+}
+
+.nav-section-label{
+  padding:16px 20px 5px;
+  font-size:10px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.1em;
+  color:var(--dim);
+}
+
+nav a{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:7px 20px;
+  color:var(--muted);
+  text-decoration:none;
+  font-size:13px;
+  border-left:2px solid transparent;
+  transition:color .14s,background .14s,border-color .14s;
+}
+
+nav a .nav-icon{font-size:13px;opacity:.7;flex-shrink:0}
+nav a:hover{color:var(--text);background:var(--surface);border-left-color:var(--accent)}
+
+/* ── Main content ────────────────────────────────────────────────── */
+main{
+  flex:1;
+  min-width:0;
+  padding:0;
+}
+
+.content{
+  max-width:780px;
+  padding:52px 56px 80px;
+}
+
+/* ── Hero ────────────────────────────────────────────────────────── */
+.hero{
+  background:linear-gradient(135deg,rgba(91,156,246,.08) 0%,rgba(139,108,247,.06) 100%);
+  border:1px solid rgba(91,156,246,.15);
+  border-radius:14px;
+  padding:32px 36px;
+  margin-bottom:52px;
+}
+
+.hero h1{
+  font-size:28px;
+  font-weight:800;
+  line-height:1.2;
+  letter-spacing:-.02em;
+  background:linear-gradient(130deg,var(--accent) 0%,var(--accent2) 100%);
+  -webkit-background-clip:text;
+  -webkit-text-fill-color:transparent;
+  background-clip:text;
+  margin-bottom:8px;
+}
+
+.hero p{
+  color:var(--muted);
+  font-size:14.5px;
+  margin-bottom:20px;
+}
+
+.pill-row{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+}
+
+.pill{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:5px 12px;
+  border-radius:99px;
+  font-size:12.5px;
+  font-weight:600;
+}
+
+.pill-blue{background:rgba(91,156,246,.15);color:var(--accent);border:1px solid rgba(91,156,246,.25)}
+.pill-purple{background:rgba(139,108,247,.15);color:var(--accent2);border:1px solid rgba(139,108,247,.25)}
+.pill-green{background:rgba(61,214,140,.15);color:var(--green);border:1px solid rgba(61,214,140,.25)}
+
+/* ── Section headings ────────────────────────────────────────────── */
+.section{margin-bottom:60px}
+
+.section-header{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  margin-bottom:20px;
+  padding-bottom:14px;
+  border-bottom:1px solid var(--border);
+}
+
+.section-icon{
+  width:36px;
+  height:36px;
+  border-radius:10px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:17px;
+  flex-shrink:0;
+  background:var(--surface2);
+  border:1px solid var(--border2);
+}
+
+.section-header h2{
+  font-size:19px;
+  font-weight:700;
+  letter-spacing:-.01em;
+}
+
+h3{
+  font-size:14px;
+  font-weight:600;
+  color:var(--accent);
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  margin:28px 0 10px;
+}
+
+p{margin-bottom:12px;color:var(--text)}
+p:last-child{margin-bottom:0}
+
+/* ── Code ────────────────────────────────────────────────────────── */
+code{
+  font-family:'JetBrains Mono','Fira Code','Courier New',monospace;
+  font-size:12.5px;
+  background:var(--code);
+  border:1px solid var(--border);
+  border-radius:5px;
+  padding:1px 6px;
+  color:#93c5fd;
+}
+
+.code-block{
+  background:var(--code);
+  border:1px solid var(--border);
+  border-radius:10px;
+  overflow:hidden;
+  margin:12px 0 20px;
+}
+
+.code-label{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding:8px 14px;
+  background:rgba(255,255,255,.025);
+  border-bottom:1px solid var(--border);
+  font-size:11px;
+  color:var(--muted);
+  font-family:monospace;
+}
+
+.code-label .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot-r{background:#f05252} .dot-y{background:#f5a623} .dot-g{background:#3dd68c}
+
+.code-block pre{
+  padding:16px 18px;
+  overflow-x:auto;
+  font-family:'JetBrains Mono','Fira Code','Courier New',monospace;
+  font-size:13px;
+  line-height:1.65;
+  color:#86efac;
+}
+
+/* ── Callouts ────────────────────────────────────────────────────── */
+.callout{
+  display:flex;
+  gap:12px;
+  padding:14px 16px;
+  border-radius:10px;
+  margin:16px 0;
+  font-size:13.5px;
+  line-height:1.6;
+}
+.callout-icon{font-size:17px;flex-shrink:0;margin-top:1px}
+.callout p{margin:0;color:inherit}
+.callout.tip{background:rgba(91,156,246,.08);border:1px solid rgba(91,156,246,.2);color:#93c5fd}
+.callout.warn{background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);color:#fcd34d}
+.callout.tip p,.callout.warn p{color:inherit}
+
+/* ── Steps ───────────────────────────────────────────────────────── */
+.steps{list-style:none;padding:0;margin:16px 0;position:relative}
+
+.steps::before{
+  content:'';
+  position:absolute;
+  left:17px;
+  top:24px;
+  bottom:24px;
+  width:2px;
+  background:var(--border2);
+}
+
+.steps li{
+  position:relative;
+  padding:18px 18px 18px 54px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  margin-bottom:10px;
+  counter-increment:step;
+}
+
+.step-num{
+  position:absolute;
+  left:10px;
+  top:18px;
+  width:28px;
+  height:28px;
+  border-radius:50%;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:#fff;
+  font-size:12px;
+  font-weight:700;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:1;
+}
+
+.steps li strong{display:block;font-size:14px;margin-bottom:6px;color:#fff}
+.steps li p{font-size:13.5px;color:var(--muted);margin-bottom:0}
+
+/* ── Tables ──────────────────────────────────────────────────────── */
+.tw{overflow-x:auto;margin:14px 0 22px;border-radius:10px;border:1px solid var(--border)}
+
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+thead th{
+  background:var(--surface2);
+  padding:10px 14px;
+  text-align:left;
+  font-size:11px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+  color:var(--muted);
+  border-bottom:1px solid var(--border);
+}
+tbody td{
+  padding:10px 14px;
+  border-bottom:1px solid var(--border);
+  vertical-align:top;
+  color:var(--text);
+}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--surface)}
+td code{font-size:12px}
+
+/* ── Pin badges ──────────────────────────────────────────────────── */
+.pin{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  padding:3px 9px;
+  border-radius:99px;
+  font-family:monospace;
+  font-size:12px;
+  font-weight:700;
+}
+.pin-pan{background:rgba(91,156,246,.2);color:var(--accent);border:1px solid rgba(91,156,246,.35)}
+.pin-tilt{background:rgba(139,108,247,.2);color:var(--accent2);border:1px solid rgba(139,108,247,.35)}
+.pin-jaw{background:rgba(61,214,140,.2);color:var(--green);border:1px solid rgba(61,214,140,.35)}
+.pin-gnd{background:rgba(107,122,153,.2);color:var(--muted);border:1px solid rgba(107,122,153,.35)}
+.pin-led{background:rgba(245,166,35,.2);color:var(--yellow);border:1px solid rgba(245,166,35,.35)}
+
+/* ── Wiring diagram ──────────────────────────────────────────────── */
+.diagram{
+  background:var(--code);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:24px 28px;
+  margin:14px 0 22px;
+  font-family:'Courier New',monospace;
+  font-size:13px;
+  line-height:2;
+  overflow-x:auto;
+}
+
+/* ── Param cards ─────────────────────────────────────────────────── */
+.param-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+  gap:10px;
+  margin:14px 0;
+}
+
+.pc{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:14px 16px;
+  border-left:3px solid var(--accent);
+}
+
+.pc.purple{border-left-color:var(--accent2)}
+.pc.green{border-left-color:var(--green)}
+
+.pc-name{font-family:monospace;font-size:13px;color:var(--accent);font-weight:700;margin-bottom:3px}
+.pc.purple .pc-name{color:var(--accent2)}
+.pc.green .pc-name{color:var(--green)}
+.pc-range{font-size:11px;color:var(--muted);margin-bottom:6px}
+.pc-desc{font-size:13px;color:var(--text);line-height:1.5}
+
+/* ── Gesture row ─────────────────────────────────────────────────── */
+.gest-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+  gap:10px;
+  margin:14px 0;
+}
+
+.gc{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:14px 16px;
+}
+
+.gc-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.gc-name{font-weight:700;font-size:14px}
+.gc-code{font-family:monospace;font-size:12px;padding:2px 8px;border-radius:5px;background:var(--code);color:var(--green);border:1px solid var(--border)}
+.gc-how{font-size:13px;color:var(--muted)}
+
+/* ── Tuning cards ────────────────────────────────────────────────── */
+.tune-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(340px,1fr));
+  gap:10px;
+  margin:14px 0;
+}
+
+.tc{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:14px 16px;
+}
+
+.tc-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px}
+.tc-name{font-family:monospace;font-size:13px;color:var(--accent);font-weight:700}
+.tc-val{font-family:monospace;font-size:12px;color:var(--yellow);background:rgba(245,166,35,.1);border:1px solid rgba(245,166,35,.2);border-radius:5px;padding:2px 8px;white-space:nowrap}
+.tc-desc{font-size:13px;color:var(--muted);line-height:1.5}
+
+/* ── FAQ ─────────────────────────────────────────────────────────── */
+.faq-list{margin-top:14px;display:flex;flex-direction:column;gap:8px}
+
+details{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  overflow:hidden;
+  transition:border-color .14s;
+}
+
+details[open]{border-color:var(--accent)}
+
+summary{
+  padding:14px 18px;
+  cursor:pointer;
+  font-weight:600;
+  font-size:14px;
+  list-style:none;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  user-select:none;
+  color:var(--text);
+}
+
+summary::-webkit-details-marker{display:none}
+
+.summ-arrow{
+  width:18px;
+  height:18px;
+  border-radius:5px;
+  background:var(--surface2);
+  border:1px solid var(--border2);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:9px;
+  flex-shrink:0;
+  transition:transform .15s,background .14s;
+  color:var(--accent);
+}
+
+details[open] .summ-arrow{transform:rotate(90deg);background:rgba(91,156,246,.15)}
+summary .summ-icon{font-size:16px;flex-shrink:0}
+
+.faq-body{
+  padding:0 18px 16px;
+  font-size:14px;
+  color:var(--muted);
+  line-height:1.7;
+  border-top:1px solid var(--border);
+  padding-top:14px;
+  margin-top:0;
+}
+.faq-body p{color:var(--muted);margin-bottom:8px}
+.faq-body p:last-child{margin-bottom:0}
+
+/* ── Responsive ──────────────────────────────────────────────────── */
+@media(max-width:700px){
+  nav{display:none}
+  .content{padding:28px 20px 60px}
+  .hero{padding:22px 20px}
+  .tune-grid{grid-template-columns:1fr}
+}
+</style>
+
+<div style="display:flex;min-height:100vh">
+
+<!-- ── Sidebar ── -->
+<nav>
+  <div class="nav-brand">
+    <div class="nav-brand-name">Devcon FTR</div>
+    <div class="nav-brand-sub">Face Tracking Robot</div>
+  </div>
+
+  <div class="nav-section-label">Getting Started</div>
+  <a href="#what"><span class="nav-icon">🤖</span> What is this?</a>
+  <a href="#hw"><span class="nav-icon">🔧</span> Hardware needed</a>
+  <a href="#wire"><span class="nav-icon">⚡</span> Wiring</a>
+  <a href="#sw"><span class="nav-icon">💻</span> Software setup</a>
+
+  <div class="nav-section-label">Running</div>
+  <a href="#run"><span class="nav-icon">▶</span> How to run</a>
+  <a href="#flags"><span class="nav-icon">🚩</span> Command flags</a>
+  <a href="#dash"><span class="nav-icon">📊</span> Web dashboard</a>
+
+  <div class="nav-section-label">Reference</div>
+  <a href="#params"><span class="nav-icon">📐</span> Face parameters</a>
+  <a href="#gest"><span class="nav-icon">👋</span> Gestures</a>
+  <a href="#tune"><span class="nav-icon">🎛</span> Fine tuning</a>
+  <a href="#faq"><span class="nav-icon">❓</span> FAQ</a>
+</nav>
+
+<!-- ── Content ── -->
+<main>
+<div class="content">
+
+<!-- Hero -->
+<div class="hero" id="what">
+  <h1>Devcon Face Tracking Robot</h1>
+  <p>Setup guide for building a face-tracking robot head using a Jetson Orin Nano, Arduino Uno, and SG90 servo motors. Beginner-friendly — step by step.</p>
+  <div class="pill-row">
+    <span class="pill pill-blue">🔄 Pan — left / right</span>
+    <span class="pill pill-purple">↕ Tilt — up / down</span>
+    <span class="pill pill-green">👄 Jaw — mouth open / close</span>
+  </div>
+</div>
+
+<!-- What is this -->
+<div class="section">
+  <div class="section-header">
+    <div class="section-icon">🤖</div>
+    <h2>What is this?</h2>
+  </div>
+  <p>The <strong>Devcon Face Tracking Robot</strong> uses a camera and Google MediaPipe AI to find a human face in real time. It then sends commands to servo motors so the robot head always faces the person in front of it — left, right, up, down — and opens a jaw servo whenever the person opens their mouth.</p>
+  <p>It also detects deliberate gestures (nod, shake, approach, retreat, mouth open/close) and fires a serial event to the Arduino so you can trigger LEDs, sounds, or any other hardware reaction.</p>
+</div>
+
+<!-- Hardware -->
+<div class="section" id="hw">
+  <div class="section-header">
+    <div class="section-icon">🔧</div>
+    <h2>Hardware you need</h2>
+  </div>
+  <div class="tw"><table>
+    <thead><tr><th>Part</th><th>Qty</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Jetson Orin Nano</strong> (or any Linux PC)</td><td>1</td><td>Runs the Python face-tracking code</td></tr>
+      <tr><td><strong>USB webcam</strong> or IP camera</td><td>1</td><td>Any USB webcam; IP camera via <code>--network</code></td></tr>
+      <tr><td><strong>Arduino Uno</strong></td><td>1</td><td>Controls the servos from serial commands</td></tr>
+      <tr><td><strong>USB-A to USB-B cable</strong></td><td>1</td><td>Connects Jetson → Arduino</td></tr>
+      <tr><td><strong>SG90 servo motors</strong></td><td>1–3</td><td>Pan only; or add tilt and jaw</td></tr>
+      <tr><td><strong>5V power source for servos</strong></td><td>1</td><td>External supply, Arduino 5V pin (light loads), or Jetson GPIO 5V — see Wiring section</td></tr>
+      <tr><td><strong>Jumper wires + breadboard</strong></td><td>–</td><td>For connecting everything together</td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout warn">
+    <span class="callout-icon">⚡</span>
+    <p><strong>Don't power servos from the Arduino 5V pin</strong> — the Arduino gets its 5V from USB which is limited to ~500 mA total. Three servos moving under load can easily exceed that and cause the Arduino to reset or behave erratically. Use one of the options in the Wiring section instead.</p>
+  </div>
+</div>
+
+<!-- Wiring -->
+<div class="section" id="wire">
+  <div class="section-header">
+    <div class="section-icon">⚡</div>
+    <h2>Wiring</h2>
+  </div>
+
+  <h3>Arduino Uno — pin assignments</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Pin</th><th>Connected to</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><span class="pin pin-pan">9</span></td><td>Pan servo — signal wire</td><td>Left / right rotation</td></tr>
+      <tr><td><span class="pin pin-tilt">10</span></td><td>Tilt servo — signal wire</td><td>Up / down rotation</td></tr>
+      <tr><td><span class="pin pin-jaw">6</span></td><td>Jaw servo — signal wire</td><td>Mouth open / close</td></tr>
+      <tr><td><span class="pin pin-gnd">GND</span></td><td>All servo GND wires + external PSU GND</td><td>Common ground — must be shared</td></tr>
+      <tr><td><span class="pin pin-led">13</span></td><td>Built-in LED (no wiring needed)</td><td>Flashes 2× when a gesture fires</td></tr>
+      <tr><td><span class="pin pin-gnd">0 / 1</span></td><td>USB serial (auto)</td><td>Do not connect anything here</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>SG90 servo — wire colours</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Wire colour</th><th>Connect to</th></tr></thead>
+    <tbody>
+      <tr><td><span style="color:#f5a623;font-size:18px;vertical-align:middle">▌</span> Orange / Yellow</td><td>Arduino signal pin (9 for pan, 10 for tilt, 6 for jaw)</td></tr>
+      <tr><td><span style="color:#f05252;font-size:18px;vertical-align:middle">▌</span> Red</td><td>Your chosen 5V power source — see options below</td></tr>
+      <tr><td><span style="color:#6b7a99;font-size:18px;vertical-align:middle">▌</span> Brown / Black</td><td>GND — must be shared with Arduino GND</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Powering the servos — pick one option</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Option</th><th>How</th><th>Good when…</th><th>Watch out for…</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Jetson GPIO 5V</strong> ⭐</td>
+        <td>Servo red wire → Jetson pin 2 or 4<br>Servo GND → Jetson GND + Arduino GND</td>
+        <td>You already have the Jetson set up and want the simplest wiring</td>
+        <td>Your power adapter must be beefy enough — Jetson under load already draws 8–15 W. Fine on the standard 19 V dev kit adapter.</td>
+      </tr>
+      <tr>
+        <td><strong>External 5V supply</strong></td>
+        <td>Phone charger / bench PSU → servo red + GND<br>Bridge GND to Arduino GND</td>
+        <td>You have 3 servos under heavy mechanical load, or want power fully isolated</td>
+        <td>One extra cable; needs a shared GND wire back to Arduino</td>
+      </tr>
+      <tr>
+        <td><strong>Arduino 5V pin</strong></td>
+        <td>Servo red wire → Arduino 5V pin</td>
+        <td>1 servo, light load, just testing</td>
+        <td>USB limits total current to ~500 mA. Multiple servos moving simultaneously can brown out the Arduino and cause resets or twitching.</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <div class="callout tip">
+    <span class="callout-icon">💡</span>
+    <p><strong>Shared ground is critical regardless of which power option you use.</strong> The servo GND wire and the Arduino GND must be connected together. Without a common ground the signal wire has no reference and the servo behaves randomly.</p>
+  </div>
+
+  <h3>Jetson Orin Nano — GPIO 40-pin header</h3>
+  <div class="tw"><table>
+    <thead><tr><th>Jetson pin</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><span class="pin pin-led">Pin 2</span> or <span class="pin pin-led">Pin 4</span></td><td>5V — connect servo red wires here</td></tr>
+      <tr><td><span class="pin pin-gnd">Pin 6</span>, <span class="pin pin-gnd">9</span>, <span class="pin pin-gnd">14</span>, <span class="pin pin-gnd">20</span>…</td><td>GND — connect servo GND <em>and</em> a wire to Arduino GND</td></tr>
+      <tr><td>Any USB-A port</td><td>Arduino Uno via USB cable → appears as <code>/dev/ttyUSB0</code></td></tr>
+      <tr><td>Any USB-A port</td><td>USB webcam</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Wiring overview (Jetson GPIO power option)</h3>
+  <div class="diagram"><span style="color:#5b9cf6;font-weight:700">[ Jetson Orin Nano ]</span>
+   |              |
+   | USB cable    | GPIO header
+   |              |
+   |         Pin 2/4 <span style="color:#f05252">(5V)</span> ──────── All servo <span style="color:#f05252">red</span> wires
+   |         Pin 6   <span style="color:#6b7a99">(GND)</span> ──┬───── All servo <span style="color:#6b7a99">GND</span> wires
+   |                         │
+<span style="color:#5b9cf6;font-weight:700">[ Arduino Uno ]</span>              │
+   |  |  |  └── <span style="color:#5b9cf6">Pin  9</span> ──── <span style="color:#3dd68c">Pan  servo</span>  (signal)
+   |  |  └───── <span style="color:#8b6cf7">Pin 10</span> ──── <span style="color:#3dd68c">Tilt servo</span>  (signal)
+   |  └──────── <span style="color:#3dd68c">Pin  6</span> ──── <span style="color:#3dd68c">Jaw  servo</span>  (signal)
+   └─────────── <span style="color:#6b7a99">GND</span>    ────┘  (bridge wire — shared ground)</div>
+</div>
+
+<!-- Software setup -->
+<div class="section" id="sw">
+  <div class="section-header">
+    <div class="section-icon">💻</div>
+    <h2>Software setup</h2>
+  </div>
+
+  <ol class="steps">
+    <li>
+      <div class="step-num">1</div>
+      <strong>Install Python libraries</strong>
+      <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>pip3 install opencv-python mediapipe pyserial flask numpy</pre></div>
+    </li>
+    <li>
+      <div class="step-num">2</div>
+      <strong>Flash the Arduino sketch</strong>
+      <p>Open <code>arduino/servo_serial/servo_serial.ino</code> in the Arduino IDE and click <strong>Upload</strong>. Or use the command line — the script can re-flash automatically using <code>arduino-builder</code> and <code>avrdude</code>.</p>
+    </li>
+    <li>
+      <div class="step-num">3</div>
+      <strong>Check the serial port appears</strong>
+      <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>ls /dev/ttyUSB*</pre></div>
+      <p>You should see <code>/dev/ttyUSB0</code>. If not, the CH340 driver may not be loaded — the script attempts to load it automatically on startup.</p>
+    </li>
+    <li>
+      <div class="step-num">4</div>
+      <strong>Grant yourself serial port access</strong>
+      <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>sudo usermod -aG dialout $USER</pre></div>
+      <p>Log out and back in once for this to take effect.</p>
+    </li>
+    <li>
+      <div class="step-num">5</div>
+      <strong>Test it</strong>
+      <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>python3 face_track.py --camera 0</pre></div>
+      <p>A window opens with a green dot tracking your nose tip. Press <code>Q</code> to quit.</p>
+    </li>
+  </ol>
+</div>
+
+<!-- How to run -->
+<div class="section" id="run">
+  <div class="section-header">
+    <div class="section-icon">▶</div>
+    <h2>How to run</h2>
+  </div>
+
+  <h3>Pan only — 1 servo</h3>
+  <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>python3 face_track.py</pre></div>
+
+  <h3>Pan + tilt — 2 servos</h3>
+  <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>python3 face_track.py --tilt</pre></div>
+
+  <h3>Pan + tilt + jaw — all 3 servos</h3>
+  <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>python3 face_track.py --tilt --jaw</pre></div>
+
+  <h3>Headless with IP camera (no monitor needed)</h3>
+  <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>python3 face_track.py --network 192.168.1.181 --no-display --tilt --jaw</pre></div>
+
+  <h3>If servos move the wrong direction</h3>
+  <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;terminal</div><pre>python3 face_track.py --flip       # invert pan (left ↔ right)
+python3 face_track.py --flip-y     # invert tilt (up ↔ down)</pre></div>
+</div>
+
+<!-- Flags -->
+<div class="section" id="flags">
+  <div class="section-header">
+    <div class="section-icon">🚩</div>
+    <h2>Command flags</h2>
+  </div>
+  <div class="tw"><table>
+    <thead><tr><th>Flag</th><th>Default</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>--camera N</code></td><td>0</td><td>Use USB webcam number N (0 = first camera found)</td></tr>
+      <tr><td><code>--network HOST</code></td><td>off</td><td>Use an IP/network camera at this address instead</td></tr>
+      <tr><td><code>--network-port N</code></td><td>8554</td><td>Port for the network camera stream</td></tr>
+      <tr><td><code>--port PATH</code></td><td>/dev/ttyUSB0</td><td>Serial port the Arduino is connected to</td></tr>
+      <tr><td><code>--flip</code></td><td>off</td><td>Invert pan servo direction</td></tr>
+      <tr><td><code>--flip-y</code></td><td>off</td><td>Invert tilt servo direction</td></tr>
+      <tr><td><code>--tilt</code></td><td>off</td><td>Enable tilt servo on Arduino <strong>pin 10</strong></td></tr>
+      <tr><td><code>--jaw</code></td><td>off</td><td>Enable jaw servo on Arduino <strong>pin 6</strong>, driven by mouth openness</td></tr>
+      <tr><td><code>--no-display</code></td><td>off</td><td>Skip the OpenCV preview window (required when headless)</td></tr>
+      <tr><td><code>--lofi</code></td><td>off</td><td>Print a compact 19-digit face param string each frame</td></tr>
+    </tbody>
+  </table></div>
+</div>
+
+<!-- Dashboard -->
+<div class="section" id="dash">
+  <div class="section-header">
+    <div class="section-icon">📊</div>
+    <h2>Web dashboard</h2>
+  </div>
+  <p>While the tracker is running, open any browser on the same network and visit:</p>
+  <div class="code-block"><div class="code-label"><span class="dot dot-r"></span><span class="dot dot-y"></span><span class="dot dot-g"></span> &nbsp;browser address bar</div><pre>http://&lt;jetson-ip-address&gt;:8080</pre></div>
+  <p>You'll see a live camera feed and all face parameters updating in real time. Gesture events appear as a badge above the parameter panel.</p>
+  <div class="callout tip">
+    <span class="callout-icon">💡</span>
+    <p>Find your Jetson's IP address by running <code>hostname -I</code> in a terminal. Use the first address shown.</p>
+  </div>
+</div>
+
+<!-- Face params -->
+<div class="section" id="params">
+  <div class="section-header">
+    <div class="section-icon">📐</div>
+    <h2>Face parameters</h2>
+  </div>
+  <p>Calculated every frame from camera landmarks. All values are <strong>0–99</strong> (directional ones are −99 to +99). Shown live on the dashboard.</p>
+
+  <div class="param-grid">
+    <div class="pc">
+      <div class="pc-name">x</div>
+      <div class="pc-range">0 – 99 &nbsp;(left → right)</div>
+      <div class="pc-desc">Nose horizontal position. 50 = centre. Drives the <strong>pan servo</strong>.</div>
+    </div>
+    <div class="pc">
+      <div class="pc-name">y</div>
+      <div class="pc-range">0 – 99 &nbsp;(top → bottom)</div>
+      <div class="pc-desc">Nose vertical position. 50 = centre. Drives the <strong>tilt servo</strong>.</div>
+    </div>
+    <div class="pc green">
+      <div class="pc-name">mouth</div>
+      <div class="pc-range">0 – 99 &nbsp;(closed → open)</div>
+      <div class="pc-desc">Lip gap openness. Drives the <strong>jaw servo</strong> in real time.</div>
+    </div>
+    <div class="pc">
+      <div class="pc-name">distance</div>
+      <div class="pc-range">0 – 99 &nbsp;(far → close)</div>
+      <div class="pc-desc">Apparent face size. Used to detect approach/retreat gestures.</div>
+    </div>
+    <div class="pc purple">
+      <div class="pc-name">yaw</div>
+      <div class="pc-range">−99 – +99</div>
+      <div class="pc-desc">Head turning left or right. Positive = facing right.</div>
+    </div>
+    <div class="pc purple">
+      <div class="pc-name">pitch</div>
+      <div class="pc-range">−99 – +99</div>
+      <div class="pc-desc">Head tilting up or down. Positive = looking up.</div>
+    </div>
+    <div class="pc purple">
+      <div class="pc-name">roll</div>
+      <div class="pc-range">−99 – +99</div>
+      <div class="pc-desc">Head leaning sideways. Like a curious dog.</div>
+    </div>
+    <div class="pc">
+      <div class="pc-name">left_eye / right_eye</div>
+      <div class="pc-range">0 – 99</div>
+      <div class="pc-desc">Eye openness. 0 = fully closed (winking), 99 = wide open.</div>
+    </div>
+    <div class="pc">
+      <div class="pc-name">smile_kiss</div>
+      <div class="pc-range">0 – 99</div>
+      <div class="pc-desc">Mouth shape. Low = pursed lips, high = wide smile.</div>
+    </div>
+    <div class="pc green">
+      <div class="pc-name">pan / tilt</div>
+      <div class="pc-range">0 – 180°</div>
+      <div class="pc-desc">Actual servo angle being sent to the Arduino this moment.</div>
+    </div>
+    <div class="pc green">
+      <div class="pc-name">jaw</div>
+      <div class="pc-range">90 – 150°</div>
+      <div class="pc-desc">Jaw servo angle. 90° = closed, 150° = fully open.</div>
+    </div>
+  </div>
+</div>
+
+<!-- Gestures -->
+<div class="section" id="gest">
+  <div class="section-header">
+    <div class="section-icon">👋</div>
+    <h2>Gesture detection</h2>
+  </div>
+  <p>Each gesture appears as a badge on the dashboard and sends a one-letter serial code to the Arduino — use it to trigger LEDs, sounds, extra servos, anything.</p>
+
+  <div class="gest-grid">
+    <div class="gc">
+      <div class="gc-header"><span class="gc-name">↕ Nod</span><span class="gc-code">G:N</span></div>
+      <div class="gc-how">Move head up and down at least twice deliberately</div>
+    </div>
+    <div class="gc">
+      <div class="gc-header"><span class="gc-name">↔ Shake</span><span class="gc-code">G:S</span></div>
+      <div class="gc-how">Move head left and right at least twice deliberately</div>
+    </div>
+    <div class="gc">
+      <div class="gc-header"><span class="gc-name">📍 Approach</span><span class="gc-code">G:A</span></div>
+      <div class="gc-how">Move face noticeably closer to the camera</div>
+    </div>
+    <div class="gc">
+      <div class="gc-header"><span class="gc-name">↩ Retreat</span><span class="gc-code">G:R</span></div>
+      <div class="gc-how">Move face noticeably farther from the camera</div>
+    </div>
+    <div class="gc">
+      <div class="gc-header"><span class="gc-name">😮 Mouth open</span><span class="gc-code">G:M</span></div>
+      <div class="gc-how">Open mouth wide — above ~40 on the mouth scale</div>
+    </div>
+    <div class="gc">
+      <div class="gc-header"><span class="gc-name">😐 Mouth close</span><span class="gc-code">G:C</span></div>
+      <div class="gc-how">Close mouth below ~20 after it was open</div>
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-icon">💡</span>
+    <p>Each gesture has a cooldown so it doesn't fire repeatedly. Nod/shake: 1 s. Approach/retreat: 1.5 s. Mouth: 0.8 s. All adjustable in <code>gesture.py</code>.</p>
+  </div>
+</div>
+
+<!-- Fine tuning -->
+<div class="section" id="tune">
+  <div class="section-header">
+    <div class="section-icon">🎛</div>
+    <h2>Fine tuning</h2>
+  </div>
+  <p>All values live at the top of <code>face_track.py</code> and <code>gesture.py</code>. Edit with any text editor — no recompile needed, just restart the script.</p>
+
+  <h3>Servo tracking — face_track.py</h3>
+  <div class="tune-grid">
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">EMA_ALPHA</span><span class="tc-val">0.30</span></div>
+      <div class="tc-desc">How fast the position updates. <strong>Higher (0.5+) = faster but jittery. Lower (0.15) = smoother but laggy.</strong> This is the main smoothness knob.</div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">ANGLE_SCALE</span><span class="tc-val">270</span></div>
+      <div class="tc-desc">Servo degrees mapped across the full camera width. <strong>Lower = smaller movements. Higher = bigger sweep.</strong> Try 180 or 360.</div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">Kp</span><span class="tc-val">0.20</span></div>
+      <div class="tc-desc">Proportional gain — how aggressively the servo chases the target. Higher = faster but may overshoot and oscillate.</div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">Kd</span><span class="tc-val">0.25</span></div>
+      <div class="tc-desc">Derivative gain — braking force that reduces wobble. Raise if the servo oscillates back and forth past the target.</div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">SLEEP_AFTER</span><span class="tc-val">3.0 s</span></div>
+      <div class="tc-desc">Seconds with no face before servos return to 90° centre. Increase to hold position longer.</div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">SEND_INTERVAL</span><span class="tc-val">0.10 s</span></div>
+      <div class="tc-desc">How often commands are sent to the Arduino (10 Hz). Lower = smoother motion, more serial traffic.</div>
+    </div>
+  </div>
+
+  <h3>Jaw servo — face_track.py</h3>
+  <div class="tune-grid">
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">JAW_CLOSED</span><span class="tc-val">90°</span></div>
+      <div class="tc-desc">Servo angle when mouth is fully closed. Adjust if the jaw doesn't rest flush against the face on your robot.</div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">JAW_OPEN</span><span class="tc-val">150°</span></div>
+      <div class="tc-desc">Servo angle when mouth is fully open. Increase for a wider swing. Decrease for subtler movement. Don't exceed 180°.</div>
+    </div>
+  </div>
+
+  <h3>Gesture sensitivity — gesture.py</h3>
+  <div class="tune-grid">
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">NOD_MIN_AMP / SHAKE_MIN_AMP</span><span class="tc-val">15</span></div>
+      <div class="tc-desc">Minimum head movement range to trigger. <strong>Lower = fires more easily. Higher = needs a bigger deliberate movement.</strong></div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">NOD_COOLDOWN / SHAKE_COOLDOWN</span><span class="tc-val">1.0 s</span></div>
+      <div class="tc-desc">Minimum gap between repeated firings. Raise if a gesture keeps triggering when you didn't mean it.</div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">PROX_DELTA</span><span class="tc-val">12</span></div>
+      <div class="tc-desc">How much face size must change to fire approach/retreat. Lower = triggers on smaller movements.</div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">MOUTH_OPEN_THRESHOLD</span><span class="tc-val">40</span></div>
+      <div class="tc-desc">Mouth openness (0–99) to fire "mouth open". <strong>Raise to 55–60 if it fires while you're just talking.</strong></div>
+    </div>
+    <div class="tc">
+      <div class="tc-top"><span class="tc-name">MOUTH_CLOSE_THRESHOLD</span><span class="tc-val">20</span></div>
+      <div class="tc-desc">Mouth openness to fire "mouth close". The gap between 20 and 40 prevents rapid flickering between states.</div>
+    </div>
+  </div>
+</div>
+
+<!-- FAQ -->
+<div class="section" id="faq">
+  <div class="section-header">
+    <div class="section-icon">❓</div>
+    <h2>FAQ</h2>
+  </div>
+  <div class="faq-list">
+
+    <details>
+      <summary><span class="summ-icon">😬</span> The servo twitches even when my face is still <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>Lower <code>EMA_ALPHA</code> (e.g. 0.15) to smooth the nose position more before it drives the servo. You can also raise <code>Kd</code> slightly to dampen oscillation.</p>
+        <p>Some twitching on the tilt axis when you pan is normal — the 2D nose Y-coordinate shifts when the head turns, which is a known limitation of pixel-based tracking.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">🔄</span> The servo moves the wrong direction <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>Add <code>--flip</code> to invert pan (left ↔ right) or <code>--flip-y</code> to invert tilt (up ↔ down). No hardware change needed.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">👄</span> The jaw servo doesn't move <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>Check three things: (1) Did you pass <code>--jaw</code> when starting? (2) Was the Arduino re-flashed with the latest sketch — jaw support was added recently and older sketches ignore pin 6. (3) Open the dashboard and watch the <code>mouth</code> value — if it stays at 0, improve lighting so MediaPipe can see your lips clearly.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">🔌</span> It says "ttyUSB0 not found" <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>The CH340 USB driver may not be loaded. The script tries automatically. If it still fails, run:</p>
+        <pre style="background:var(--code);border:1px solid var(--border);border-radius:7px;padding:12px 14px;font-size:13px;color:#86efac;margin:8px 0">sudo modprobe usbserial
+sudo bash fix_usb.sh</pre>
+        <p>Then re-plug the USB cable and try again.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">📷</span> Camera not found <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>Try <code>--camera 0</code>, <code>--camera 1</code>, or <code>--camera 2</code> — the index depends on which cameras are connected. For IP cameras use <code>--network 192.168.x.x</code> with the camera's local IP address.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">🤦</span> Gestures keep triggering by accident <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>Raise the cooldown values in <code>gesture.py</code>. For nod and shake, also raise <code>NOD_MIN_AMP</code> / <code>SHAKE_MIN_AMP</code> — this requires a larger, more deliberate head movement before it counts.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">📡</span> Arduino not responding <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>Make sure no other program (e.g. the Arduino IDE Serial Monitor) is using the port at the same time — only one program can hold a serial port. Also confirm the baud rate is <code>115200</code> in both the sketch and the Python script.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">🍓</span> Can I use a Raspberry Pi instead? <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>Yes — any Linux machine with Python 3.8+ works. The Jetson is preferred because MediaPipe runs faster with GPU acceleration (25–35 FPS). A Raspberry Pi 4 will get around 10–15 FPS, which is still functional for smooth servo tracking.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">🛠</span> How do I add custom reactions to gestures? <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>In <code>servo_serial.ino</code>, find the <code>handleGesture(char code)</code> function. Each gesture sends a single letter: <code>N</code> nod, <code>S</code> shake, <code>A</code> approach, <code>R</code> retreat, <code>M</code> mouth open, <code>C</code> mouth close. Add LEDs, a buzzer, NeoPixels, extra servos — anything — inside that function based on the code received.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary><span class="summ-icon">⚡</span> What FPS should I expect? <span class="summ-arrow">▶</span></summary>
+      <div class="faq-body">
+        <p>Jetson Orin Nano: typically 25–35 FPS with the face mesh model. Raspberry Pi 4: around 10–15 FPS. The servo update rate is capped at 10 Hz regardless of camera FPS — so even at 15 FPS the servos still move smoothly.</p>
+      </div>
+    </details>
+
+  </div>
+</div>
+
+</div><!-- .content -->
+</main>
+</div>

@@ -1,0 +1,64 @@
+# Kai — third-party Python dependencies
+#
+# ⚠️  DO NOT RUN `pip3 install -r requirements.txt` ON THE JETSON.
+#
+#     The robot's environment is already built and contains packages that CANNOT be restored
+#     from PyPI — above all a hand-built CUDA-enabled torch (pulled in under faster-whisper).
+#     Reinstalling from PyPI would replace it with a CPU-only wheel and silently halve the
+#     voice pipeline's speed, or break it outright. On a LIVE robot this file is documentation,
+#     not an install script. It is for rebuilding a dead SD card, and even then read the
+#     "Rebuilding from scratch" notes at the bottom first.
+#
+# Unpinned on purpose: these are the packages the code imports, which is the fact that was
+# missing. The exact versions the robot is running are captured separately and are the thing to
+# restore from — regenerate with:
+#
+#     ./scripts/freeze_requirements.sh      # writes requirements.lock.txt (pip freeze + notes)
+#
+# Verified against every `import` in the tree (excluding tests) on 2026-08-07.
+
+# ── Vision ────────────────────────────────────────────────────────────────────
+mediapipe            # face_track.py — FaceMesh
+opencv-python        # face_track.py, vision/{camera,face_params,laptop_camera}.py
+numpy                # everywhere
+
+# ── Servo link ────────────────────────────────────────────────────────────────
+pyserial             # servo/servo.py, servo/servo_serial.py  (imported as `serial`)
+
+# ── Voice: wake word, VAD, capture ────────────────────────────────────────────
+sounddevice          # ai/session.py, ai/voice_assistant.py, scripts/wake_test.py
+openwakeword         # ai/audio.py — trained-model wake tier
+pvporcupine          # ai/audio.py — Porcupine wake tier; needs the CPU-table workaround, see
+                     #   config/wake.py, and a key at ~/.config/kai/porcupine.key
+webrtcvad            # ai/audio.py — no aarch64 wheel on PyPI; on the Jetson this is actually
+                     #   `webrtcvad-wheels` (prebuilt). Same import name either way.
+
+# ── Voice: STT / TTS / LLM ────────────────────────────────────────────────────
+faster-whisper       # ai/voice_assistant.py, scripts/wake_test.py — PULLS IN torch, see warning
+scipy                # ai/voice_assistant.py — resampling
+requests             # ai/voice_assistant.py — Ollama HTTP API
+piper-tts            # invoked as `python3 -m piper`, never imported
+
+# ── Documents / RAG ───────────────────────────────────────────────────────────
+fastembed            # ai/rag.py — CPU-only via onnxruntime, no torch dependency (deliberate)
+pypdf                # ai/index_documents.py — only needed to index .pdf sources
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+flask                # face_track.py — web/ dashboard on WEB_PORT
+
+# ── NOT installable from PyPI ─────────────────────────────────────────────────
+# PyGObject / GStreamer (`import gi` in vision/camera.py) comes from the system packages, not
+# pip. It is present in the JetPack image; if it ever isn't:
+#     sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-{base,good,bad}
+#
+# torch is intentionally absent from this file. faster-whisper depends on it, and on the Jetson
+# it must remain the hand-built CUDA wheel. If you install faster-whisper on a fresh Jetson,
+# install the NVIDIA-provided torch FIRST and then `pip3 install --no-deps faster-whisper`.
+
+# ── Rebuilding from scratch (things pip does not cover) ───────────────────────
+# 1. ch341 kernel module for the Arduino's CH340 USB chip — NOT in the tegra kernel.
+#    Prebuilt at servo-test/ch341_build/ch341.ko; servo/servo.py loads it on demand.
+# 2. I2S / PulseAudio routing for the mic and speaker — see scripts/autostart.sh.
+# 3. Ollama with gemma2:2b pulled, `keep_alive=-1`. See the memory budget in README.md before
+#    changing the model or OLLAMA_NUM_CTX.
+# 4. `loginctl enable-linger devconph` so the @reboot cron job's session survives logout.
