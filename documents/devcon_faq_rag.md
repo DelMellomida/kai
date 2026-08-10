@@ -49,6 +49,14 @@ synonyms: [website, contact, links, social media, find you]
 A: DEVCON is at devcon.ph, with chapters listed at devcon.ph/chapters and its community platform at devcon.plus.
 
 ---
+id: chapters-count
+section: Chapters
+synonyms: [how many chapters, number of chapters, how many active, chapter count, how many branches, ilan ang chapters]
+---
+**Q: How many chapters does DEVCON have?**
+A: DEVCON has 9 active chapters — Metro Manila, Laguna, Legazpi, Pampanga, Cebu, Iloilo, Davao, Bukidnon, and Iligan — out of 12 in total. Bacolod, Bohol, and Cagayan de Oro (CDO) are currently inactive but retain volunteer-led communities.
+
+---
 id: chapters-locations
 section: Chapters
 synonyms: [where are chapters, cities, branches, active inactive]
@@ -316,10 +324,10 @@ A: DEVCON's 2026 goal is to empower 10,000 youth through DEVCON Kids, on the vie
 ---
 id: ambition-community-size
 section: DEVCON's Ambition
-synonyms: [how big community, 19000 geeks, 13 chapters, 120 events, growth target]
+synonyms: [how big community, 19000 geeks, 9 chapters, 120 events, growth target]
 ---
 **Q: How big does DEVCON want its AI-ready community to get?**
-A: DEVCON is already at 13 active locations, roughly 19,000 geeks, and 120+ free events a year, within a wider 60,000+ nationwide network. Its ambition emphasizes deeper reach into places a single Manila event could never touch, not just bigger numbers.
+A: DEVCON is already at 9 active chapters, roughly 19,000 geeks, and 120+ free events a year, within a wider 60,000+ nationwide network. Its ambition emphasizes deeper reach into places a single Manila event could never touch, not just bigger numbers.
 
 ---
 id: ambition-partners
