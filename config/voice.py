@@ -325,10 +325,18 @@ IDENTITY_CAPTURE = True
 # Injected into the SYSTEM prompt, not the user turn — the opposite placement to
 # RAG_CONTEXT_PLACEMENT above, and for the opposite reason. The retrieved context changes every
 # turn, so parking it at the front of the prompt invalidates Ollama's cached prefix every turn. This
-# string does NOT change once learned: it costs one prefix invalidation at the moment the name is
-# captured, and nothing afterwards. Confirm that with OLLAMA_LOG_TIMINGS — prompt_eval_* should
-# spike for exactly one turn. If it spikes every turn, the string is being rebuilt and the
-# placement is wrong.
+# string does NOT change once learned, so in principle it costs one prefix invalidation at the
+# moment the name is captured and nothing afterwards.
+#
+# MEASURED 2026-08-10, and the "one invalidation" half is NOT confirmed — it is currently
+# unmeasurable on this robot. Every `[llm] turn:` line in /tmp/face-servo.log is preceded by
+# `MODEL RELOADED: ~200-360ms — placement was re-decided`, on every turn, so there is no surviving
+# KV prefix between turns for anything to invalidate. What WAS measured is that the injection costs
+# nothing detectable: turns with a name pinned evaluated their prompt in 258-304 ms
+# (2654-3394 tok/s), inside the spread of turns without one (215-465 ms).
+# Re-measure if the per-turn reload is ever fixed — that is the point at which the prefix reasoning
+# starts to mean something. If prompt_eval_* then spikes every turn rather than once, the string is
+# being rebuilt and this placement is wrong.
 #
 # The "not in every reply" clause is load-bearing. Without it the model opens more or less every
 # sentence with the name, which reads worse than never using it at all.
