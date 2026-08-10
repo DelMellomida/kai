@@ -314,6 +314,64 @@ RAG_CONTEXT_PLACEMENT = "user"
 # Ollama's truncation would. Raise it only alongside OLLAMA_NUM_CTX — the two are one budget.
 MAX_HISTORY_TURNS = 6
 
+# ── Who Kai is talking to ───────────────────────────────────────────────────────
+# A name offered in speech ("I'm Jhondel", "ako si Jhondel") is pinned for the life of the session
+# and injected into the system prompt, so it outlives the MAX_HISTORY_TURNS window directly above,
+# which would otherwise evict it six exchanges later. Extraction is ai/identity.py — pure stdlib, no
+# second LLM call. See docs/tickets/S12. False disables the whole path and restores the
+# persona+history prompt byte for byte.
+IDENTITY_CAPTURE = True
+
+# Injected into the SYSTEM prompt, not the user turn — the opposite placement to
+# RAG_CONTEXT_PLACEMENT above, and for the opposite reason. The retrieved context changes every
+# turn, so parking it at the front of the prompt invalidates Ollama's cached prefix every turn. This
+# string does NOT change once learned: it costs one prefix invalidation at the moment the name is
+# captured, and nothing afterwards. Confirm that with OLLAMA_LOG_TIMINGS — prompt_eval_* should
+# spike for exactly one turn. If it spikes every turn, the string is being rebuilt and the
+# placement is wrong.
+#
+# The "not in every reply" clause is load-bearing. Without it the model opens more or less every
+# sentence with the name, which reads worse than never using it at all.
+IDENTITY_PROMPT = ("The person you are talking to is called {name}. Use their name naturally in "
+                   "conversation, not in every reply.")
+
+# Length bounds on the captured word. The floor rejects initialisms and stray particles that survive
+# the stop-list ("I'm K", "ako si a"); the ceiling rejects a run-on where an anchor matched inside an
+# unrelated clause.
+IDENTITY_MIN_LEN = 2
+IDENTITY_MAX_LEN = 20
+
+# Require a capitalised first letter for the WEAK anchors ("I'm X", "ako'y X") only. Whisper
+# capitalises proper nouns fairly reliably, and that is what separates "I'm Jhondel" from "I'm fine"
+# once the stop-list has taken the common cases. Set False only if real names are being missed
+# BECAUSE of casing — measure first, because the weak tier is only safe with the corroboration on.
+# The strong anchors ("my name is X", "ako si X") never consult this.
+IDENTITY_WEAK_ANCHORS_NEED_CAPITAL = True
+
+# Words that are never a name, checked casefolded. This is the list that will need editing after a
+# false accept is heard at an event — which is why it is here and not in ai/identity.py. Everything
+# in it is reachable through a weak anchor: "I'm fine", "I'm from Cebu", "I'm a developer",
+# "I'm just looking", "ako'y masaya". Tagalog function words are included for the same reason the
+# English ones are.
+IDENTITY_STOPWORDS = frozenset({
+    # English answers to "how are you" and friends
+    "fine", "good", "great", "ok", "okay", "well", "alright", "sorry", "sure", "here", "back",
+    "done", "ready", "busy", "tired", "hungry", "happy", "sad", "curious", "confused", "lost",
+    "new", "old", "young", "late", "early", "right", "wrong", "serious", "kidding", "joking",
+    # articles, determiners, prepositions, and the rest of the connective tissue
+    "a", "an", "the", "from", "in", "at", "on", "with", "for", "to", "of", "about", "into", "over",
+    "and", "but", "or", "so", "not", "no", "yes", "very", "really", "just", "still", "also",
+    "going", "trying", "looking", "asking", "talking", "wondering", "thinking", "saying", "doing",
+    "there", "this", "that", "these", "those", "it", "its", "my", "your", "our", "their",
+    # roles people offer instead of a name
+    "student", "teacher", "developer", "engineer", "designer", "programmer", "founder", "intern",
+    "volunteer", "member", "speaker", "organizer", "organiser", "guest", "visitor", "user",
+    # Tagalog function words and common answers reachable through "ako'y" / "ako si"
+    "po", "ang", "ng", "sa", "na", "ay", "din", "rin", "lang", "naman", "kasi", "pala", "ba",
+    "hindi", "oo", "opo", "sige", "salamat", "maayos", "masaya", "malungkot", "pagod", "gutom",
+    "taga", "galing", "dito", "diyan", "doon", "ito", "iyan", "iyon", "siya", "sila", "kami",
+})
+
 # ── Jaw "speaking" pantomime ────────────────────────────────────────────────────
 # Kai has no audio (yet), so when a reply is produced we drive the jaw servo for a window
 # sized to how long that text would take to say aloud. The mouth opens once per sentence:

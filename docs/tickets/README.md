@@ -8,7 +8,9 @@ Tickets are grouped by **Tier**, which ranks them by severity × inverse effort 
 low-effort work first. Within a tier they appear in the review's own priority order. Each ticket
 carries the review's Severity / Effort / Confidence / Lens verbatim.
 
-**Nothing here has been implemented.** These are specifications, not change records.
+**One of these has been implemented** — S12, on 2026-08-10. Everything else is still a
+specification, not a change record. A landed ticket keeps its file and gains a `## Resolution`
+section rather than being deleted, so the spec and what actually shipped stay side by side.
 
 **ID prefixes:** `R` = robotics engineering lens, `S` = software engineering lens. `S11` was a
 grouped "minor correctness and hygiene" finding and is split into `S11a`–`S11d` for tracking; the
@@ -28,7 +30,7 @@ Do these first. All nine are small, self-contained, and individually revertible.
 
 | ID | Ticket | Summary |
 |---|---|---|
-| **S12** | [Kai never learns who it is talking to](S12-no-identity-within-a-session.md) | A name offered in speech survives only `MAX_HISTORY_TURNS = 6` and is then evicted; nothing pins it. The only personalisation available without the camera. |
+| **S12** ✅ | [Kai never learns who it is talking to](S12-no-identity-within-a-session.md) | **Landed 2026-08-10.** A name offered in speech survived only `MAX_HISTORY_TURNS = 6` and was then evicted; nothing pinned it. Two acceptance criteria still need a live run — see its Resolution. |
 | **R7** | [TTS subprocesses outlive the process](R7-tts-subprocesses-outlive-process.md) | `run()`'s `finally` never calls `tts.stop()`, so `paplay`/Piper survive shutdown and the restarted process talks over them. |
 | **S8** | [`app/camera_supervisor.py` has no tests](S8-camera-supervisor-untested.md) | The only substantial untested module — and the one deciding whether the robot believes it has a camera. |
 | **R4** | [Firmware clamps to 0–180 while the host clamps to 10–170](R4-firmware-servo-limits-mismatch.md) | A corrupted serial line drives the pan servo into its mechanical stop; `toInt()` turns garbage into 0°. |

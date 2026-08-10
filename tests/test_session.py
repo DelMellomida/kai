@@ -127,6 +127,9 @@ class FakeVoice:
         self.spoken_wavs = []
         self.history_resets = 0
         self.turn_status_clears = 0
+        # Who the assistant believes it is talking to (ai/identity.py). Published as sess_person and
+        # forgotten by reset_history() with everything else the next person must not inherit.
+        self.person_name = None
         self.status = "idle"        # the assistant's own per-turn status
         self.attached = None
         self.turn_result = {"status": "ok"}
@@ -152,6 +155,7 @@ class FakeVoice:
     def reset_history(self):
         self.history_resets += 1
         self._epoch += 1
+        self.person_name = None
 
     def clear_turn_status(self):
         self.turn_status_clears += 1
@@ -2399,6 +2403,32 @@ class TestLiveSettings(SessionCase):
         s = self.make()
         s.set_rms_floor(900.0)
         json.dumps(s.get_status())
+
+    def test_person_name_is_published(self):
+        """sess_person is read from the assistant rather than mirrored on the session, so the
+        dashboard cannot show a name the prompt no longer carries. See docs/tickets/S12."""
+        s = self.make()
+        self.assertEqual(s.get_status()["sess_person"], "")
+        self.voice.person_name = "Jhondel"
+        self.assertEqual(s.get_status()["sess_person"], "Jhondel")
+
+    def test_person_name_survives_a_wake_mid_conversation(self):
+        """Saying "hey Kai" again while it is already listening continues the conversation and keeps
+        its history (see _begin_session's note). The name has to follow the same rule, or repeating
+        the wake word mid-chat quietly turns you back into a stranger."""
+        s = self.make()
+        self.wake(s, T0)
+        self.voice.person_name = "Jhondel"
+        self.wake(s, T0 + 2)
+        self.assertEqual(s.get_status(T0 + 3)["sess_person"], "Jhondel")
+
+    def test_person_name_is_gone_after_the_session_ends(self):
+        s = self.make()
+        self.wake(s, T0)
+        self.voice.person_name = "Jhondel"
+        s.end_session("manual")
+        self.assertEqual(s.get_status()["sess_person"], "",
+                         "the next person must not inherit the last one's name")
 
 
 class TestSessionStartRetrySchedule(unittest.TestCase):

@@ -102,3 +102,34 @@ already asks follow-ups unprompted.
 
 **Rollback.** A `config/voice.py` flag (`IDENTITY_CAPTURE = True`) reverting to today's persona +
 history prompt, in the style of `RAG_CONTEXT_PLACEMENT`'s documented REVERT.
+
+## Resolution
+
+**Landed 2026-08-10**, branch `feat/session-identity-capture`. Implemented as specified — four steps,
+no deviations. Suite: 1232 passed, 2680 subtests (was 1185, 2675).
+
+- `ai/identity.py` — `extract_name()`, pure stdlib, two anchor tiers.
+- `config/voice.py` — `IDENTITY_CAPTURE`, `IDENTITY_PROMPT`, `IDENTITY_MIN_LEN` / `IDENTITY_MAX_LEN`,
+  `IDENTITY_WEAK_ANCHORS_NEED_CAPITAL`, `IDENTITY_STOPWORDS`, sited directly under
+  `MAX_HISTORY_TURNS` since that is the cap they exist to outlive.
+- `ai/voice_assistant.py` — `_person_name`, `person_name`, `note_identity()`, cleared in
+  `reset_history()`, injected in `_call_ollama()`. `_epoch_ok_locked()` added because `self._lock` is
+  a plain `Lock`, so the existing `_epoch_ok()` cannot be called from inside a critical section.
+- `ai/session.py` — `sess_person` on `/params`, read through to the assistant rather than mirrored.
+- `ai/persona.txt` — the conversational-callback line (S14's step 4, tried here because it is free).
+- Tests: `tests/test_identity.py` (34), `TestIdentityCapture` in `tests/test_voice_assistant.py`
+  (10), three in `tests/test_session.py`. `FakeVoice` gained `person_name` and clears it in
+  `reset_history()` — modelling the new interface rather than letting `getattr` hide it.
+
+**Met:** capture independent of `MAX_HISTORY_TURNS`; conservative extraction with the non-matches
+documented and tested; cleared on `_end_session`; survives a mid-session wake; `/params` exposure;
+full test coverage including the epoch guard and prompt stability across turns.
+
+**Not met — both need the robot, neither blocks the merge:**
+
+- *Used at the model's discretion, judged by ear over ten turns.* `IDENTITY_PROMPT`'s "not in every
+  reply" clause is reasoned, not measured. If the model over-uses the name, that string is the knob.
+- *KV-prefix cost confirmed from `prompt_eval_*`.* `test_system_prompt_is_stable_across_turns_once_learned`
+  asserts the code-side property the claim rests on — the system message is byte-identical across
+  turns once learned — but the one-turn spike itself has not been observed on hardware. If it turns
+  out to recur every turn, something is rebuilding the string and the placement is wrong.
