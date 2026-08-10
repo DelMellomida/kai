@@ -537,6 +537,14 @@ class VoiceAssistant:
         def _run() -> None:
             outcome = "error"
             try:
+                # The one-breath hands-free turn arrives here, not in _process() — the whisper wake
+                # tier already holds the transcript, so "Hey Kai, my name is Jhondel" said without a
+                # pause never touches the mic-turn path. Capturing in only one of the two was a real
+                # gap: the same sentence pinned a name or did not, purely on whether the speaker drew
+                # breath. use_llm=False is the verbatim /voice/say route, which is Kai reading a line
+                # out, not somebody introducing themselves.
+                if use_llm:
+                    self.note_identity(text, epoch=epoch)
                 reply = self._call_ollama(text) if use_llm else text
                 if not self._epoch_ok(epoch):
                     # A cold model load takes ~50 s; the session can easily have ended meanwhile.

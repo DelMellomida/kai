@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -309,6 +310,29 @@ class TestIdentityCapture(unittest.TestCase):
             va = make_assistant()
             va.note_identity("My name is Jhondel")
             self.assertIsNone(va.person_name)
+
+    def test_one_breath_turn_also_pins_the_name(self):
+        """say(use_llm=True) is the one-breath hands-free path — the whisper wake tier already holds
+        the transcript, so "Hey Kai, my name is Jhondel" said without a pause runs here and never
+        touches _process(). Found live: the mic path captured and this one did not, so the same
+        sentence pinned a name or not depending purely on whether the speaker drew breath."""
+        va = make_assistant()
+        done = threading.Event()
+        with patch.object(va, "_call_ollama", return_value="Hi there"), \
+             patch.object(va, "_speak"):
+            va.say("my name is Jhondel", use_llm=True, on_done=lambda *_: done.set())
+            done.wait(5)
+        self.assertEqual(va.person_name, "Jhondel")
+
+    def test_verbatim_say_does_not_pin_a_name(self):
+        """use_llm=False is the dashboard reading a line out loud, not somebody introducing
+        themselves. Kai saying "my name is Kai" must not make Kai believe it is talking to Kai."""
+        va = make_assistant()
+        done = threading.Event()
+        with patch.object(va, "_speak"):
+            va.say("My name is Jhondel", use_llm=False, on_done=lambda *_: done.set())
+            done.wait(5)
+        self.assertIsNone(va.person_name)
 
     def test_name_goes_in_the_system_prompt_not_the_user_turn(self):
         """The OPPOSITE placement to the RAG context, and for the opposite reason: this string is

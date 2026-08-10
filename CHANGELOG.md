@@ -22,8 +22,13 @@ Conventions:
 
 ## 2026-08-10 — Kai forgot your name six questions after you gave it
 
-Suite green: 1232 passed, 2680 subtests (was 1185, 2675). Implements
-[S12](docs/tickets/S12-no-identity-within-a-session.md).
+Suite green: 1234 passed, 2680 subtests (was 1185, 2675). Implements
+[S12](docs/tickets/S12-no-identity-within-a-session.md); deployed and exercised on the robot.
+
+Two things the live run turned up that the tests could not, both recorded in the ticket: Whisper
+mishears names (`[identity] talking to 'Jandal'` was a correct extraction of a misheard "Jhondel",
+which nothing in this design defends against), and the model uses the name more often than
+`IDENTITY_PROMPT` asks it to.
 
 - **A name offered in speech was an ordinary history turn, so the rolling cap evicted it.** The
   prompt is `system + capped history + user turn` (`ai/llm.build_chat_messages`) with no slot for a
@@ -46,13 +51,23 @@ Suite green: 1232 passed, 2680 subtests (was 1185, 2675). Implements
   — what may the next person inherit? Nothing. It survives a "hey Kai" landing in `LISTEN_WAIT`,
   matching the history rule there, and `note_identity()` is epoch-guarded so a session that ended
   while STT was still running cannot hand its name to whoever is next.
-- **The prompt placement is the opposite call to the RAG context, deliberately.**
-  `RAG_CONTEXT_PLACEMENT = "user"` keeps per-turn-varying text out of the cached prefix. This string
-  does not vary once learned, so the system position costs one KV-prefix invalidation at the turn it
-  is captured and nothing after — asserted in `test_system_prompt_is_stable_across_turns_once_learned`
-  rather than assumed. **The robot-side half is not done:** confirming from `prompt_eval_*` that the
-  spike lasts one turn and not every turn still needs a live run, as does judging by ear whether the
-  model uses the name at the right rate.
+- **Both conversational paths capture, which took a live run to find.** `note_identity()` was hooked
+  only into `_process()`, the mic-turn path. The **one-breath** turn — "Hey Kai, my name is Jhondel"
+  said without pausing — runs through `say()` instead, because the whisper wake tier already holds
+  the transcript. On the robot, `sess_person` stayed `''` while Kai cheerfully replied "Hi Jhondel!":
+  the model read the name out of the user turn, which looks identical from outside and pins nothing.
+  So the same sentence captured or did not purely on whether the speaker drew breath. Now hooked in
+  both, gated on `use_llm` so the verbatim `/voice/say` route cannot make Kai think it is talking to
+  itself.
+- **The prompt placement is the opposite call to the RAG context, deliberately — and the reasoning
+  behind it is currently unmeasurable.** `RAG_CONTEXT_PLACEMENT = "user"` keeps per-turn-varying text
+  out of the cached prefix; this string does not vary once learned, so the system position should
+  cost one invalidation and nothing after. On the robot it cannot be confirmed: every `[llm] turn:`
+  line is preceded by `MODEL RELOADED: ~200-360ms — placement was re-decided`, so **no KV prefix
+  survives between turns at all** and there is nothing to invalidate. What was measured is that the
+  injection costs nothing detectable — 258-304 ms prompt eval with a name pinned, inside the
+  215-465 ms spread without one. Noted at the constant in `config/voice.py`, to be re-measured if the
+  per-turn reload is ever fixed. That reload also makes `RAG_CONTEXT_PLACEMENT`'s optimisation inert.
 - **`ai/persona.txt` now says to use the conversation it already has.** One line, no code: refer back
   to what was said earlier, notice a repeated question, pick up a dropped thread — and never claim to
   remember an earlier *visit*, which would be a lie the history cannot support. `load_persona()`

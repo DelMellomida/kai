@@ -125,11 +125,51 @@ no deviations. Suite: 1232 passed, 2680 subtests (was 1185, 2675).
 documented and tested; cleared on `_end_session`; survives a mid-session wake; `/params` exposure;
 full test coverage including the epoch guard and prompt stability across turns.
 
-**Not met — both need the robot, neither blocks the merge:**
+### Verified on the robot, 2026-08-10
 
-- *Used at the model's discretion, judged by ear over ten turns.* `IDENTITY_PROMPT`'s "not in every
-  reply" clause is reasoned, not measured. If the model over-uses the name, that string is the knob.
-- *KV-prefix cost confirmed from `prompt_eval_*`.* `test_system_prompt_is_stable_across_turns_once_learned`
-  asserts the code-side property the claim rests on — the system message is byte-identical across
-  turns once learned — but the one-turn spike itself has not been observed on hardware. If it turns
-  out to recur every turn, something is rebuilding the string and the placement is wrong.
+Deployed and exercised live. What the live run added over the tests:
+
+- **A gap the tests could not see, found and fixed.** `note_identity()` was called only from
+  `_process()` — the mic-turn path. The **one-breath** hands-free turn ("Hey Kai, my name is
+  Jhondel" said without pausing) runs through `say()` instead, because the whisper wake tier already
+  holds the transcript. So the same sentence pinned a name or did not, purely on whether the speaker
+  drew breath. Now hooked in both, gated on `use_llm` so the verbatim `/voice/say` route — Kai
+  reading a line out — cannot make Kai believe it is talking to itself. Covered by
+  `test_one_breath_turn_also_pins_the_name` and `test_verbatim_say_does_not_pin_a_name`.
+- **Session scoping confirmed live.** `sess_person` went to `""` on `session end: no_speech`,
+  observed on `/params` rather than only asserted in a fake.
+- **It fired correctly on a real human before anyone asked it to.** A person spoke to Kai
+  mid-deployment and `[identity] talking to 'Jandal'` appeared — a correct anchor match on a name
+  Whisper had misheard. See the new limitation below.
+- **Recall across turns works.** Name pinned on turn 1, still `'Jhondel'` and used by the model on
+  turn 2 of the same session.
+
+**Met:** everything in the acceptance criteria except the two below.
+
+**Not met:**
+
+- *Used at the model's discretion, judged by ear.* **Early evidence says it over-uses the name.** A
+  four-sentence reply opened with "You know what, Jhondel!" and used "Jhondel" again two sentences
+  later. `IDENTITY_PROMPT`'s "not in every reply" clause is not strong enough; it needs a session's
+  worth of listening and probably a firmer wording. This is the knob, and it is a prompt edit.
+- *KV-prefix cost confirmed from `prompt_eval_*`.* **Currently unmeasurable, for a reason worth
+  knowing:** every `[llm] turn:` line is preceded by `MODEL RELOADED: ~200-360ms — placement was
+  re-decided`. Ollama reloads on every turn, so no KV prefix survives between turns and there is
+  nothing for the injection to invalidate. The injection was measured to cost nothing detectable
+  (258-304 ms prompt eval with a name pinned, against 215-465 ms without), which is the practical
+  question; the mechanism claim has to wait. `config/voice.py` records this at the constant.
+
+### Follow-up raised by the live run
+
+- **Whisper mishears names, and the design has no defence against it.** `[identity] talking to
+  'Jandal'` was a *correct* extraction of an *incorrectly transcribed* name — the anchor matched
+  exactly as intended and the stop-list and capitalisation gate are both irrelevant to this failure.
+  Kai will then say the wrong name out loud with confidence, which is the exact outcome the two-tier
+  anchor design was built to avoid, arriving through a channel it does not cover. Worth its own
+  ticket: the plausible mitigations (confirm the name back and let it be corrected, prefer the
+  `small` Whisper model for the utterance that carries a name, keep a gazetteer of common Filipino
+  first names) are all larger than this ticket and none is obviously right.
+- **Ollama reloads the model on every turn.** Not caused by this change and not in its scope, but it
+  costs 200-360 ms per turn and it defeats KV-cache reuse entirely — which makes
+  `RAG_CONTEXT_PLACEMENT`'s whole optimisation inert too. Related to R6's note that Ollama pins its
+  GPU/CPU split from free memory at load time.
