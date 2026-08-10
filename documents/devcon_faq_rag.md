@@ -123,10 +123,10 @@ A: Kai is built on NVIDIA Ampere architecture with Tensor Cores, using the CUDA 
 ---
 id: kai-stack
 section: Kai (robot)
-synonyms: [Kai tech stack, tools behind Kai, NMBLR.AI]
+synonyms: [Kai tech stack, tools behind Kai, NMBLR.AI, what software runs Kai, what model do you use, Arduino, Gemma, Whisper, Piper, Ollama, MediaPipe, open source]
 ---
 **Q: What's the tech stack behind Kai?**
-A: Kai's stack includes Claude Code, Micro:bit, Qwen, Google AI Suite, and NVIDIA. The Jetson Orin Nano was lent by the NMBLR.AI team.
+A: Kai runs on an NVIDIA Jetson Orin Nano lent by the NMBLR.AI team, and its code was written with Claude Code. MediaPipe tracks the face, Whisper turns speech into text, Gemma 2 answers through Ollama, and Piper speaks the reply. An Arduino drives the neck and jaw servos, and a small local search index lets Kai answer from its own documents. All of it runs on the robot itself — nothing goes to the cloud.
 
 ---
 id: internship-what

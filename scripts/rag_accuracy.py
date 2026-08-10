@@ -111,10 +111,15 @@ CASES: list[tuple[str, str]] = [
     ("do you need internet?",                "offline"),
     ("do you use the cloud?",                "no cloud"),
     ("what is edge computing?",              "edge computing"),
-    # Retargeted: Micro:bit is now a fact about KAI's build stack, not about internship tooling,
-    # and "what tools did the interns use?" correctly retrieves the internship-tracks entry
-    # instead. The question moved to match where the fact lives.
-    ("what tools were used to build you?",    "Micro:bit"),
+    # Needle is "Arduino" and not "Claude Code": the kai-stack entry is not the only chunk naming
+    # Claude Code (the Jumpstart internship entry does too), so a substring test on it would pass
+    # while retrieving the wrong entry entirely. "Arduino" appears in exactly one chunk.
+    #
+    # It used to be "Micro:bit", which the entry claimed and the robot dutifully said out loud —
+    # along with Qwen and Google AI Suite, none of which this repo has ever used. The eval scored
+    # that a hit for months because the harness only checks the DOCUMENT reached the model, never
+    # that the document was true. Keep needles pointed at facts the code can be diffed against.
+    ("what tools were used to build you?",    "Arduino"),
     ("who lent you?",                        "NMBLR.AI"),
 ]
 

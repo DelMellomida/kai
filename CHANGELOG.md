@@ -20,6 +20,134 @@ Conventions:
 
 ---
 
+## 2026-08-11 — Kai now speaks in a room, and breathes in Tagalog too
+
+Suite green: 1244 passed, 2685 subtests (was 1237, 2680). All three changes verified on the robot from
+the audio the live `_speak` path produced, and each reverts from `config/voice.py` alone.
+
+- **The output chain was loudness-only; it now has EQ and a room.** `TTS_POST_EFFECTS` was
+  `compand … gain -n -1` and nothing else, so every reply arrived bone-dry, dead-centre and flat — a
+  synthetic cue independent of which model produced it. `TTS_POST_HIGHPASS = ["highpass", "90"]` runs
+  **before** the compand (energy a PAM8403 into a small driver cannot reproduce otherwise eats the
+  headroom the compressor then reacts to), and `TTS_POST_ROOM = ["reverb", "18", "50", "28", "100",
+  "0", "-4"]` runs **after** it, followed by a second `gain -n -1` because reverb adds energy past the
+  chain's own normalise. The order lives in `ai/tts._sox_chain()` and is pinned by tests, since it is
+  not visible from the config lists. Emptying both constants reproduces the old command line exactly —
+  asserted, not assumed. Confirmed live: the sub-90 Hz share of a real reply fell from **0.55% raw to
+  0.18%** through the chain.
+- **The reverb costs nothing the other contracts care about**, which is why it was safe to ship.
+  Duration is **unchanged** — 7.84 s for the test line and 1.27 s for a filler stall under every chain
+  tried — because sox decays the tail into the silence Piper already pads onto every WAV instead of
+  appending to the file. So `FILLER_MAX_STALL_S` (1.8) and `FILLER_MAX_LINE_S` need no re-deriving and
+  the jaw window is untouched. Trailing silence actually **shrinks** (0.13 → 0.10 s), the safe
+  direction. Whisper transcribed all four candidate chains identically, so the room costs nothing a
+  decoder can detect. **What none of that measures is the venue** — reverb trades against clarity in
+  ambient noise, and `TTS_POST_ROOM = []` is the revert if Kai gets harder to understand at an event.
+- **Tagalog replies were going out with no breaths at all.** `DELIVERY_BREATH_CONJUNCTIONS` was
+  English-only, so `ai/delivery.shape()` matched nothing in the language the room actually speaks.
+  Added on a Tagalog speaker's approval: `pero`, `kasi`, `kaya`, `tapos`, `kung`, `habang`, `para`.
+  **The semicolon buys more in Tagalog than in English** — measured on one sentence through this
+  voice: plain **0.07 s**, comma **0.15 s**, semicolon **0.36 s**, against the 0.156 s recorded for
+  English. Verified in the live path by toggling `delivery_shaping` around the same line: **off gives
+  0.05/0.05/0.06/0.05 s** (word boundaries only), **on gives a 0.27 s breath**. Whisper confirms the
+  punctuation is never voiced.
+  - **`at` and `o` are deliberately excluded** — both too common and too short in Tagalog, where a
+    breath before every "at" is a stutter. `kasi` and `kaya` are likeliest to misfire, since they sit
+    mid-clause more often than "because"/"so" do; drop those two first if it sounds choppy.
+  - **No Tagalog openers, and the asymmetry is the point.** Breaths insert punctuation and add no
+    words, so they cannot be mispronounced. An opener hands the `en_US` voice a new Tagalog word to
+    say — and a native speaker judged this voice's Tagalog bad, with no offline alternative (Piper
+    ships no `tl`/`fil`/`ceb` across 173 voices; swapping only the espeak phonemizer to `id`/`ms`/`es`
+    keeps Kai's pitch at 200–206 Hz and was judged no better). Considered and dropped.
+- **Sentences may now differ in loudness.** `TTS_PIPER_NORMALIZE = False` passes `--no-normalize`, so
+  Piper stops normalising **every sentence** to full scale (per-sentence peaks measured 0.00 dB
+  apart — no two sentences Kai ever spoke differed in peak level) and sox's single `gain -n -1`
+  normalises the whole reply instead. Honest about the size: 3.42 dB of raw variation arrives as
+  **0.79 dB**, because the compand's upward compression eats the rest. Recovering it means softening
+  `compand`, which is what keeps Kai audible in a loud room — not worth the trade. Coupled in code so
+  the flag is only passed when `TTS_POST_PROCESS` is on; without sox the raw output is ~10 dB quieter
+  and nothing would put the level back.
+
+## 2026-08-11 — Kai was telling people it runs on Micro:bit, Qwen and Google AI Suite
+
+Suite green: 1237 passed, 2680 subtests (unchanged). Retrieval was working correctly the whole
+time — the document it retrieved was wrong.
+
+- **The `kai-stack` entry in `documents/devcon_faq_rag.md` listed three things this repo has never
+  used.** Asked what powers it, Kai read back "Claude Code, Micro:bit, Qwen, Google AI Suite, and
+  NVIDIA" — verbatim from the chunk, which wins that question comfortably on `SECTION_BOOST`'s
+  +0.08 for `"Kai (robot)"`. The LLM is `gemma2:2b` (`config/voice.py`), the microcontroller is an
+  Arduino on `/dev/ttyUSB0` (`config/servo.py`, `servo/servo.py`), and there is no cloud AI call
+  anywhere in the tree — STT is faster-whisper, embeddings are `BAAI/bge-small-en-v1.5` through
+  fastembed's local ONNX runtime, TTS is Piper. The entry also contradicted its own neighbour
+  `kai-hardware`, two lines up, which correctly says "no cloud round trips". It now names the real
+  stack, and stays speakable: "Gemma 2", not `gemma2:2b`.
+- **The accuracy harness had been scoring the false fact as a pass.** `scripts/rag_accuracy.py`
+  asked "what tools were used to build you?" and looked for the needle `"Micro:bit"` — which the
+  document did contain, so the case went green every run. The harness only checks that a document
+  reached the model, never that the document was true; that is a real limit of it, not a bug, and
+  the mitigation is to point needles at facts a reader can diff against the code. Needle is now
+  `"Arduino"`, and deliberately not `"Claude Code"` — the Jumpstart internship entry names Claude
+  Code too, so a substring test on it would pass while retrieving the wrong entry.
+- **Wording was measured, not just written.** The first draft opened "Kai was built with Claude
+  Code" and cost a case: "who made you?" started retrieving the stack entry instead of `kai-origin`
+  ("Cohort 4"), 29/31 -> 28/31. Rephrased to "its code was written with Claude Code" and the origin
+  entry keeps the question. Final: **29/31 answer-in-context, unchanged from before the edit**, and
+  `scripts/rag_eval` is identical — on-topic 0.552–0.770 8/8, off-topic 0.520–0.637 with 4/8
+  rejected at `SIMILARITY_THRESHOLD` 0.55, overlap 0.085. The numbers recorded against that
+  constant in `config/rag.py` still hold.
+
+`documents/.rag_index.json` was rebuilt (`python3 -m ai.index_documents`, 51 chunks) — the edit does
+nothing until it is, and `_warn_if_stale()` is what says so at startup if someone forgets. One claim
+in the neighbouring `kai-hardware` entry is still unverified and was left alone: it says Kai uses
+"TensorRT for near-zero-latency neural network execution", but TensorRT appears only in
+`requirements.lock.txt` (it ships with JetPack) and in `docs/plan/wip/tensorrt-plan.md`, which is a
+plan, not a build. Nothing in the tree runs it.
+
+## 2026-08-10 — Kai never took a breath between sentences
+
+Suite green: 1237 passed, 2680 subtests (was 1234). Verified on the robot, not just in tests — the
+numbers below are from the WAV the live `_speak` path produced.
+
+- **Piper's `--sentence-silence` was never being passed, and its default is 0.** `ai/tts._run_piper`
+  built its command line from `-m`, `--length-scale` and `-f`, so a four-sentence reply came out as
+  one continuous run. Measured longest interior silences at the three sentence boundaries of the same
+  reply, raw pre-sox: **0.20, 0.17, 0.14 s** — not pauses at all, just the decay of a phrase ending,
+  against 0.4–0.7 s for conversational speech. `TTS_SENTENCE_SILENCE_S = 0.35` now ships and the live
+  path measures **0.59, 0.56, 0.54 s**. Note what was already there: `ai/delivery.py`'s
+  `DELIVERY_PAUSE` was measured and tuned to buy a 0.156 s breath *inside* long sentences, while the
+  boundary a person leans on hardest got nothing.
+- **The two VITS noise parameters were also never passed — and they do not do what was expected, so
+  they ship at the voice's own values.** `noise_scale` and `noise_w` control how much a line varies;
+  `voices/en_US-hfc_female-medium.onnx.json` carries the stock 0.667 / 0.8. Four repeats per config of
+  one long line, because VITS draws fresh noise every run and one sample cannot tell an effect from a
+  draw: today **9.58 st** mean p10–p90 intonation range, at `noise_scale 0.8 / noise_w 1.1` **9.43
+  st**, and within-config spread is **±0.4–0.9 st**. The knobs move intonation by less than the noise
+  floor, and the "livelier" setting measures marginally flatter. An 8-cell sweep (`noise_w` 0.8→1.2 ×
+  `noise_scale` 0.667/0.8) stayed inside 8.8–10.0 st. They are plumbed and dashboard-settable so an
+  ear can overrule this, defaulted to no change. **Add this to the killed-hypothesis table in
+  [docs/plan/completed/expressive-voice-plan.md](docs/plan/completed/expressive-voice-plan.md): the
+  VITS noise parameters do not increase intonation range.**
+- **Free, and checked rather than assumed.** Synthesis time is unchanged at 3.4–3.7 s per long line
+  across every cell measured, so first-audio latency does not move — only the audio itself is ~1 s
+  longer for four sentences, which lengthens the deaf-while-speaking window slightly.
+- **The cached bank is unaffected, which is why this was safe to ship.** `--sentence-silence` adds
+  **no** trailing padding (tail silence stays 0.13–0.18 s at every value), so a one-sentence filler
+  stall keeps its length (1.11 → 1.14 s, inside run-to-run noise) and `FILLER_MAX_STALL_S` (1.8)
+  needed no re-deriving. Confirmed after the restart: `filler bank: 52/52 lines cached [tl 12op/12st,
+  ceb 4op/10st, en 4op/10st]` — identical pools to before. No trailing silence also means this cannot
+  re-create the stranded-jaw bug fixed earlier the same day.
+- **Three new sliders on the dashboard** (Pause between sentences, Tone variation, Rhythm variation),
+  each re-warming the canned lines on change via `reprewarm_canned()` — the filler bank, the wake ack
+  and the greeting are pre-synthesised, so without that they would keep the old prosody while live
+  replies used the new one, and disagree audibly mid-conversation.
+
+The flag spellings are pinned by a test on purpose. Piper rejects an unknown flag by exiting
+non-zero, `_run_piper` reports that as a failed synthesis, and the result is **every reply silent**
+with nothing flag-shaped in the log — so `--sentence-silence`, `--noise-scale` and `--noise-w-scale`
+were read off `python3 -m piper --help` against the pinned `piper-tts==1.4.2` on this robot rather
+than taken from any documentation. Re-check after a piper upgrade; that test is where it should break.
+
 ## 2026-08-10 — Kai forgot your name six questions after you gave it
 
 Suite green: 1234 passed, 2680 subtests (was 1185, 2675). Implements
