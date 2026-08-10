@@ -14,14 +14,21 @@ carries the review's Severity / Effort / Confidence / Lens verbatim.
 grouped "minor correctness and hygiene" finding and is split into `S11a`–`S11d` for tracking; the
 four share no code and can land in any order.
 
+**Not everything here came from the review.** `S12`–`S14` are feature specifications raised on
+2026-08-10 from a separate question — what would make Kai's *conversation* land, given the camera is
+not part of the answer. They are written to the same format and carry the same contract, but their
+Severity reads as "enhancement, not a defect": nothing about the current behaviour is broken, it is
+absent. Do not read them as review findings.
+
 ---
 
 ## Tier 1 — high impact, small effort
 
-Do these first. All eight are small, self-contained, and individually revertible.
+Do these first. All nine are small, self-contained, and individually revertible.
 
 | ID | Ticket | Summary |
 |---|---|---|
+| **S12** | [Kai never learns who it is talking to](S12-no-identity-within-a-session.md) | A name offered in speech survives only `MAX_HISTORY_TURNS = 6` and is then evicted; nothing pins it. The only personalisation available without the camera. |
 | **R7** | [TTS subprocesses outlive the process](R7-tts-subprocesses-outlive-process.md) | `run()`'s `finally` never calls `tts.stop()`, so `paplay`/Piper survive shutdown and the restarted process talks over them. |
 | **S8** | [`app/camera_supervisor.py` has no tests](S8-camera-supervisor-untested.md) | The only substantial untested module — and the one deciding whether the robot believes it has a camera. |
 | **R4** | [Firmware clamps to 0–180 while the host clamps to 10–170](R4-firmware-servo-limits-mismatch.md) | A corrupted serial line drives the pan servo into its mechanical stop; `toInt()` turns garbage into 0°. |
@@ -42,6 +49,8 @@ Do these first. All eight are small, self-contained, and individually revertible
 | **S4** | [TTS is module-global state with fixed shared output paths](S4-tts-global-state-shared-wav-paths.md) | Two filenames shared by every reply; the mitigation surface across three modules now exceeds the fix. Prerequisite for R5. |
 | **S7** | [Flask dev server, unauthenticated, on 0.0.0.0](S7-unauthenticated-dev-server-dashboard.md) | Anyone on the venue network can silence, blind, restart or puppet the robot; unbounded streaming threads on a dev server. |
 | **R8** | [No liveness watchdog on the inference loop itself](R8-no-main-loop-watchdog.md) | Every other subsystem is watched. A wedged MediaPipe leaves a convincingly-alive, half-working robot with nothing reporting it. |
+| **S13** | [A conversation is forgotten the instant the session ends](S13-no-continuity-across-the-wake-gap.md) | 25 s of thinking discards the sticky RAG topic, so the same follow-up that resolved a moment ago degrades to "I'm not sure". |
+| **S14** | [Kai only ever speaks when spoken to, and its sessions die silently](S14-kai-has-no-conversational-initiative.md) | The persona offers "gusto mo marinig?" but the state machine cannot act on an unanswered question; `no_speech` ends the conversation without a word. |
 
 ## Tier 3 — high impact, large effort
 
@@ -83,6 +92,17 @@ Worth reading before scheduling — several of these are cheaper or safer in a p
   supervisor thread and can reuse it.
 - **S4 → S6.** If S4 lands first, `VoiceWarmer`'s `_quiet_for_synth` gate reduces from a correctness
   requirement to CPU pacing.
+- **S13 → S14.** A sign-off has to know whether the conversation can be resumed — "balik ka ha" is
+  right when S13 has landed and misleading when it has not.
+- **S12 → S14.** A nudge and a sign-off both read far better with a name in them, and S12 is the
+  cheaper half. If both are scheduled, do S12 first and write the banks with the name slot in mind.
+- **R5 ‖ S12–S14.** Independent. R5 shortens the wait before Kai speaks; these three change what it
+  says and when. Neither blocks the other, and S12 is small enough to land while R5 is still being
+  planned.
+- **S6 → S13, S14.** Both add state and a deadline to `ConversationSession`, which S6 already calls
+  a god object at 1587 lines. Landing them first makes S6 bigger; landing S6 first is a large
+  prerequisite for two medium tickets. Prefer taking them first and folding the new state into S6's
+  extraction plan rather than growing the class twice.
 - **S10 ↔ S11c.** The rebuild rehearsal is the moment the ambiguous `autostart.sh.new` becomes a real
   trap. Resolve S11c before the rehearsal, or resolve it during.
 
