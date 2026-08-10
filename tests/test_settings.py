@@ -8,7 +8,9 @@ from unittest.mock import patch
 
 import settings
 from config.thinking import THINKING_SOUNDS, THINKING_SWEEP
-from config.voice import TTS_ENABLED, TTS_LENGTH_SCALE, TTS_VOLUME
+from config.voice import (
+    TTS_ENABLED, TTS_LENGTH_SCALE, TTS_NOISE_SCALE, TTS_NOISE_W, TTS_SENTENCE_SILENCE_S, TTS_VOLUME,
+)
 from config.wake import HANDS_FREE_ENABLED, VAD_RMS_FLOOR, WAKE_SENSITIVITIES
 
 
@@ -42,6 +44,9 @@ class TestDefaults(SettingsTestCase):
         self.assertEqual(settings.get("tts_enabled"), TTS_ENABLED)
         self.assertEqual(settings.get("tts_volume"), TTS_VOLUME)
         self.assertEqual(settings.get("tts_length_scale"), TTS_LENGTH_SCALE)
+        self.assertEqual(settings.get("tts_sentence_silence"), TTS_SENTENCE_SILENCE_S)
+        self.assertEqual(settings.get("tts_noise_scale"), TTS_NOISE_SCALE)
+        self.assertEqual(settings.get("tts_noise_w"), TTS_NOISE_W)
         self.assertEqual(settings.get("vad_rms_floor"), VAD_RMS_FLOOR)
         self.assertEqual(settings.get("wake_sensitivity"), WAKE_SENSITIVITIES[0])
         self.assertEqual(settings.get("thinking_sweep"), THINKING_SWEEP)
