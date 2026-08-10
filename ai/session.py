@@ -1487,6 +1487,10 @@ class ConversationSession:
                 "sess_ready": self.ready,
                 "sess_enabled": self.enabled,
                 "sess_epoch": self._epoch,
+                # Who Kai believes it is talking to (ai/identity.py), "" until they say so. Reads
+                # from the assistant rather than being mirrored here, so there is one owner and the
+                # dashboard cannot show a name the prompt no longer carries.
+                "sess_person": self._voice.person_name or "",
                 "sess_wake_ok": self._mic.wake.ready,
                 "sess_wake_error": self._mic.wake.unavailable or "",
                 # Which tier actually won. The first thing to read when someone reports "Kai stopped

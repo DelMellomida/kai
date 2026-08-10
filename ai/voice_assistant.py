@@ -31,6 +31,7 @@ from ai import delivery
 from ai import rag
 from ai import tts
 from ai.audio import normalize_for_asr
+from ai.identity import extract_name
 # Device plumbing lives in ai/mic_device.py — this class is one of its two consumers, not its owner.
 # Re-exported (rather than reached through the module) because ensure_input_resolved() and
 # start_recording() call these by bare name, which is what lets a test patch them here.
@@ -56,6 +57,7 @@ from config.voice import (
     WHISPER_CPU_THREADS, WHISPER_BEAM_SIZE, WHISPER_INITIAL_PROMPT,
     ASR_NORMALIZE, ASR_NORMALIZE_MAX_GAIN, ASR_NORMALIZE_SCAN,
     RAG_CONTEXT_PLACEMENT, MAX_HISTORY_TURNS,
+    IDENTITY_CAPTURE, IDENTITY_PROMPT,
 )
 from config.wake import (
     CAPTURE_HARD_CAP_S, TTS_MAX_SPOKEN_CHARS, TTS_TAIL_MUTE_S,
@@ -92,6 +94,10 @@ class VoiceAssistant:
         self._response   = ""
         self._error      = ""
         self._history: list[dict] = []
+        # Who Kai is talking to, if they said so (ai/identity.py). Session-scoped: cleared by
+        # reset_history() alongside the rolling history and the sticky RAG topic, because all three
+        # answer the same question — what may the NEXT person inherit? Nothing. See docs/tickets/S12.
+        self._person_name: str | None = None
         self._audio_chunks: list[np.ndarray] = []
         self._audio_samples = 0        # running total, so the legacy buffer can be bounded
         self._stream: sd.InputStream | None = None
@@ -456,11 +462,51 @@ class VoiceAssistant:
         itself afterwards and hand the next person one turn of the last person's conversation."""
         with self._lock:
             self._history = []
+            self._person_name = None
             self._epoch += 1
         # The retrieval side keeps its own one-line memory (the sticky DEVCON topic, see
         # config/rag.py STICKY_TURNS). It has to be forgotten with the history, or the next
         # person's first question inherits the last person's subject.
         rag.reset_topic()
+
+    @property
+    def person_name(self) -> str | None:
+        """Who Kai currently believes it is talking to, for /params. None until they say so."""
+        with self._lock:
+            return self._person_name
+
+    def note_identity(self, text: str, epoch: int | None = None) -> str | None:
+        """Pin a name if `text` offers one. Returns the name in force after the call.
+
+        Called BEFORE the LLM, so a name lands on the turn that offered it — "I'm Jhondel" gets
+        answered by name rather than a turn late, which is the whole difference between this reading
+        as recognition and reading as a delay.
+
+        Epoch-guarded for the same reason the history append is: a session that ended while STT was
+        running must not have its name applied to the next person's conversation. First name offered
+        wins — a later "I'm just looking" cannot overwrite it, and re-extracting every turn would
+        make the system prompt vary, which is exactly what IDENTITY_PROMPT's placement avoids."""
+        if not IDENTITY_CAPTURE:
+            return None
+        if not self._epoch_ok(epoch):
+            return None
+        with self._lock:
+            if self._person_name is not None:
+                return self._person_name
+        name = extract_name(text)
+        if name is None:
+            return None
+        with self._lock:
+            # Re-check under the lock: reset_history() may have run since _epoch_ok passed.
+            if self._epoch_ok_locked(epoch) and self._person_name is None:
+                self._person_name = name
+                print(f"[identity] talking to {name!r}", flush=True)
+            return self._person_name
+
+    def _epoch_ok_locked(self, epoch: int | None) -> bool:
+        """_epoch_ok for callers already holding the lock — self._lock is a plain Lock, not an
+        RLock, so calling _epoch_ok() from inside the critical section would deadlock."""
+        return epoch is None or self._epoch == epoch
 
     def say(self, text: str, use_llm: bool = True, epoch: int | None = None,
             on_done=None) -> dict:
@@ -491,6 +537,14 @@ class VoiceAssistant:
         def _run() -> None:
             outcome = "error"
             try:
+                # The one-breath hands-free turn arrives here, not in _process() — the whisper wake
+                # tier already holds the transcript, so "Hey Kai, my name is Jhondel" said without a
+                # pause never touches the mic-turn path. Capturing in only one of the two was a real
+                # gap: the same sentence pinned a name or did not, purely on whether the speaker drew
+                # breath. use_llm=False is the verbatim /voice/say route, which is Kai reading a line
+                # out, not somebody introducing themselves.
+                if use_llm:
+                    self.note_identity(text, epoch=epoch)
                 reply = self._call_ollama(text) if use_llm else text
                 if not self._epoch_ok(epoch):
                     # A cold model load takes ~50 s; the session can easily have ended meanwhile.
@@ -772,6 +826,8 @@ class VoiceAssistant:
 
             with self._lock:
                 self._status = STATUS_THINKING
+            # Before the LLM call, so a name offered this turn is answered this turn.
+            self.note_identity(transcript, epoch=epoch)
             reply = self._call_ollama(transcript)
 
             if not self._epoch_ok(epoch):
@@ -902,7 +958,14 @@ class VoiceAssistant:
     def _call_ollama(self, text: str) -> str:
         with self._lock:
             history = list(self._history)
+            person_name = self._person_name
         persona = load_persona()
+        # The one fact about the SPEAKER the prompt carries. System position is deliberate and is
+        # the opposite call to the RAG context below: this string is constant for the rest of the
+        # session, so it invalidates Ollama's cached prefix once, at the turn it is learned, rather
+        # than on every turn. See IDENTITY_PROMPT in config/voice.py.
+        if person_name:
+            persona = f"{persona}\n\n{IDENTITY_PROMPT.format(name=person_name)}"
         # The previous user turn, so a follow-up that only says "it" still retrieves its subject.
         previous_user_text = next((m["content"] for m in reversed(history) if m["role"] == "user"),
                                   None)

@@ -1,3 +1,4 @@
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -256,6 +257,131 @@ class TestProcess(unittest.TestCase):
         # resampled from 44100 to 16000 samples/sec — length should track the target rate
         self.assertAlmostEqual(len(samples), 16000, delta=100)
         self.assertTrue(call_args[1]["vad_filter"])
+
+
+class TestIdentityCapture(unittest.TestCase):
+    """Pinning who Kai is talking to. Extraction itself is tests/test_identity.py; this covers the
+    lifetime, the epoch guard and the prompt placement. See docs/tickets/S12."""
+
+    def test_name_is_none_until_offered(self):
+        va = make_assistant()
+        self.assertIsNone(va.person_name)
+        va.note_identity("How many chapters does DEVCON have?")
+        self.assertIsNone(va.person_name)
+
+    def test_name_is_pinned(self):
+        va = make_assistant()
+        va.note_identity("My name is Jhondel")
+        self.assertEqual(va.person_name, "Jhondel")
+
+    def test_first_name_wins(self):
+        """A later utterance cannot overwrite it. Re-extracting every turn would make the system
+        prompt vary between turns, which is exactly what the system placement exists to avoid."""
+        va = make_assistant()
+        va.note_identity("My name is Jhondel")
+        va.note_identity("My name is Somebody")
+        self.assertEqual(va.person_name, "Jhondel")
+
+    def test_reset_history_forgets_the_name(self):
+        """The contract reset_history() already holds for the rolling history and the sticky RAG
+        topic: the next person inherits nothing."""
+        va = make_assistant()
+        va.note_identity("My name is Jhondel")
+        with patch("ai.voice_assistant.rag.reset_topic"):
+            va.reset_history()
+        self.assertIsNone(va.person_name)
+
+    def test_stale_epoch_cannot_pin_a_name(self):
+        """A session that ended while STT was still running must not hand its name to the next
+        person — the same failure the history append is epoch-guarded against."""
+        va = make_assistant()
+        stale = va.epoch
+        va.bump_epoch()
+        va.note_identity("My name is Jhondel", epoch=stale)
+        self.assertIsNone(va.person_name)
+
+    def test_current_epoch_pins_normally(self):
+        va = make_assistant()
+        va.note_identity("My name is Jhondel", epoch=va.epoch)
+        self.assertEqual(va.person_name, "Jhondel")
+
+    def test_disabled_captures_nothing(self):
+        with patch("ai.voice_assistant.IDENTITY_CAPTURE", False):
+            va = make_assistant()
+            va.note_identity("My name is Jhondel")
+            self.assertIsNone(va.person_name)
+
+    def test_one_breath_turn_also_pins_the_name(self):
+        """say(use_llm=True) is the one-breath hands-free path — the whisper wake tier already holds
+        the transcript, so "Hey Kai, my name is Jhondel" said without a pause runs here and never
+        touches _process(). Found live: the mic path captured and this one did not, so the same
+        sentence pinned a name or not depending purely on whether the speaker drew breath."""
+        va = make_assistant()
+        done = threading.Event()
+        with patch.object(va, "_call_ollama", return_value="Hi there"), \
+             patch.object(va, "_speak"):
+            va.say("my name is Jhondel", use_llm=True, on_done=lambda *_: done.set())
+            done.wait(5)
+        self.assertEqual(va.person_name, "Jhondel")
+
+    def test_verbatim_say_does_not_pin_a_name(self):
+        """use_llm=False is the dashboard reading a line out loud, not somebody introducing
+        themselves. Kai saying "my name is Kai" must not make Kai believe it is talking to Kai."""
+        va = make_assistant()
+        done = threading.Event()
+        with patch.object(va, "_speak"):
+            va.say("My name is Jhondel", use_llm=False, on_done=lambda *_: done.set())
+            done.wait(5)
+        self.assertIsNone(va.person_name)
+
+    def test_name_goes_in_the_system_prompt_not_the_user_turn(self):
+        """The OPPOSITE placement to the RAG context, and for the opposite reason: this string is
+        constant for the rest of the session, so it costs one KV-prefix invalidation when learned
+        rather than one per turn. See IDENTITY_PROMPT in config/voice.py."""
+        va = make_assistant()
+        va.note_identity("My name is Jhondel")
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"message": {"content": "reply"}}
+        with patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
+             patch("ai.voice_assistant.rag.retrieve_context", return_value="CONTEXT_TEXT"), \
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
+            va._call_ollama("hello")
+        messages = mock_post.call_args[1]["json"]["messages"]
+        system_msg, user_msg = messages[0], messages[-1]
+        self.assertIn("PERSONA_TEXT", system_msg["content"])
+        self.assertIn("Jhondel", system_msg["content"])
+        self.assertNotIn("Jhondel", user_msg["content"])
+
+    def test_prompt_is_unchanged_when_no_name_is_known(self):
+        """With capture on but nobody having introduced themselves, the prompt must be identical to
+        today's — the feature costs nothing until it fires."""
+        va = make_assistant()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"message": {"content": "reply"}}
+        with patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
+             patch("ai.voice_assistant.rag.retrieve_context", return_value=""), \
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
+            va._call_ollama("hello")
+        system_msg = mock_post.call_args[1]["json"]["messages"][0]
+        self.assertEqual(system_msg["content"], "PERSONA_TEXT")
+
+    def test_system_prompt_is_stable_across_turns_once_learned(self):
+        """The KV-prefix claim in config/voice.py, asserted rather than assumed: the system message
+        must be byte-identical on consecutive turns even as the retrieved context changes, or the
+        'one invalidation, then free' reasoning is wrong and the placement should change."""
+        va = make_assistant()
+        va.note_identity("My name is Jhondel")
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"message": {"content": "reply"}}
+        seen = []
+        with patch("ai.voice_assistant.load_persona", return_value="PERSONA_TEXT"), \
+             patch("ai.voice_assistant.rag.retrieve_context", side_effect=["CTX_A", "CTX_B"]), \
+             patch("ai.llm.requests.post", return_value=mock_resp) as mock_post:
+            va._call_ollama("first")
+            seen.append(mock_post.call_args[1]["json"]["messages"][0]["content"])
+            va._call_ollama("second")
+            seen.append(mock_post.call_args[1]["json"]["messages"][0]["content"])
+        self.assertEqual(seen[0], seen[1])
 
 
 class TestCallOllama(unittest.TestCase):

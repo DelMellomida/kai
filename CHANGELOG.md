@@ -20,6 +20,86 @@ Conventions:
 
 ---
 
+## 2026-08-10 — Kai forgot your name six questions after you gave it
+
+Suite green: 1239 passed, 2705 subtests (was 1190, 2700). Implements
+[S12](docs/tickets/S12-no-identity-within-a-session.md); deployed and exercised on the robot.
+
+Two things the live run turned up that the tests could not, both recorded in the ticket: Whisper
+mishears names (`[identity] talking to 'Jandal'` was a correct extraction of a misheard "Jhondel",
+which nothing in this design defends against), and the model uses the name more often than
+`IDENTITY_PROMPT` asks it to.
+
+- **A name offered in speech was an ordinary history turn, so the rolling cap evicted it.** The
+  prompt is `system + capped history + user turn` (`ai/llm.build_chat_messages`) with no slot for a
+  fact about the *speaker*, so "I'm Jhondel" landed in `_history` and was dropped by
+  `MAX_HISTORY_TURNS = 6` exchanges later — unrecoverable, because nothing had extracted it. Kai now
+  pins the first name it is offered on `VoiceAssistant._person_name` and appends `IDENTITY_PROMPT` to
+  the system prompt, so it outlives the window entirely. Published as `sess_person` on `/params`.
+- **Extraction is a regex, not a second LLM call.** `ai/identity.py` is pure stdlib, in the shape of
+  `ai/wake_phrase.py` and for the same reason — the bugs here are all false accepts and casing, so it
+  must be testable with plain strings. Asking Ollama to pull the name out would put another
+  round-trip on the path [R5](docs/tickets/R5-serialised-first-audio-latency.md) exists to shorten.
+- **The anchors are two-tier, because the risk is not symmetric.** A missed name costs nothing; a
+  wrong name is said out loud to somebody standing in front of the robot. Strong anchors ("my name
+  is X", "call me X", "ako si X" — `si` is a personal-name marker, introducing a name is its
+  grammatical job) are taken as-is. The weak tier ("I'm X") is accepted only with a capitalised
+  first letter *and* a miss on `IDENTITY_STOPWORDS`, which is what separates "I'm Jhondel" from
+  "I'm fine", "I'm from Cebu" and "I'm a developer".
+- **The name is session-scoped, on the seam that already existed.** `reset_history()` clears it
+  alongside the rolling history and the sticky RAG topic, because all three answer the same question
+  — what may the next person inherit? Nothing. It survives a "hey Kai" landing in `LISTEN_WAIT`,
+  matching the history rule there, and `note_identity()` is epoch-guarded so a session that ended
+  while STT was still running cannot hand its name to whoever is next.
+- **Both conversational paths capture, which took a live run to find.** `note_identity()` was hooked
+  only into `_process()`, the mic-turn path. The **one-breath** turn — "Hey Kai, my name is Jhondel"
+  said without pausing — runs through `say()` instead, because the whisper wake tier already holds
+  the transcript. On the robot, `sess_person` stayed `''` while Kai cheerfully replied "Hi Jhondel!":
+  the model read the name out of the user turn, which looks identical from outside and pins nothing.
+  So the same sentence captured or did not purely on whether the speaker drew breath. Now hooked in
+  both, gated on `use_llm` so the verbatim `/voice/say` route cannot make Kai think it is talking to
+  itself.
+- **The prompt placement is the opposite call to the RAG context, deliberately — and the reasoning
+  behind it is currently unmeasurable.** `RAG_CONTEXT_PLACEMENT = "user"` keeps per-turn-varying text
+  out of the cached prefix; this string does not vary once learned, so the system position should
+  cost one invalidation and nothing after. On the robot it cannot be confirmed: every `[llm] turn:`
+  line is preceded by `MODEL RELOADED: ~200-360ms — placement was re-decided`, so **no KV prefix
+  survives between turns at all** and there is nothing to invalidate. What was measured is that the
+  injection costs nothing detectable — 258-304 ms prompt eval with a name pinned, inside the
+  215-465 ms spread without one. Noted at the constant in `config/voice.py`, to be re-measured if the
+  per-turn reload is ever fixed. That reload also makes `RAG_CONTEXT_PLACEMENT`'s optimisation inert.
+- **`ai/persona.txt` now says to use the conversation it already has.** One line, no code: refer back
+  to what was said earlier, notice a repeated question, pick up a dropped thread — and never claim to
+  remember an earlier *visit*, which would be a lie the history cannot support. `load_persona()`
+  re-reads the file on every call, so this is revertible on the live robot without a restart.
+
+## 2026-08-10 — Long replies were being cut off mid-sentence, with the jaw still moving
+
+Two independent bugs behind one symptom. Suite green: 1180 passed, 2675 subtests (was 1173).
+
+- **`STATE_SPEAKING` guillotined every reply at 20 s.** `_enter_speaking` armed
+  `SESSION_SPEAK_MAX_UNKNOWN_S` unconditionally, and that was the only deadline a *healthy* reply
+  ever got — `SESSION_SPEAK_GRACE_S`, commented "allowed overrun past the WAV's own duration",
+  reached only the canned branch. The clock also starts before Piper does, because `on_done` fires
+  from the turn worker the moment the reply text exists. Meanwhile `TTS_MAX_SPOKEN_CHARS` (500)
+  allows ~90 words — about 31 s at `SPEAK_SEC_PER_WORD`. So any answer past ~18 s was cut mid-word
+  by the guard against a *wedged* paplay. `VoiceAssistant.audio_ends_at()` now publishes the WAV's
+  measured end and `session._speaking_deadline()` prefers it, falling back to the 20 s cap only
+  when no length is known — a pantomime, an unreadable header, or the synthesis window. The
+  backstop is intact: a wedged paplay either publishes no end time or overruns the one it did.
+- **Cut audio left the jaw miming on.** The jaw is a `(start, segments)` schedule that
+  `face_track.py` reads every frame; `tts.stop()` only kills the subprocess, and the sole reset in
+  the class was `start_recording()`'s, covering push-to-talk alone. So a filler cut mid-word by an
+  arriving reply went on mouthing the rest of its sentence in silence — up to `FILLER_MAX_LINE_S`,
+  plus the 0.5–1.5 s Piper run before the reply had a window of its own. `_begin_speech()` now
+  retires the outgoing schedule at the one seam every speech path already passes through, and
+  `stop_speech()` pairs the two for the four sites in `ai/session.py` that cut audio directly
+  (ack timeout, speak timeout, push-to-talk interrupt, session end).
+
+Clearing the stale end time in `_begin_speech` is load-bearing for the first fix: `_enter_speaking`
+arms from `on_done`, which fires after `_speak()` has claimed the speaker but before its worker
+knows a duration. A left-over end time from the previous line would cut the new one instantly.
+
 ## 2026-08-10 — Documentation restructure
 
 Docs only — no code behaviour changed. The full test suite is green before and after
