@@ -1,5 +1,14 @@
 # R4 — Firmware clamps to 0–180 while the host clamps to 10–170
 
+> **Status: FIXED** — `fix/firmware-servo-limits`. The sketch gained `ANGLE_MIN`/`ANGLE_MAX` (10/170)
+> and a strict `parseAngle()` that replaces every `String::toInt()` coercion; a line is now applied
+> whole or not at all. Suite green (1244 passed, was 1239).
+>
+> **Two things this ticket cannot close from a keyboard.** The sketch was not compiled — there is no
+> Arduino toolchain on the Jetson or the dev box, so the C++ is reviewed but unbuilt. And the change
+> does nothing until someone **flashes the board**; until then the robot is running the old firmware
+> regardless of what is on `main`. The on-hardware criterion below stays unchecked for both reasons.
+
 | | |
 |---|---|
 | **Tier** | 1 |
@@ -36,18 +45,30 @@ mechanical limit unconditionally is the one that doesn't.
 
 ## Acceptance criteria
 
-- [ ] Firmware constrains pan and jaw to the same window as the host (10–170), with the limits
-      named as constants at the top of the sketch and a comment pointing at `config/servo.py` as
-      the source of truth they must be kept in step with.
-- [ ] A line containing any character outside `[0-9,\n]` (for the numeric forms) is rejected
-      outright rather than coerced through `toInt()` — no servo write happens for a malformed line.
-- [ ] An empty numeric field (e.g. `",90\n"`, `"J\n"`) is rejected rather than treated as 0.
-- [ ] `G:` gesture lines and the `J` prefix continue to parse exactly as before.
-- [ ] Verified on hardware: sending deliberately corrupted lines over `servo/servo_serial.py`'s
-      interactive mode (or a raw `screen`/`python -m serial.tools.miniterm` session) produces no
-      motion, and the head never travels past the mechanical limits.
-- [ ] The host-side clamps in `servo/servo.py` are left in place — this is defence in depth, not a
-      relocation. `tests/test_servo.py`'s existing `SERVO_MIN`/`SERVO_MAX` assertions still pass.
+- [x] Firmware constrains pan and jaw to the same window as the host (10–170), named as
+      `ANGLE_MIN`/`ANGLE_MAX` at the top of the sketch with a comment pointing at `config/servo.py`.
+      **The comment is backed by a test**, which the criterion did not ask for and should have:
+      `tests/test_servo.py::TestFirmwareAngleLimits` reads the real `.ino` and fails if the two
+      constants ever drift. A promise to keep two files in step, in two languages, one of which
+      nothing in this repo executes, is exactly the kind that quietly stops being true.
+      One window covers both axes — `JAW_OPEN` (config/tracking.py) is already pinned at `SERVO_MAX`.
+- [x] A line containing any character outside `[0-9,]` is rejected outright rather than coerced.
+      `parseAngle()` returns false on any non-digit and the line is dropped with no servo write.
+      Applied whole or not at all: a good pan with a corrupt jaw moves nothing. **The tilt field is
+      validated too, then discarded** — there is no tilt hardware (R10), but garbage in tilt means
+      the line is corrupt and the pan field beside it has no better claim to being intact.
+- [x] An empty numeric field is rejected rather than treated as 0 — `parseAngle()` fails on
+      `length() == 0`, covering `",90"`, `"90,"` and `"J"`.
+- [x] `G:` gesture lines and the `J` prefix continue to parse exactly as before. Both branches are
+      untouched apart from the `J` branch's parse call; `G:` is matched and dispatched first, ahead
+      of any numeric handling, exactly as it was.
+- [ ] **DEFERRED — needs the robot.** Verified on hardware: deliberately corrupted lines over
+      `servo/servo_serial.py`'s interactive mode produce no motion, and the head never travels past
+      the mechanical limits. **Also unbuilt** — no Arduino toolchain was available, so the sketch has
+      not been compiled. Flash and run this before trusting the change.
+- [x] The host-side clamps in `servo/servo.py` are left in place — defence in depth, not a
+      relocation. `servo/servo.py` is not modified by this ticket at all, and the existing
+      `SERVO_MIN`/`SERVO_MAX` assertions pass unchanged.
 
 ## Suggested approach
 

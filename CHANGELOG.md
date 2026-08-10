@@ -20,6 +20,40 @@ Conventions:
 
 ---
 
+## 2026-08-11 — One corrupted byte on the servo wire could slam the head into its stop
+
+Suite green: 1244 passed (was 1239). Implements
+[R4](docs/tickets/R4-firmware-servo-limits-mismatch.md). **Firmware — inert until the Arduino is
+flashed, and not compiled here: no Arduino toolchain was available on either box.**
+
+- **The limit that protects the SG90 existed only on the host.** `config/servo.py`'s `SERVO_MIN`/
+  `SERVO_MAX` (10/170) are applied in `servo/servo.py`'s `send()` and `send_jaw()`, but the sketch
+  constrained to the full `0..180` in all three of its `constrain()` calls. The host's clamp is
+  applied and then *destroyed in transit* if the line corrupts, and the link is fire-and-forget by
+  design — no checksum, no echo, no ack — so nothing downstream can tell a mangled line from a real
+  one. `ANGLE_MIN`/`ANGLE_MAX` now live in the sketch, which is the copy that survives the wire.
+- **`String::toInt()` returns 0 for anything it cannot parse, and 0 is the worst value on this
+  wire.** Not an inert default — a hard slam to the end of travel. So the one input the old parser
+  could not report was also the most damaging thing it could command, and the CH340 is documented as
+  flapping under servo brownout, which makes corruption *correlated* with the condition that makes a
+  stall worse: the stall current from a slam to 0 lands on the same rail whose sag caused the flap.
+  `parseAngle()` replaces it — rejects an empty field, any non-digit, and anything over 3 digits.
+- **A line is now applied whole or not at all.** Every field is parsed before any servo is written,
+  so a good pan with a corrupt jaw moves nothing. The tilt field is validated and then thrown away:
+  there is no tilt hardware (R10), but garbage in tilt means the *line* is corrupt, and the pan
+  field sitting beside it has no better claim to being intact.
+- **The "keep these in step with config/servo.py" comment is backed by a test.** R4 asked only for
+  the comment. `tests/test_servo.py::TestFirmwareAngleLimits` reads the real `.ino` and fails if the
+  constants drift, if a full-range `constrain(..., 0, 180)` reappears, or if `toInt()` comes back.
+  It strips C++ comments before searching — the first version matched this sketch's own explanation
+  of why `toInt()` is wrong and failed on the change that fixed it.
+
+What is still true, and what is not yet: the host-side clamps are untouched, so this is defence in
+depth rather than a relocation, and `G:` gesture lines and the `J` fast channel dispatch exactly as
+before. But the sketch has not been compiled and the board has not been flashed. Until someone does
+both, the robot is running the old firmware no matter what is on `main`, and R4's on-hardware
+criterion stays open.
+
 ## 2026-08-10 — Kai forgot your name six questions after you gave it
 
 Suite green: 1239 passed, 2705 subtests (was 1190, 2700). Implements
