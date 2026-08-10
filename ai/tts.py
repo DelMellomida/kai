@@ -27,7 +27,9 @@ from pathlib import Path
 from config.voice import (
     TTS_ENGINE, TTS_PIPER_CMD, TTS_VOICE_MODEL,
     TTS_SINK, TTS_OUTPUT_DIR, TTS_XDG_RUNTIME, TTS_LATENCY_MSEC,
+    TTS_PIPER_NORMALIZE,
     TTS_POST_PROCESS, TTS_POST_SOX, TTS_POST_CHANNELS, TTS_POST_EFFECTS,
+    TTS_POST_HIGHPASS, TTS_POST_ROOM,
     TTS_ASSERT_CARD_PROFILE, TTS_CARD, TTS_CARD_PROFILE, TTS_PACTL_TIMEOUT_S,
 )
 # TTS_ENABLED / TTS_VOLUME / TTS_LENGTH_SCALE deliberately NOT imported: they are dashboard-settable,
@@ -181,14 +183,37 @@ def apply_output_profile() -> bool:
     return True
 
 
+def _sox_chain() -> list[str]:
+    """The sox effects, in the one order that makes acoustic sense — and the order is the whole point,
+    which is why this is a function and not a single config list:
+
+      TTS_POST_HIGHPASS   before the compand. It removes energy this speaker cannot reproduce, so it
+                          has to go first: cutting it afterwards would be after the compressor has
+                          already spent its headroom reacting to it.
+      TTS_POST_EFFECTS    the loudness chain (compand + `gain -n -1`), untouched.
+      TTS_POST_ROOM       after the compand — compress the dry signal, then put it in a space, the
+                          order a person mixing this would use.
+      a final `gain -n -1` only when a room is configured, because reverb adds energy after the
+      chain's own normalise and would otherwise leave the peak somewhere above -1 dB.
+
+    Either addition being empty yields exactly the previous command line, so the whole feature reverts
+    from config alone."""
+    room = list(TTS_POST_ROOM)
+    return [*TTS_POST_HIGHPASS, *TTS_POST_EFFECTS, *room,
+            *(["gain", "-n", "-1"] if room else [])]
+
+
 def _post_process(src: Path, dst: Path) -> Path:
-    """Run sox to duplicate `src` (Piper's quiet mono WAV) to TTS_POST_CHANNELS and apply the
-    TTS_POST_EFFECTS loudness chain, writing `dst`. Returns `dst` on success, else `src` unchanged
+    """Run sox to duplicate `src` (Piper's quiet mono WAV) to TTS_POST_CHANNELS and apply the effect
+    chain from _sox_chain(), writing `dst`. Returns `dst` on success, else `src` unchanged
     (best-effort: a missing/broken sox must never cost us the reply — speech still plays, just
-    quieter/mono). No-op passthrough when TTS_POST_PROCESS is off."""
+    quieter/mono/dry). No-op passthrough when TTS_POST_PROCESS is off.
+
+    Note that fallback is louder-consequence than it used to be: TTS_PIPER_NORMALIZE = False means the
+    raw Piper WAV is also ~10 dB quieter (see _run_piper)."""
     if not TTS_POST_PROCESS:
         return src
-    cmd = [TTS_POST_SOX, str(src), "-c", str(TTS_POST_CHANNELS), str(dst), *TTS_POST_EFFECTS]
+    cmd = [TTS_POST_SOX, str(src), "-c", str(TTS_POST_CHANNELS), str(dst), *_sox_chain()]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except OSError as exc:
@@ -225,8 +250,27 @@ def _run_piper(text: str, dst: Path, length_scale: float | None = None) -> bool:
         # clip-free and gives the post-processing chain a consistent level to work from.
         "--length-scale", str(settings.get("tts_length_scale") if length_scale is None
                               else length_scale),
+        # The other three prosody parameters, all live for the same reason. --sentence-silence is the
+        # one that changes how Kai sounds: its default is 0, so before 2026-08-10 a four-sentence reply
+        # ran together without a single breath. See config/voice.py for the measurements behind all
+        # three, and for why the two noise values default to the voice's own.
+        #
+        # FLAG SPELLINGS VERIFIED against the pinned piper-tts 1.4.2 on this robot
+        # (`python3 -m piper --help`, 2026-08-10): --sentence-silence, --noise-scale and
+        # --noise-w-scale, the last also accepting --noise-w / --noise_w as aliases. Do not take a
+        # spelling from a blog post or a different version — Piper rejects an unknown flag by exiting
+        # non-zero, which _run_piper reports as a failed synthesis, which means EVERY REPLY IS SILENT.
+        # That failure looks nothing like a flag problem in the log, so re-check --help after any
+        # piper-tts upgrade.
+        "--sentence-silence", str(settings.get("tts_sentence_silence")),
+        "--noise-scale", str(settings.get("tts_noise_scale")),
+        "--noise-w-scale", str(settings.get("tts_noise_w")),
         "-f", str(dst),
     ]
+    # Only skip Piper's per-sentence normalisation when sox is going to normalise the whole reply
+    # instead. Without that pairing the raw output is ~10 dB quieter and nothing puts the level back.
+    if not TTS_PIPER_NORMALIZE and TTS_POST_PROCESS:
+        cmd.insert(-2, "--no-normalize")
     try:
         with _proc_lock:
             proc = subprocess.Popen(
