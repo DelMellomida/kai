@@ -22,7 +22,7 @@ Conventions:
 
 ## 2026-08-10 — Kai forgot your name six questions after you gave it
 
-Suite green: 1234 passed, 2680 subtests (was 1185, 2675). Implements
+Suite green: 1239 passed, 2705 subtests (was 1190, 2700). Implements
 [S12](docs/tickets/S12-no-identity-within-a-session.md); deployed and exercised on the robot.
 
 Two things the live run turned up that the tests could not, both recorded in the ticket: Whisper

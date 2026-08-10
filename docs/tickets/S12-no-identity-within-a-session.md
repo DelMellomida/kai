@@ -106,7 +106,7 @@ history prompt, in the style of `RAG_CONTEXT_PLACEMENT`'s documented REVERT.
 ## Resolution
 
 **Landed 2026-08-10**, branch `feat/session-identity-capture`. Implemented as specified — four steps,
-no deviations. Suite: 1232 passed, 2680 subtests (was 1185, 2675).
+no deviations. Suite: 1239 passed, 2705 subtests (was 1190, 2700).
 
 - `ai/identity.py` — `extract_name()`, pure stdlib, two anchor tiers.
 - `config/voice.py` — `IDENTITY_CAPTURE`, `IDENTITY_PROMPT`, `IDENTITY_MIN_LEN` / `IDENTITY_MAX_LEN`,
