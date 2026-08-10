@@ -1,5 +1,10 @@
 # R7 — TTS subprocesses outlive the process
 
+> **Status: FIXED** — `fix/tts-outlives-shutdown`. `tts.stop()` is now the first statement of
+> `face_track.run()`'s `finally`, and `ConversationSession.stop()` cancels speech before releasing
+> the mic. Suite green (1176 passed). **Two acceptance criteria are deferred**: both are on-robot
+> observations (`pgrep` after SIGTERM, and a mid-reply `POST /restart`) — see the checklist.
+
 | | |
 |---|---|
 | **Tier** | 1 |
@@ -36,17 +41,30 @@ invisible in the log: the old process has already printed its clean shutdown lin
 
 ## Acceptance criteria
 
-- [ ] `run()`'s `finally` calls `tts.stop()` before `_session.stop()`.
-- [ ] After `SIGTERM` during a spoken reply, no `paplay` or `piper` process belonging to the
-      exiting PID survives — verifiable with `pgrep -af 'paplay|piper'` immediately after
-      `[face_track] Stopped.` appears in the log.
-- [ ] A dashboard `POST /restart` issued mid-reply produces silence between the two processes,
-      not overlapping speech.
-- [ ] The forced-exit path (`lifecycle.arm_restart_deadline` → `os._exit`) is documented as NOT
-      covered by this fix, since `os._exit` skips the `finally` by design — note in the code
-      comment that `scripts/autostart.sh` is the backstop there.
-- [ ] A regression test asserts that the shutdown sequence invokes `tts.stop()` (patch `ai.tts.stop`
-      and drive the teardown, in the style of the existing `tests/test_tts.py` handle assertions).
+- [x] `run()`'s `finally` calls `tts.stop()` before `_session.stop()` — it is the **first**
+      statement of the block, ahead of `stop_evt.set()`, so the 1–2 s of teardown that follows also
+      happens in silence rather than under a half-spoken reply. `face_track.py` now imports
+      `tts` alongside `rag`.
+- [ ] **DEFERRED — needs the robot.** After `SIGTERM` during a spoken reply, no `paplay` or `piper`
+      process belonging to the exiting PID survives (`pgrep -af 'paplay|piper'` immediately after
+      `[face_track] Stopped.`).
+- [ ] **DEFERRED — needs the robot.** A dashboard `POST /restart` issued mid-reply produces silence
+      between the two processes, not overlapping speech.
+- [x] The forced-exit path (`lifecycle.arm_restart_deadline` → `os._exit`) is documented as NOT
+      covered by this fix, since `os._exit` skips the `finally` by design — recorded in the code
+      comment at the call site, naming `scripts/autostart.sh`'s `wait_for_capture_device` as the
+      backstop.
+- [x] A regression test asserts that the shutdown sequence invokes `tts.stop()`.
+      **Scoped differently from the ticket's suggestion**, and worth being explicit about:
+      `face_track.run()` has no test harness — it is an unbounded loop wiring live hardware — so the
+      assertion lives on `ConversationSession.stop()`, which the existing `SessionCase` fixture
+      already patches `ai.session.tts.stop` for. Three cases in `tests/test_session.py::TestStop`:
+      speech is cancelled, cancelled **before** the mic is released (ordering), and `stop()` is
+      idempotent. The one line inside `run()`'s `finally` remains covered by inspection only.
+- [x] **Added beyond the ticket:** `ConversationSession.stop()` also cancels speech, placed after
+      the tick-thread join (so nothing can start a new line behind it) and before `self._mic.stop()`.
+      The ticket floated this as "consider"; it is what the regression test can actually reach, and
+      `stop()` is reachable independently of `face_track.run()`.
 
 ## Suggested approach
 

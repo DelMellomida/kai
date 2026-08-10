@@ -1,6 +1,8 @@
 import json
 import random
+import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -124,6 +126,9 @@ class FakeVoice:
         self.spoken_wavs = []
         self.history_resets = 0
         self.turn_status_clears = 0
+        # Who the assistant believes it is talking to (ai/identity.py). Published as sess_person and
+        # forgotten by reset_history() with everything else the next person must not inherit.
+        self.person_name = None
         self.status = "idle"        # the assistant's own per-turn status
         self.attached = None
         self.turn_result = {"status": "ok"}
@@ -149,6 +154,7 @@ class FakeVoice:
     def reset_history(self):
         self.history_resets += 1
         self._epoch += 1
+        self.person_name = None
 
     def clear_turn_status(self):
         self.turn_status_clears += 1
@@ -209,6 +215,34 @@ class FakePresence:
         if self.raise_on_call:
             raise RuntimeError("camera thread died")
         return self.visible, self.since, self.is_fresh
+
+
+def _lock_probing_recorder(session, held):
+    """A recorder double whose record() reports whether the session lock was held when it ran.
+
+    The probe runs on ANOTHER thread on purpose: session._lock is an RLock, so acquiring it from
+    the calling thread would succeed whether or not the bug is present and the test would pass
+    vacuously. Acquire and release both happen on the probe thread — RLock ownership is per-thread,
+    so releasing from anywhere else raises.
+    """
+    def _record(*_args, **_kwargs):
+        got = []
+
+        def _probe():
+            acquired = session._lock.acquire(blocking=False)
+            got.append(acquired)
+            if acquired:
+                session._lock.release()
+
+        probe = threading.Thread(target=_probe)
+        probe.start()
+        probe.join(timeout=2.0)
+        held.append(not (got and got[0]))
+        return "clip"
+
+    return SimpleNamespace(record=_record, annotate=lambda *a, **k: None,
+                           status=lambda: {"enabled": False, "written": 0, "skipped": 0,
+                                           "mb": 0.0, "error": ""})
 
 
 class SessionCase(unittest.TestCase):
@@ -725,6 +759,65 @@ class TestUtterance(SessionCase):
         self.assertEqual(s.state, STATE_BUSY)
         self.assertEqual(len(self.voice.turns), 1)
 
+    def test_max_utterance_dispatches_without_holding_the_session_lock(self):
+        """S1. The lock is an RLock, so a nested `with` inside a method called from tick() is
+        re-entrant — which meant the code _finish_utterance places *after* its own block, on the
+        stated grounds that a WAV write must not land on the tick thread's critical section, was
+        still inside tick()'s. UtteranceRecorder.record() writes up to CAPTURE_HARD_CAP_S of audio,
+        and the audio worker needs this same lock ~30 times a second for the VAD.
+
+        Checked from ANOTHER thread on purpose: an RLock is re-entrant, so acquiring it from this
+        one would succeed whether or not the bug is present, and the test would pass vacuously."""
+        s = self.make()
+        at = self.wake(s, T0)
+        s._gate = self.fake_gate()
+        s._gate.update.return_value = "onset"
+        s._gate.speech_duration.return_value = MAX_UTTERANCE_S
+        s._on_audio(np.ones(320, dtype="int16"), at + 1)
+
+        held = []
+        s._recorder = _lock_probing_recorder(s, held)
+        s.tick(at + 1 + MAX_UTTERANCE_S)
+
+        self.assertEqual(s.state, STATE_BUSY, "the turn must still be forced")
+        self.assertEqual(held, [False], "the WAV write ran while tick() held the session lock")
+
+    def test_scan_too_long_dispatches_without_holding_the_session_lock(self):
+        """The same seam on the wake-scan path.
+
+        Weaker than the turn case above, and deliberately asserted differently. _finish_scan's
+        `too_long` branch discards the audio and returns BEFORE it records anything or dispatches
+        Whisper, so this path never actually reached disk I/O — the ticket overstated it. What is
+        asserted here is the structural property: tick() hands the dispatch out with the lock
+        released, so the branch stays safe if it ever grows work the way the turn path has."""
+        s = self.make(wake_kind="utterance")
+        s._gate = self.fake_gate()
+        s._gate.update.return_value = "onset"
+        s._voice.scan_ready = True
+        s._on_audio(np.ones(320, dtype="int16"), T0 + 1)
+        self.assertEqual(s.state, STATE_SCAN_SPEECH)
+
+        held = []
+
+        def _probe_finish(now, reason):
+            got = []
+
+            def _probe():
+                acquired = s._lock.acquire(blocking=False)
+                got.append(acquired)
+                if acquired:
+                    s._lock.release()
+
+            probe = threading.Thread(target=_probe)
+            probe.start()
+            probe.join(timeout=2.0)
+            held.append(not (got and got[0]))
+
+        s._finish_scan = _probe_finish
+        s.tick(T0 + 1 + WAKE_WHISPER_MAX_UTTERANCE_S + 1)
+
+        self.assertEqual(held, [False], "_finish_scan ran while tick() held the session lock")
+
     def test_rejected_turn_returns_to_listening(self):
         s = self.make()
         at = self.wake(s, T0)
@@ -1135,6 +1228,34 @@ class TestStart(SessionCase):
         with patch("ai.session.MIC_LEGACY_CAPTURE", True), patch("ai.session.threading.Thread"):
             self.assertFalse(s.start())
         self.assertIsNone(self.voice.attached)
+
+
+class TestStop(SessionCase):
+    """R7. Piper and paplay are child PROCESSES, not threads — the interpreter exiting does not take
+    them with it. A teardown that leaves them running means the replacement process (autostart.sh
+    relaunches within seconds) starts talking over audio the previous one left in the air, with its
+    own self-hearing gate wide open because it knows nothing about that sound."""
+
+    def test_stop_cancels_speech_in_flight(self):
+        s = self.make()
+        self.mock_stop.reset_mock()
+        s.stop()
+        self.mock_stop.assert_called()
+
+    def test_stop_cancels_speech_before_releasing_the_mic(self):
+        # Ordering is the point: the mic close ends this process's claim on the audio devices, and a
+        # synth still running past it is exactly the orphan this closes.
+        s = self.make()
+        order = []
+        self.mock_stop.side_effect = lambda: order.append("tts.stop")
+        self.mic.stop = lambda: order.append("mic.stop")
+        s.stop()
+        self.assertEqual(order, ["tts.stop", "mic.stop"])
+
+    def test_stop_is_idempotent_and_safe_on_a_session_that_never_started(self):
+        s = self.make()
+        s.stop()
+        s.stop()
 
 
 class TestGreeting(SessionCase):
@@ -2341,6 +2462,32 @@ class TestLiveSettings(SessionCase):
         s = self.make()
         s.set_rms_floor(900.0)
         json.dumps(s.get_status())
+
+    def test_person_name_is_published(self):
+        """sess_person is read from the assistant rather than mirrored on the session, so the
+        dashboard cannot show a name the prompt no longer carries. See docs/tickets/S12."""
+        s = self.make()
+        self.assertEqual(s.get_status()["sess_person"], "")
+        self.voice.person_name = "Jhondel"
+        self.assertEqual(s.get_status()["sess_person"], "Jhondel")
+
+    def test_person_name_survives_a_wake_mid_conversation(self):
+        """Saying "hey Kai" again while it is already listening continues the conversation and keeps
+        its history (see _begin_session's note). The name has to follow the same rule, or repeating
+        the wake word mid-chat quietly turns you back into a stranger."""
+        s = self.make()
+        self.wake(s, T0)
+        self.voice.person_name = "Jhondel"
+        self.wake(s, T0 + 2)
+        self.assertEqual(s.get_status(T0 + 3)["sess_person"], "Jhondel")
+
+    def test_person_name_is_gone_after_the_session_ends(self):
+        s = self.make()
+        self.wake(s, T0)
+        self.voice.person_name = "Jhondel"
+        s.end_session("manual")
+        self.assertEqual(s.get_status()["sess_person"], "",
+                         "the next person must not inherit the last one's name")
 
 
 class TestSessionStartRetrySchedule(unittest.TestCase):

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +79,43 @@ _INDEX_IDF: dict[str, float] = {}
 # follow-up. Module state, like the index cache above; reset_topic() clears it with the session.
 _sticky_turns = 0
 
+# Failure accounting for the fail-open handlers below. The fail-open POLICY is right — a broken
+# index must behave exactly as if RAG did not exist — but the SILENCE was not: retrieve_context()
+# returning "" for a TypeError is indistinguishable from "no relevant documents", and "" is the
+# dangerous state, the one where gemma2:2b answers DEVCON questions from pretraining. A whole
+# retrieval regression could ship and present only as "Kai's answers got vaguer".
+_ERROR_LOG_INTERVAL_S = 60.0
+_error_count = 0
+_last_error = ""
+_last_error_t = 0.0
+
+
+def _note_error(where: str, exc: BaseException) -> None:
+    """Record a swallowed failure, and say so — at most once a minute per distinct error.
+
+    Rate-limited for the reason config/tracking.py records about NO_FACE: an unconditional line
+    here would run at turn rate against a persistent fault and bury everything worth reading. The
+    counter is unconditional, so /params still shows the true total.
+    """
+    global _error_count, _last_error, _last_error_t
+    _error_count += 1
+    detail = f"{type(exc).__name__}: {exc}"
+    now = time.monotonic()
+    if detail != _last_error or now - _last_error_t >= _ERROR_LOG_INTERVAL_S:
+        print(f"[rag] WARNING: {where} failed ({detail}) — answering without documents", flush=True)
+        _last_error, _last_error_t = detail, now
+
+
+def status() -> dict:
+    """Retrieval health for /params. `rag_errors` is monotonic across the process."""
+    return {"rag_errors": _error_count, "rag_last_error": _last_error}
+
+
+def _reset_errors() -> None:
+    """Tests only — module state is shared across a process, like vision/presence.reset()."""
+    global _error_count, _last_error, _last_error_t
+    _error_count, _last_error, _last_error_t = 0, "", 0.0
+
 
 def ensure_model_loaded() -> None:
     """Lazy-load the embedding model singleton. Call once at startup to pre-warm."""
@@ -123,7 +161,8 @@ def embed_query(text: str) -> list[float] | None:
     """Embed a live user query. Fails open (returns None) — must never crash a voice turn."""
     try:
         return embed_batch([QUERY_PREFIX + text])[0]
-    except Exception:
+    except Exception as exc:
+        _note_error("embed_query", exc)
         return None
 
 
@@ -136,7 +175,11 @@ def load_index() -> None:
         chunks = data.get("chunks", [])
         entities = data.get("entities", [])
         _warn_if_stale(data.get("sources"))
-    except Exception:
+    except Exception as exc:
+        # A missing index is the ordinary case on a fresh checkout, not a fault — it means
+        # "nothing indexed yet". A malformed one is a real failure and has to be visible.
+        if not isinstance(exc, FileNotFoundError):
+            _note_error("load_index", exc)
         _INDEX_CHUNKS = []
         _INDEX_VECTORS = None
         _INDEX_ENTITIES = []
@@ -475,5 +518,6 @@ def retrieve_context(query_text: str, previous_user_text: str | None = None) -> 
 
         print("[rag] failsafe: no primer indexed — returning the don't-guess notice")
         return NO_CONTEXT_NOTICE
-    except Exception:
+    except Exception as exc:
+        _note_error("retrieve_context", exc)
         return ""

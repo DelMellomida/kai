@@ -105,6 +105,12 @@ REWARM_RETRY_S = 1.5         # one retry if the ack still got cancelled
 GREETING_QUIET_WAIT_S = 20.0
 GREETING_POLL_S = 0.25
 
+# How often a persistently broken presence feed may log. Reached from the 20 Hz tick and from every
+# /params snapshot, so an unthrottled line here would run at hundreds per minute — the same failure
+# NO_FACE_LOG_INTERVAL_S exists to prevent (see config/tracking.py: NO FACE was 58% of a 1.5-hour
+# log). Implementation cadence, not a knob.
+PRESENCE_ERROR_LOG_S = 60.0
+
 
 class ConversationSession:
     """The hands-free state machine: wake word in, spoken reply out, and a session that ends itself.
@@ -182,6 +188,9 @@ class ConversationSession:
         self._discarded_short = 0
         self._end_reason = ""
         self._last_heartbeat = 0.0
+        # Last presence-feed failure and when it was logged — see _note_presence_error.
+        self._presence_error = ""
+        self._presence_error_t = -PRESENCE_ERROR_LOG_S
         # Wall time of the whole turn (utterance handed over -> worker reported back). The PER-STAGE
         # breakdown lives on the VoiceAssistant, which is the only thing that can see the stages
         # apart — see VoiceAssistant.stage_timings(). Kept as "llm_ms" here because the dashboard
@@ -267,6 +276,12 @@ class ConversationSession:
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=2.0)
+        # After the tick thread is down (so nothing can start a new line behind us) and before the
+        # mic goes: cancel any synth or playback still in flight. Every other teardown path already
+        # does this — _end_session, and face_track.run()'s finally — but stop() is reachable on its
+        # own, and a speech worker outliving the session it belongs to is how audio from one run
+        # ends up playing into the next. tts.stop() is a no-op when nothing is running.
+        tts.stop()
         self._mic.stop()
 
     def reresolve_mic(self) -> dict:
@@ -1185,14 +1200,26 @@ class ConversationSession:
                 print(f"[session] ERROR in tick: {exc}", flush=True)
 
     def tick(self, now: float) -> None:
-        """Advance every timer. `now` is passed in so tests drive a fake clock with no sleeping."""
+        """Advance every timer. `now` is passed in so tests drive a fake clock with no sleeping.
+
+        The two capture timeouts below do NOT finish their utterance inline. `self._lock` is an
+        RLock, so a nested `with` inside a method called from here is re-entrant — which means the
+        code those methods carefully place *after* their own `with` block, on the stated grounds
+        that "recording inside the lock would put a WAV write on the tick thread", was still inside
+        THIS one. UtteranceRecorder.record() writes up to CAPTURE_HARD_CAP_S of audio, and the audio
+        worker needs this same lock ~30 times a second for the VAD. So the timeout paths hand back a
+        pending dispatch and it runs once the lock is released, which is exactly what _on_audio
+        already does with its own `pending`.
+        """
+        pending: tuple[str, str] | None = None
         with self._lock:
             if self._presence is not None:
                 try:
                     visible, _since, is_fresh = self._presence(now)
                     self._apply_presence(visible, is_fresh, now)
-                except Exception:
+                except Exception as exc:
                     self._face_absent_since = None   # a broken feed must fail open
+                    self._note_presence_error(exc, now)
 
             state = self._state
             elapsed = now - self._state_since
@@ -1238,14 +1265,11 @@ class ConversationSession:
             elif state == STATE_LISTEN_SPEECH:
                 if not self._manual_end and elapsed >= MAX_UTTERANCE_S:
                     self._log("max utterance reached")
-                    # Re-enters the lock (RLock), and calls process_utterance while we hold it. Safe:
-                    # the turn worker's on_done takes this same lock and simply waits for the tick.
-                    self._finish_utterance(now, reason="max_utterance")
+                    pending = ("turn", "max_utterance")   # dispatched below, off the lock
 
             elif state == STATE_SCAN_SPEECH:
                 if elapsed >= WAKE_WHISPER_MAX_UTTERANCE_S:
-                    # Re-enters the lock (RLock), same precedent as the LISTEN_SPEECH cap above.
-                    self._finish_scan(now, reason="too_long")
+                    pending = ("scan", "too_long")        # dispatched below, off the lock
 
             elif state == STATE_SCAN_CHECK:
                 if elapsed >= WAKE_WHISPER_CHECK_MAX_S:
@@ -1279,6 +1303,15 @@ class ConversationSession:
                 self._end_session(now, "mic_lost")
 
             self._heartbeat(now)
+
+        # Outside the lock, by construction rather than by convention: both of these harvest audio,
+        # spawn a worker and write a WAV, and the audio worker is waiting on this lock at ~30 Hz.
+        if pending is not None:
+            kind, reason = pending
+            if kind == "turn":
+                self._finish_utterance(now, reason=reason)
+            else:
+                self._finish_scan(now, reason=reason)
 
     def _end_session(self, now: float, reason: str) -> None:
         """Caller holds the lock. Back to idle, with the conversation forgotten."""
@@ -1454,6 +1487,10 @@ class ConversationSession:
                 "sess_ready": self.ready,
                 "sess_enabled": self.enabled,
                 "sess_epoch": self._epoch,
+                # Who Kai believes it is talking to (ai/identity.py), "" until they say so. Reads
+                # from the assistant rather than being mirrored here, so there is one owner and the
+                # dashboard cannot show a name the prompt no longer carries.
+                "sess_person": self._voice.person_name or "",
                 "sess_wake_ok": self._mic.wake.ready,
                 "sess_wake_error": self._mic.wake.unavailable or "",
                 # Which tier actually won. The first thing to read when someone reports "Kai stopped
@@ -1561,11 +1598,26 @@ class ConversationSession:
             return "unknown"
         try:
             visible, _since, is_fresh = self._presence(now)
-        except Exception:
+        except Exception as exc:
+            self._note_presence_error(exc, now)
             return "unknown"
         if not is_fresh:
             return "unknown"
         return "yes" if visible else "no"
+
+    def _note_presence_error(self, exc: BaseException, now: float) -> None:
+        """Say that the presence feed is broken, at most once a minute.
+
+        Failing open is right — a camera hiccup must never end a conversation — but doing it
+        silently is not: a snapshot callable that raises every time is indistinguishable from a
+        camera that simply cannot see anyone, and sess_face_present reports "unknown" for both.
+        Rate-limited because this is reached from the 20 Hz tick and from every /params snapshot.
+        """
+        detail = f"{type(exc).__name__}: {exc}"
+        if detail == self._presence_error and now - self._presence_error_t < PRESENCE_ERROR_LOG_S:
+            return
+        self._presence_error, self._presence_error_t = detail, now
+        self._log(f"WARNING: presence feed failed ({detail}) — treating presence as unknown")
 
     def _log(self, message: str) -> None:
         # flush=True because stdout is block-buffered into /tmp/face-servo.log under the autostart,
