@@ -16,7 +16,8 @@ import unittest.mock
 from ai import filler
 from config.filler import (
     FILLER_DEFAULT_LANG, FILLER_DELAY_JITTER_S, FILLER_MAX_SILENCE_S, FILLER_MIN_GAP_S,
-    FILLER_OPENERS, FILLER_PLAYBACK_START_BUDGET_S, FILLER_STALL_GAP_JITTER_S, FILLER_STALLS,
+    FILLER_OPENER_COOLDOWN_TURNS, FILLER_OPENERS, FILLER_PLAYBACK_START_BUDGET_S,
+    FILLER_STALL_GAP_JITTER_S, FILLER_STALLS,
 )
 from config.thinking import THINKING_SOUND_DELAY_S
 
@@ -213,6 +214,46 @@ class TestSelection(unittest.TestCase):
         with unittest.mock.patch.dict(filler.FILLER_OPENERS, {"xx": ["only"]}, clear=False):
             key = filler.pick_opener("xx", rng, avoid="filler_op_xx_0")
             self.assertEqual(key, "filler_op_xx_0")
+
+    def test_the_cooldown_is_small_enough_to_bind_on_the_smallest_pool(self):
+        # A window at or above the pool size bars every candidate on every turn, which would make
+        # _off_cooldown's relaxation the normal path instead of the fallback it is written to be.
+        self.assertGreaterEqual(FILLER_OPENER_COOLDOWN_TURNS, 1)
+        self.assertLess(FILLER_OPENER_COOLDOWN_TURNS, min(EXPECTED_OPENERS.values()))
+
+    def test_an_opener_sits_out_the_cooldown_before_it_can_come_back(self):
+        # The second-lap case, which is where this binds: `used` is full, so the once-per-conversation
+        # rung is empty and the window is the only thing left. Driven exactly as session._tick_filler
+        # does it -- append, keep the last COOLDOWN -- on the four-line English pool, the one that
+        # used to settle into A B A B for the rest of a conversation.
+        rng = random.Random(41)
+        used = {f"filler_op_en_{i}" for i in range(EXPECTED_OPENERS["en"])}
+        recent: list[str] = []
+        played: list[str] = []
+        for _ in range(200):
+            key = filler.pick_opener("en", rng, avoid=recent, used=used)
+            self.assertNotIn(key, recent, f"came back inside the window: {played[-4:]} + {key}")
+            played.append(key)
+            recent.append(key)
+            del recent[:-FILLER_OPENER_COOLDOWN_TURNS or None]
+        # And it is still drawing from the whole pool, not just cycling the two the window allows.
+        self.assertEqual(set(played), used)
+
+    def test_a_pool_no_bigger_than_the_window_alternates_rather_than_repeating(self):
+        # The length cap can leave a language with two warm openers (robot, 2026-08-09: "en 2op").
+        # The window then bars everything, and the relaxation has to give up the OLDEST bar first --
+        # a flat fallback to the full pool would hand back the line that just played.
+        rng = random.Random(43)
+        have = {"filler_op_en_0", "filler_op_en_1"}
+        recent: list[str] = []
+        last = ""
+        for _ in range(50):
+            key = filler.pick_opener("en", rng, avoid=recent, have=have)
+            self.assertIn(key, have)
+            self.assertNotEqual(key, last, "back to back on a two-line pool")
+            last = key
+            recent.append(key)
+            del recent[:-FILLER_OPENER_COOLDOWN_TURNS or None]
 
     def test_opener_is_empty_for_an_unknown_language(self):
         # Signals "nothing to say", which is what makes the session fall back to the old "Hmm".
