@@ -30,10 +30,18 @@ random(), so the same reply is always delivered the same way — a canned line d
 runs, a bug reproduces, and tests can assert exact output. `hash()` would not do: Python salts it per
 process, so the same text would shape differently after a restart.
 
-TAGALOG: the conjunction and opener lists are English (see config/voice.py). A Tagalog reply simply
-matches nothing and passes through unshaped, which is the intended degradation — Kai reads Tagalog in
-an English-accented voice already (the voice is en_US — see config/voice.py TTS_VOICE_MODEL), and
-inventing Tagalog discourse markers is a bigger claim than this module should make.
+TAGALOG (updated 2026-08-11): the BREATH list now carries Tagalog connectives — pero, kasi, kaya,
+tapos, kung, habang, para — approved by a Tagalog speaker, so a Tagalog reply is no longer passed
+through completely unshaped. It previously was, which meant the language the room actually speaks got
+none of this module's benefit.
+
+The OPENERS remain English-only, and that asymmetry is deliberate rather than unfinished. Breaths
+insert PUNCTUATION and add no words, so they cannot be mispronounced. An opener adds a word for the
+voice to say — and the voice is en_US with no Filipino alternative anywhere offline (Piper ships no
+tl/fil/ceb in 173 voices; swapping only the espeak phonemizer keeps Kai's pitch but was judged no
+better by a native speaker; see docs/plan/wip/natural-audio-plan.md). Handing that voice new Tagalog
+words to pronounce is the one change here with a known downside, so it was considered and dropped.
+Do not "finish the job" by adding Tagalog openers without a fresh ear test.
 
 VERIFYING A CHANGE TO THE WORD/PUNCTUATION LISTS: espeak-ng (Piper's phonemizer) voices some strings
 in ways you cannot hear from reading them — config/thinking.py records "Hmmmm..." coming back as
