@@ -173,6 +173,59 @@ class TestServoGesture(unittest.TestCase):
         s._ser.write.assert_called_once_with(b"G:R\n")
 
 
+class TestServoMainLoopNeverBlocks(unittest.TestCase):
+    """The two calls the MAIN TRACKING LOOP makes must never wait on the serial lock.
+
+    The control thread holds that lock for the whole of a USB reconnect — _reconnect() sleeps 2 s
+    for the Arduino to reboot, and _ensure_usb() can add a modprobe plus another 1.5 s on top. A
+    blocking acquire on the tracking loop therefore freezes face tracking, the speaking jaw AND the
+    dashboard status publisher for seconds at a time, every time a flaky CH340 flaps.
+
+    Both calls are cosmetic and self-correcting (the jaw is re-sent at 20 Hz, a gesture is a one-off
+    social cue), so dropping one is strictly better than stalling the loop that drives everything.
+    """
+
+    def _held_lock(self, s):
+        """Hold s._lock on another thread, as a reconnect would. Returns the release event."""
+        acquired = threading.Event()
+        release  = threading.Event()
+
+        def holder():
+            with s._lock:
+                acquired.set()
+                release.wait(5.0)
+
+        threading.Thread(target=holder, daemon=True).start()
+        self.assertTrue(acquired.wait(2.0), "helper thread never took the lock")
+        return release
+
+    def test_send_jaw_gives_up_rather_than_waiting(self):
+        s = make_servo()
+        release = self._held_lock(s)
+        try:
+            t0 = time.monotonic()
+            self.assertFalse(s.send_jaw(150))
+            self.assertLess(time.monotonic() - t0, 0.5)
+        finally:
+            release.set()
+
+    def test_send_gesture_gives_up_rather_than_waiting(self):
+        s = make_servo()
+        release = self._held_lock(s)
+        try:
+            t0 = time.monotonic()
+            self.assertFalse(s.send_gesture("nod"))
+            self.assertLess(time.monotonic() - t0, 0.5,
+                            "send_gesture blocked the tracking loop on the serial lock")
+        finally:
+            release.set()
+
+    def test_send_gesture_reports_success_when_the_lock_is_free(self):
+        s = make_servo()
+        self.assertTrue(s.send_gesture("nod"))
+        s._ser.write.assert_called_once_with(b"G:N\n")
+
+
 class TestServoCenter(unittest.TestCase):
     def test_center_sends_90_90_90(self):
         s = make_servo()
