@@ -80,12 +80,37 @@ FILLER_OPENERS = {
         "Sandali lang, tao rin ako, charot, robot ako! Itong gumagalaw kong ulo, sinasalamin ka lang.",
         "May lag ang utak ko pero wala sa puso! Developer kit kasi ang loob ko, same sa drones.",
     ],
-    # Base Bisaya/Cebuano, mixed with Tagalog/English
+    # Base Bisaya/Cebuano, mixed with Tagalog/English.
+    #
+    # TUNED FOR NORTHERN MINDANAO (2026-08-12), because that is where the chapters are: DEVCON
+    # lists Bukidnon and Iligan as active and Cebu as a separate chapter entirely (see
+    # documents/devcon_faq_rag.md). The dialect written here is therefore Bisaya as spoken around
+    # Malaybalay/Valencia and Iligan, not Cebu City Cebuano. Three things follow, and they are the
+    # reason these lines look the way they do:
+    #
+    #   * NO CEBU PLACENAMES. "tiangge sa Colon" was the original and Colon Street is Cebu City --
+    #     it means nothing in Bukidnon and reads as a foreign reference in Iligan. "merkado" is
+    #     deliberately generic because Bukidnon and Iligan share no market: if a demo is fixed to
+    #     one city, name THAT city's (Cogon for the CDO side, Palao for Iligan) and it lands much
+    #     harder. A wrong local reference is worse than no local reference.
+    #   * KEEP THE "gina-" PROGRESSIVE. "gina-process", "Ginaproseso" -- this is a real Mindanao
+    #     marker; Cebu City leans on "gi-". It is the most locally-correct thing in the bank and
+    #     anyone tidying these lines toward textbook Cebuano should leave it alone.
+    #   * "huwat", not the standard spelling "hulat". A SPELLING CHOICE MADE FOR THE PHONEMIZER, not
+    #     for the reader: every line here is spoken by an American English voice under English
+    #     phonetics (see the CORRECTED note above), and "hulat" invites the /hjuː/ reading.
+    #
+    # Corrected in the same pass, all four openers and one stall: "Wa nako kadungog" (nako is
+    # genitive and collides with the ka- verb), "mao paspas" (bare mao cannot carry "that's why"),
+    # "sa akong nawong" (nawong is the face; the Jetson is in her head), "ayaw ko'g i-off" (the 'g
+    # ligature does not belong before i-), "Wala koy kinahanglan nga internet" (a literal
+    # translation of the English), and the stall "Balik-balika nga" (nga as a softener is Tagalog;
+    # in Cebuano it is a linker). These were errors, not regional variation.
     "ceb": [
-        "Kusog kaayo ang saba diri, murag tiangge sa Colon! Naa'y NVIDIA Jetson Orin Nano sa akong nawong.",
-        "Huwat sa gamay, naghuna-huna pa ko! Wala koy kinahanglan nga internet, offline ra ko molihok bisan asa.",
-        "Wa nako kadungog, murag naay nag-videoke sa luyo! Ang DEVCON Jumpstart Cohort 4 interns maoy naghimo nako.",
-        "Sandali ra, gina-process pa nako, ayaw ko'g i-off! CUDA ug TensorRT akong gamit, mao paspas kaayo ko.",
+        "Kusog kaayo ang saba diri, murag tiangge sa merkado! Naa'y NVIDIA Jetson Orin Nano sa akong ulo.",
+        "Huwat sa gamay, naghuna-huna pa ko! Dili ko manginahanglan ug internet, offline ra ko bisan asa.",
+        "Wa ko kadungog, murag naay nag-videoke sa luyo! Ang DEVCON Jumpstart Cohort 4 interns maoy naghimo nako.",
+        "Kadali ra, gina-process pa nako, ayaw ko i-off! CUDA ug TensorRT akong gamit, maong paspas kaayo ko.",
     ],
     # Base English, mixed with Taglish flavor
     "en": [
@@ -130,7 +155,7 @@ FILLER_STALLS = {
     ],
     "ceb": [
         "Huwat sa.",
-        "Balik-balika nga.",
+        "Balika daw.",
         "Hapit na.",
         "Ginaproseso pa.",
         "Huwat lang.",

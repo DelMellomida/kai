@@ -20,6 +20,56 @@ Conventions:
 
 ---
 
+## 2026-08-12 — The Bisaya filler was Cebu Bisaya, in a room full of Bukidnon and Iligan
+
+Read for dialect rather than for code. The `ceb` bank in `config/filler.py` is understandable
+anywhere Cebuano is spoken, but it was not written for the chapters that will hear it: DEVCON lists
+**Bukidnon and Iligan** as active and Cebu as a separate chapter entirely
+(`documents/devcon_faq_rag.md`). One line named a Cebu City street; four carried grammar errors that
+mark the text as written by a non-speaker rather than as a regional accent. All four openers and one
+stall changed. No code changed — this is content only, so the 47 tests in `tests/test_filler.py`
+that police the bank (ASCII-only, sentence shape, stall length) still pass unaltered.
+
+- **`"tiangge sa Colon"` was the only outright geographic error.** Colon Street is Cebu City. It
+  means nothing in Malaybalay or Valencia and reads as a foreign reference in Iligan — worse than no
+  local reference at all. Now `"tiangge sa merkado"`, deliberately generic, because Bukidnon and
+  Iligan share no market between them. A demo pinned to one city should name that city's (Cogon on
+  the CDO side, Palao for Iligan); the comment in the file says so.
+- **Four grammar errors and one Tagalog particle.** `"Wa nako kadungog"` -> `"Wa ko kadungog"`
+  (`nako` is genitive and collides with the `ka-` verb); `"mao paspas kaayo ko"` -> `"maong ..."`
+  (bare `mao` cannot carry "that's why"); `"sa akong nawong"` -> `"sa akong ulo"` (`nawong` is the
+  face, and the Jetson is in her head); `"ayaw ko'g i-off"` -> `"ayaw ko i-off"`; `"Wala koy
+  kinahanglan nga internet"` -> `"Dili ko manginahanglan ug internet"` (the first is a literal
+  translation of the English). The stall `"Balik-balika nga."` -> `"Balika daw."` — `nga` as a
+  softener is Tagalog; in Cebuano it is a linker.
+- **What was deliberately left alone.** The `gina-` progressive (`"gina-process"`, `"Ginaproseso"`)
+  is a genuine Mindanao marker where Cebu City leans on `gi-` — it is the most locally-correct thing
+  in the bank and a tidy-up toward textbook Cebuano would remove it. `"huwat"` stays misspelled for
+  `"hulat"` because it is a choice made for the **phonemizer**, not the reader: every line here is
+  spoken by an American English voice under English phonetics, and `"hulat"` invites the /hjuː/
+  reading. Both are now written down in the file so the next editor does not "fix" them.
+
+**`scripts/filler_check.py` cannot score this bank, and the run proves it rather than assuming it.**
+All 14 `ceb` lines came back at overlap **0.00** — including the nine stalls this change never
+touched. That is the checker's documented limit (Whisper transcribing Bisaya through a
+mostly-English model), not a defect in the lines: the failure it exists to catch is espeak spelling
+a word out letter by letter, and nothing did. `"Ay, huwat sa."` was heard as `"I, you, what's up?"`
+and `"Hapit na."` as `"Happy New Year!"` — wrong words, but words. The objective half of the check
+did pass: measured on the robot, the four openers run **7.06 / 7.66 / 7.71 / 8.69 s** against
+`FILLER_MAX_LINE_S` 10.0, and every stall **0.88-1.61 s** against `FILLER_MAX_STALL_S` 1.8, so
+nothing new will be silently dropped by the length cap at prewarm. WAVs kept at
+`/tmp/kai_filler_ceb` for the by-ear pass, which a native Bukidnon or Iligan speaker still owes this
+change. Note that the script's own `MAX_STALL_S` (1.2) is stricter than the constant that actually
+governs shipping (1.8), so it flags four stalls that the robot will happily cache.
+
+Suite unchanged by this entry — no code was touched, and `tests/test_filler.py` is 47/47. The two
+platform-split pre-existing failures it ran into are the ones the entry below already names and
+confirms independently: on the Jetson,
+`TestAmbientAdaptation::test_without_adaptation_the_same_room_never_closes_the_utterance`
+(measured here as deterministic — three full runs of three, and again in isolation, with uptime at
+216 808 s, so it is not the clock flake), and on Windows, `TestImportPvporcupine`. Restart-only: the bank is pre-synthesised at startup, so the old WAVs play until
+`face_track.py` is restarted.
+
 ## 2026-08-12 — The jaw moved before the "Yes?" came out
 
 Reported on the robot: say "Hey Kai", and the mouth moves first with the acknowledgement arriving
