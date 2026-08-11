@@ -2,6 +2,7 @@ import re
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from servo.servo import ServoSerial, SEND_INTERVAL, SERVO_MIN, SERVO_MAX, PAN_DEADBAND
@@ -234,6 +235,73 @@ class TestServoConcurrency(unittest.TestCase):
         self.assertGreater(len(writes), 0, "no writes recorded — test didn't exercise the path")
         for data in writes:
             self.assertRegex(data, self._LINE_RE)
+
+
+class TestFirmwareAngleLimits(unittest.TestCase):
+    """The firmware's copy of the travel limits, checked against config/servo.py.
+
+    R4 asks the sketch to clamp to the same window as the host, "with a comment pointing at
+    config/servo.py as the source of truth they must be kept in step with". A comment is not a
+    mechanism — the two files are in different languages, one of them is not executed by anything
+    in this repo, and the sketch only reaches the robot when a human remembers to flash it. This
+    class is the mechanism.
+
+    It reads the real .ino. It cannot prove the firmware BEHAVES correctly — only hardware can do
+    that, and R4's on-hardware criterion is deferred for exactly that reason — but drift between
+    the two constants is the failure that would otherwise go unnoticed for months, and that it can
+    prove."""
+
+    _INO = Path(__file__).parent.parent / "arduino" / "servo_serial" / "servo_serial.ino"
+
+    def setUp(self):
+        if not self._INO.is_file():
+            self.skipTest(f"sketch not found at {self._INO}")
+        self.source = self._INO.read_text(encoding="utf-8")
+        self.code = self._strip_comments(self.source)
+
+    @staticmethod
+    def _strip_comments(source: str) -> str:
+        """Source with // and /* */ comments removed.
+
+        The banned-idiom checks below have to run against CODE. This file's comments explain at
+        length why toInt() and constrain(..., 0, 180) are wrong, and a plain substring search over
+        the whole file matches that explanation and fails on the very change that fixed it — which
+        is what happened when this was first written. Naming the mistake is not committing it."""
+        source = re.sub(r"/\*.*?\*/", " ", source, flags=re.DOTALL)
+        return re.sub(r"//[^\n]*", " ", source)
+
+    def _const(self, name: str) -> int:
+        m = re.search(rf"^const\s+int\s+{name}\s*=\s*(\d+)\s*;", self.code, re.MULTILINE)
+        self.assertIsNotNone(m, f"{name} not found in {self._INO.name}")
+        return int(m.group(1))
+
+    def test_angle_min_matches_config(self):
+        self.assertEqual(self._const("ANGLE_MIN"), SERVO_MIN)
+
+    def test_angle_max_matches_config(self):
+        self.assertEqual(self._const("ANGLE_MAX"), SERVO_MAX)
+
+    def test_no_full_range_constrain_remains(self):
+        # The defect itself: constrain(..., 0, 180) is the full mechanical range, which is the one
+        # window the SG90 must not be driven to. Written as a search over the source rather than a
+        # count, so it fails on a NEW one as well as on a surviving one.
+        offenders = re.findall(r"constrain\s*\([^;]*?,\s*0\s*,\s*180\s*\)", self.code)
+        self.assertEqual(offenders, [], f"full-range constrain() still in the sketch: {offenders}")
+
+    def test_no_toint_coercion_remains(self):
+        # String::toInt() returns 0 for anything it cannot parse, and 0 is a slam into the stop —
+        # so the one input it cannot report is also the worst thing it can command.
+        self.assertNotIn("toInt()", self.code,
+                         f"toInt() still called in {self._INO.name}; use parseAngle() instead")
+
+    def test_parser_digit_cap_admits_every_legal_angle(self):
+        # parseAngle() rejects fields longer than 3 digits. That is only safe while every angle the
+        # host can emit is at most 3 digits, which SERVO_MAX bounds. Pins the link between the two
+        # so raising SERVO_MAX past 999 cannot silently make the firmware reject valid commands.
+        self.assertGreaterEqual(SERVO_MIN, 0)
+        self.assertLessEqual(SERVO_MAX, 999)
+        for angle in (SERVO_MIN, SERVO_MAX, (SERVO_MIN + SERVO_MAX) // 2):
+            self.assertLessEqual(len(str(angle)), 3)
 
 
 if __name__ == '__main__':

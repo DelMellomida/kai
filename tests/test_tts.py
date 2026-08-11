@@ -112,8 +112,18 @@ class TestClampForSpeech(unittest.TestCase):
 
 
 class TestLiveSettings(_ResetProcState):
-    """TTS reads its three dashboard knobs at the point of use, so a change applies to the very next
-    thing Kai says — no restart, no engine reload."""
+    """TTS reads its dashboard knobs at the point of use, so a change applies to the very next thing
+    Kai says — no restart, no engine reload."""
+
+    # Every knob _run_piper pulls. Kept as one dict so a new prosody parameter fails loudly here
+    # (KeyError) rather than silently never being passed.
+    LIVE = {"tts_volume": 1.75, "tts_length_scale": 1.0, "tts_enabled": True,
+            "tts_sentence_silence": 0.35, "tts_noise_scale": 0.667, "tts_noise_w": 0.8}
+
+    @staticmethod
+    def _argv_after(popen, flag):
+        argv = popen.call_args[0][0]
+        return argv[argv.index(flag) + 1]
 
     def test_enabled_follows_the_setting(self):
         with patch("ai.tts.voice_model_path", return_value=Path(__file__)):
@@ -124,21 +134,89 @@ class TestLiveSettings(_ResetProcState):
 
     def test_piper_gets_the_live_rate(self):
         proc = _fake_proc()
-        live = {"tts_volume": 1.75, "tts_length_scale": 0.8, "tts_enabled": True}
+        live = {**self.LIVE, "tts_length_scale": 0.8}
         with patch("ai.tts.voice_model_path", return_value=Path(__file__)), \
              patch("ai.tts.settings.get", side_effect=lambda name: live[name]), \
              patch("subprocess.Popen", return_value=proc) as popen, \
              patch("pathlib.Path.is_file", return_value=True), \
              patch("pathlib.Path.stat", return_value=MagicMock(st_size=1024)):
             tts._run_piper("hi", Path("/tmp/x.wav"))
+        self.assertEqual(self._argv_after(popen, "--length-scale"), "0.8")
+
+    def test_piper_gets_the_live_prosody_parameters(self):
+        """The three parameters that were never passed before 2026-08-10. --sentence-silence is the
+        one that matters: Piper's default is 0, which is why Kai used to run four sentences together
+        without a breath. See config/voice.py for the measurements."""
+        proc = _fake_proc()
+        live = {**self.LIVE, "tts_sentence_silence": 0.4, "tts_noise_scale": 0.7,
+                "tts_noise_w": 1.1}
+        with patch("ai.tts.voice_model_path", return_value=Path(__file__)), \
+             patch("ai.tts.settings.get", side_effect=lambda name: live[name]), \
+             patch("subprocess.Popen", return_value=proc) as popen, \
+             patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.stat", return_value=MagicMock(st_size=1024)):
+            tts._run_piper("hi", Path("/tmp/x.wav"))
+        self.assertEqual(self._argv_after(popen, "--sentence-silence"), "0.4")
+        self.assertEqual(self._argv_after(popen, "--noise-scale"), "0.7")
+        self.assertEqual(self._argv_after(popen, "--noise-w-scale"), "1.1")
+
+    def test_the_flag_spellings_are_the_ones_this_piper_accepts(self):
+        """Pinned deliberately. These were read off `python3 -m piper --help` on the robot against
+        piper-tts 1.4.2; Piper rejects an unknown flag by exiting non-zero, which _run_piper reports
+        as a failed synthesis — i.e. a wrong spelling here makes EVERY reply silent, and the log says
+        nothing about flags. If a piper upgrade renames one, this test is where it should break."""
+        proc = _fake_proc()
+        with patch("ai.tts.voice_model_path", return_value=Path(__file__)), \
+             patch("ai.tts.settings.get", side_effect=lambda name: self.LIVE[name]), \
+             patch("subprocess.Popen", return_value=proc) as popen, \
+             patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.stat", return_value=MagicMock(st_size=1024)):
+            tts._run_piper("hi", Path("/tmp/x.wav"))
         argv = popen.call_args[0][0]
-        self.assertEqual(argv[argv.index("--length-scale") + 1], "0.8")
+        for flag in ("--length-scale", "--sentence-silence", "--noise-scale", "--noise-w-scale"):
+            self.assertIn(flag, argv)
+
+    def test_normalisation_is_skipped_only_when_sox_will_do_it_instead(self):
+        """Piper normalises every sentence to full scale, which is why no two sentences Kai says ever
+        differed in peak level. Handing that to sox's single `gain -n -1` keeps the relative
+        differences — but only if sox is actually in the chain, since raw Piper output is ~10 dB
+        quieter. TTS_POST_PROCESS off must therefore leave Piper normalising."""
+        for normalize, post, expected in ((False, True, True), (False, False, False),
+                                          (True, True, False)):
+            with self.subTest(normalize=normalize, post_process=post):
+                proc = _fake_proc()
+                with patch("ai.tts.TTS_PIPER_NORMALIZE", normalize), \
+                     patch("ai.tts.TTS_POST_PROCESS", post), \
+                     patch("ai.tts.voice_model_path", return_value=Path(__file__)), \
+                     patch("ai.tts.settings.get", side_effect=lambda name: self.LIVE[name]), \
+                     patch("subprocess.Popen", return_value=proc) as popen, \
+                     patch("pathlib.Path.is_file", return_value=True), \
+                     patch("pathlib.Path.stat", return_value=MagicMock(st_size=1024)):
+                    tts._run_piper("hi", Path("/tmp/x.wav"))
+                argv = popen.call_args[0][0]
+                self.assertEqual("--no-normalize" in argv, expected)
+                # Whatever happens, the output file must stay the last argument pair.
+                self.assertEqual(argv[-2], "-f")
+
+    def test_a_length_scale_override_leaves_the_other_parameters_live(self):
+        """synthesize_to_duration drives --length-scale directly to fit a cached line to a target
+        length. That override must not quietly reset the prosody parameters to Piper's defaults, or a
+        fitted filler line would come out with no sentence pause while every reply had one."""
+        proc = _fake_proc()
+        with patch("ai.tts.voice_model_path", return_value=Path(__file__)), \
+             patch("ai.tts.settings.get", side_effect=lambda name: self.LIVE[name]), \
+             patch("subprocess.Popen", return_value=proc) as popen, \
+             patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.stat", return_value=MagicMock(st_size=1024)):
+            tts._run_piper("hi", Path("/tmp/x.wav"), length_scale=2.5)
+        self.assertEqual(self._argv_after(popen, "--length-scale"), "2.5")
+        self.assertEqual(self._argv_after(popen, "--sentence-silence"), "0.35")
 
     def test_synthesis_does_not_apply_volume(self):
         # Piper's --volume is normalised straight back out by TTS_POST_EFFECTS (`gain -n -1`), and
         # values above ~1.2 clip the raw audio. Volume belongs at playback — see play().
         proc = _fake_proc()
-        live = {"tts_volume": 1.75, "tts_length_scale": 1.0, "tts_enabled": True}
+        live = self.LIVE
         with patch("ai.tts.voice_model_path", return_value=Path(__file__)), \
              patch("ai.tts.settings.get", side_effect=lambda name: live[name]), \
              patch("subprocess.Popen", return_value=proc) as popen, \
@@ -178,6 +256,46 @@ class TestLiveSettings(_ResetProcState):
         calls = self._paplay_argv(popen)
         self.assertTrue(calls, "play() must invoke paplay")
         self.assertIn("--volume=0", calls[0])
+
+
+class TestSoxChain(unittest.TestCase):
+    """The effect ORDER is the whole design (see ai/tts._sox_chain), and it is not visible from the
+    config lists on their own — so it is pinned here."""
+
+    LOUD = ["compand", "0.3,1", "6:-70,-60,-20", "-5", "-90", "0.2", "gain", "-n", "-1"]
+
+    def test_highpass_runs_before_the_compand(self):
+        # After the compressor has spent its headroom on sub-90 Hz energy, removing it is too late.
+        with patch("ai.tts.TTS_POST_HIGHPASS", ["highpass", "90"]), \
+             patch("ai.tts.TTS_POST_EFFECTS", self.LOUD), \
+             patch("ai.tts.TTS_POST_ROOM", []):
+            chain = tts._sox_chain()
+        self.assertLess(chain.index("highpass"), chain.index("compand"))
+
+    def test_room_runs_after_the_compand_and_is_renormalised(self):
+        # Reverb adds energy after the loudness chain's own `gain -n -1`, so the peak must be pulled
+        # back down or the output sits above -1 dB.
+        with patch("ai.tts.TTS_POST_HIGHPASS", ["highpass", "90"]), \
+             patch("ai.tts.TTS_POST_EFFECTS", self.LOUD), \
+             patch("ai.tts.TTS_POST_ROOM", ["reverb", "18", "50", "28", "100", "0", "-4"]):
+            chain = tts._sox_chain()
+        self.assertGreater(chain.index("reverb"), chain.index("compand"))
+        self.assertEqual(chain[-3:], ["gain", "-n", "-1"])
+        self.assertGreater(len(chain) - 3, chain.index("reverb"))
+
+    def test_both_empty_is_byte_identical_to_the_old_chain(self):
+        """The revert path. Emptying both constants must reproduce the pre-2026-08-11 command line
+        exactly, not merely something equivalent."""
+        with patch("ai.tts.TTS_POST_HIGHPASS", []), \
+             patch("ai.tts.TTS_POST_EFFECTS", self.LOUD), \
+             patch("ai.tts.TTS_POST_ROOM", []):
+            self.assertEqual(tts._sox_chain(), self.LOUD)
+
+    def test_no_room_means_no_second_normalise(self):
+        with patch("ai.tts.TTS_POST_HIGHPASS", ["highpass", "90"]), \
+             patch("ai.tts.TTS_POST_EFFECTS", self.LOUD), \
+             patch("ai.tts.TTS_POST_ROOM", []):
+            self.assertEqual(tts._sox_chain().count("gain"), 1)
 
 
 class TestOutputCardProfile(_ResetProcState):
