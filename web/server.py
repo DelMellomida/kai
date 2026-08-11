@@ -28,7 +28,7 @@ import settings
 from ai import rag
 from ai.wake_phrase import match_wake_phrase
 from app import lifecycle
-from config.tracking import REBOOT_ENABLED, UPLOAD_DIR
+from config.tracking import REBOOT_ENABLED, UPLOAD_DIR, WEB_PUBLISH_INTERVAL
 
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 try:
@@ -134,7 +134,16 @@ class Dashboard:
         def _params_stream():
             def _gen():
                 while True:
-                    yield f'data: {json.dumps(dash.params_snapshot())}\n\n'
+                    # Through the cache, not straight to params_snapshot(): every open tab has its
+                    # own generator thread on this line, and the build behind it takes the session
+                    # RLock that the audio worker and the session tick need. WEB_PUBLISH_INTERVAL is
+                    # the right max-age because it is the rate the producers actually write at — a
+                    # shorter one would rebuild to get the same dict back. Each client keeps its own
+                    # _PARAMS_POLL_S cadence, so the SSE contract is unchanged; they just share the
+                    # work now. See DashboardState.cached_snapshot.
+                    snap = dash.state.cached_snapshot(
+                        dash.params_snapshot, time.monotonic(), WEB_PUBLISH_INTERVAL)
+                    yield f'data: {json.dumps(snap)}\n\n'
                     time.sleep(_PARAMS_POLL_S)
             return Response(_gen(), mimetype='text/event-stream',
                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})

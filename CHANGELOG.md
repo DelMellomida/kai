@@ -20,46 +20,6 @@ Conventions:
 
 ---
 
-## 2026-08-11 — The main loop ran 200 times a second to decide it had nothing to do
-
-Suite green: 1263 passed, 2710 subtests (was 1254, 2710). Implements
-[R2](docs/tickets/R2-idle-spin-loop-gil-contention.md). Measured **185.0 Hz → 22.0 Hz on the idle
-path, 8.4× fewer iterations** — on the dev box, not the Jetson; see the caveat at the end.
-
-- **The loop polled for frames instead of waiting for them.** `CameraThread.latest()` is
-  non-blocking and returns `None` until a fresh frame arrives, so `face_track.run()` slept
-  `NO_FRAME_SLEEP` (5 ms) and went round again. With `--no-camera`, an unprobed camera, a stalled
-  feed, or simply between frames at 30 fps, that is ~200 iterations a second — each doing real work
-  before deciding there was nothing to do: a `settings.get()` under an `RLock`, a
-  `speaking_openness()` call taking the assistant lock, a time comparison.
-- **All of it holds the GIL, which `config/tracking.py` records as the resource this box actually
-  runs out of.** The note on `INFERENCE_FPS` measured raising perception 15 → 22 fps collapsing the
-  pure-Python control thread from ~14 Hz to 6–10 Hz, with CPU, memory and thermals all in hand. A
-  permanent 200 Hz Python loop contends for exactly that, alongside the 15 Hz control thread, the
-  20 Hz session tick and the ~30 blocks/s audio worker — and it is worst in the degraded states
-  (`--no-camera`, stalled feed) where the servo and voice paths are the only things still working.
-- **`CameraThread` now signals a stored frame; the loop blocks on it.** A `threading.Event` set and
-  cleared *inside* `_lock` alongside `_frame`, which makes "event set" and "frame waiting" the same
-  fact rather than two that can disagree — the failure mode being a set event with nothing behind
-  it, which restores the full-speed spin silently and with nothing else looking different.
-  `close()` sets it too, so shutdown does not pay out a timeout on a loop that is already stopping.
-- **This is not a latency trade.** The old path slept a fixed 5 ms and could not notice a frame that
-  arrived 0.1 ms into it; the loop now wakes on the store itself, so a frame is picked up sooner
-  than the poll managed on average.
-- **The wait is bounded by `WEB_PUBLISH_INTERVAL` (0.04), not `JAW_SEND_INTERVAL` (0.05).** R2
-  suggested the latter, and it would have quietly dropped `/params` and the `cam_retry_in_s`
-  countdown from 25 Hz to 20 Hz — which the same ticket's third acceptance criterion forbids. The
-  ticket's criteria disagreed with each other and the tighter obligation wins. Written as
-  `NO_FRAME_WAIT = WEB_PUBLISH_INTERVAL` rather than a literal so the two cannot drift, with
-  `tests/test_settings.py::TestIdleWaitBounds` pinning it against `JAW_SEND_INTERVAL` as well — the
-  two constants live in config modules that deliberately import nothing, so a test is the only place
-  that relationship can be stated.
-
-What is still unproven: the measurement above is off-robot, and the *reason* for the change — GIL
-headroom for the 15 Hz control thread — is a Jetson claim. `[control] N Hz` with `--no-camera`
-should now read at or above its old value, and that number is worth capturing before and after on
-the next deploy. R2's two on-hardware criteria stay open until it is.
-
 ## 2026-08-11 — One corrupted byte on the servo wire could slam the head into its stop
 
 Suite green: 1254 passed, 2710 subtests (was 1249, 2710). Implements
@@ -110,6 +70,80 @@ still answers a reset with `READY` afterwards — so the parser does not wedge, 
 mode a hand-rolled one would actually have. **What could not be checked remotely is that the rejected
 lines produced no motion**: the link is fire-and-forget with no echo, so the board says nothing that
 distinguishes "rejected" from "moved". That half needs someone watching the head.
+
+## 2026-08-11 — Every extra dashboard tab took the session lock 20 more times a second
+
+Suite green: 1270 passed, 2710 subtests (was 1263, 2710). Implements
+[S2](docs/tickets/S2-params-sse-snapshot-per-client.md).
+
+- **The cost scaled with the number of open tabs, on the locks the robot needs most.** Each
+  connected browser gets its own Flask generator thread calling `params_snapshot()` 20 times a
+  second, and that builds a ~70-key dict from four sources. One of them, `session.get_status()`,
+  holds the session `RLock` for most of its body and takes the assistant lock *inside* it — the same
+  `RLock` the ~30 blocks/s audio worker needs for VAD and the 20 Hz session tick holds. Two or three
+  tabs at a venue is a realistic load that had never been tested.
+- **And it was pure overhead.** The publishers only write at 25 Hz (`WEB_PUBLISH_INTERVAL`), so most
+  of that work produced JSON byte-identical to the previous tick. `DashboardState.cached_snapshot()`
+  now sits in front, with `WEB_PUBLISH_INTERVAL` as the max age — the rate the data can actually
+  change at, rather than a number chosen to feel safe.
+- **Measured builds per second: 1 tab 20.0 → 20.0, 2 tabs 40.0 → 20.0, 3 tabs 60.0 → 20.0, 5 tabs
+  100.0 → 20.0, 8 tabs 160.0 → 20.0.** Flat. **The single-tab case saves nothing** —
+  `_PARAMS_POLL_S` (0.05) is longer than `WEB_PUBLISH_INTERVAL` (0.04), so one client's polls always
+  find the cache expired. The ticket is about load scaling with tab count, and that is what goes
+  away; nobody testing with one tab open will see a difference, which is worth knowing before
+  someone concludes the change did nothing.
+- **One builder, not a thundering herd.** The ticket sketched the build outside any lock and accepted
+  duplicate builds under a race as harmless. It is harmless for correctness, but "a new client
+  connecting does not trigger an extra build" is one of the ticket's own criteria, and a wave of
+  tabs hitting a cold cache is exactly that case. A second `_build_lock` admits one builder; the
+  losers wait, re-check, and find the fresh snapshot. `build()` still never runs under the lock that
+  guards the cached value, so a slow `session.get_status()` cannot serialise readers.
+
+What is unchanged: `params_snapshot()` itself is untouched and still directly testable, the SSE key
+set and per-client cadence are identical, and `dashboard.html` needed no changes. What is unproven:
+the criterion that matters most — three `/params` clients plus a `/video` client with
+`[control] N Hz` holding and `sess_blocks_dropped` flat — measures contention on the robot and stays
+open.
+
+## 2026-08-11 — The main loop ran 200 times a second to decide it had nothing to do
+
+Suite green: 1263 passed, 2710 subtests (was 1254, 2710). Implements
+[R2](docs/tickets/R2-idle-spin-loop-gil-contention.md). Measured **185.0 Hz → 22.0 Hz on the idle
+path, 8.4× fewer iterations** — on the dev box, not the Jetson; see the caveat at the end.
+
+- **The loop polled for frames instead of waiting for them.** `CameraThread.latest()` is
+  non-blocking and returns `None` until a fresh frame arrives, so `face_track.run()` slept
+  `NO_FRAME_SLEEP` (5 ms) and went round again. With `--no-camera`, an unprobed camera, a stalled
+  feed, or simply between frames at 30 fps, that is ~200 iterations a second — each doing real work
+  before deciding there was nothing to do: a `settings.get()` under an `RLock`, a
+  `speaking_openness()` call taking the assistant lock, a time comparison.
+- **All of it holds the GIL, which `config/tracking.py` records as the resource this box actually
+  runs out of.** The note on `INFERENCE_FPS` measured raising perception 15 → 22 fps collapsing the
+  pure-Python control thread from ~14 Hz to 6–10 Hz, with CPU, memory and thermals all in hand. A
+  permanent 200 Hz Python loop contends for exactly that, alongside the 15 Hz control thread, the
+  20 Hz session tick and the ~30 blocks/s audio worker — and it is worst in the degraded states
+  (`--no-camera`, stalled feed) where the servo and voice paths are the only things still working.
+- **`CameraThread` now signals a stored frame; the loop blocks on it.** A `threading.Event` set and
+  cleared *inside* `_lock` alongside `_frame`, which makes "event set" and "frame waiting" the same
+  fact rather than two that can disagree — the failure mode being a set event with nothing behind
+  it, which restores the full-speed spin silently and with nothing else looking different.
+  `close()` sets it too, so shutdown does not pay out a timeout on a loop that is already stopping.
+- **This is not a latency trade.** The old path slept a fixed 5 ms and could not notice a frame that
+  arrived 0.1 ms into it; the loop now wakes on the store itself, so a frame is picked up sooner
+  than the poll managed on average.
+- **The wait is bounded by `WEB_PUBLISH_INTERVAL` (0.04), not `JAW_SEND_INTERVAL` (0.05).** R2
+  suggested the latter, and it would have quietly dropped `/params` and the `cam_retry_in_s`
+  countdown from 25 Hz to 20 Hz — which the same ticket's third acceptance criterion forbids. The
+  ticket's criteria disagreed with each other and the tighter obligation wins. Written as
+  `NO_FRAME_WAIT = WEB_PUBLISH_INTERVAL` rather than a literal so the two cannot drift, with
+  `tests/test_settings.py::TestIdleWaitBounds` pinning it against `JAW_SEND_INTERVAL` as well — the
+  two constants live in config modules that deliberately import nothing, so a test is the only place
+  that relationship can be stated.
+
+What is still unproven: the measurement above is off-robot, and the *reason* for the change — GIL
+headroom for the 15 Hz control thread — is a Jetson claim. `[control] N Hz` with `--no-camera`
+should now read at or above its old value, and that number is worth capturing before and after on
+the next deploy. R2's two on-hardware criteria stay open until it is.
 
 ## 2026-08-11 — Kai never took a breath, and spoke in no room at all
 
@@ -372,7 +406,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
     actually rejects. Actively working today: the decoder bias, the skeleton matcher, the
     gazetteer's query expansion, the per-chunk titles, and the primer as a ranked document.
 
-
 ## 2026-08-07 — Bare "hey" wakes Kai on the Whisper tier
 - The wake phrase on tier 3 is now **"hey"** — the name is optional. `"Hey Kai"` still works and still
   wins when the name is recognized; `"hey"` alone is a third accepted form in `ai/wake_phrase.py`.
@@ -398,7 +431,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   `WAKE_ENGINE_FORCE = "whisper"` while evaluating this.
 - Rollback is one line: `WAKE_PHRASE_SOLO_PREFIXES = ()` in `config/wake.py` restores strict
   two-word matching. Tests pin both configurations.
-
 
 ## 2026-08-07 — Why the wake word barely worked — three bugs, none of them in the matcher
 - Shortening the phrase made it *worse*, and chasing that turned up two more problems upstream. The
@@ -444,7 +476,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
 
 ---
 
-
 ## 2026-08-06 — Documents first, and "DEVCON" by ear
 - **Retrieved documents now outrank the model's own knowledge.** The context block used to be
   introduced as *"Reference information (use only if relevant…)"*, which reads as optional — the
@@ -479,7 +510,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   the persona. If Kai ever sounds flat and generic on a long-document question, set `TOP_K = 2`
   before touching `OLLAMA_NUM_CTX` (raising the context window is what breaks GPU residency).
 
-
 ## 2026-07-28 — Wake-word fallback chain
 - Hands-free no longer depends on one vendor. Kai tries **three** wake engines in order and keeps the
   first that initializes: **Porcupine → openWakeWord → Whisper phrase spotting**. A tier failing is a
@@ -511,7 +541,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   nearby utterance rather than per button press. Left uncapped it starves the servo control loop and
   shows up as jittery face tracking rather than as anything audio-shaped — watch `[control] N Hz`.
 - Setup for tiers 2 and 3, plus the "hey kai" training recipe: **`wake/README.md`**.
-
 
 ## 2026-07-28 — Hands-free conversation — "Hey Kai"
 - Kai no longer needs a button. Say **"Hey Kai"**, he answers *"Yes?"*, and then you just talk:
@@ -565,7 +594,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   `gemma2:2b` (switched from `gemma3:4b` to fit the camera in 8 GB), so read `config/voice.py`
   rather than the model names in the older entries.
 
-
 ## 2026-07-06 — Voice assistant
 - Kai can now hear and reply: push-to-talk button on the web dashboard records from the
   Jetson's mic, transcribes locally with `faster-whisper`, and sends the text to a local
@@ -580,7 +608,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   ride the existing `/params` SSE stream (`voice_status`, `voice_transcript`, `voice_response`,
   `voice_error` fields).
 - Sanity-check the mic before use: `python3 -c "import sounddevice as sd; print(sd.query_devices())"`.
-
 
 ## 2026-07-06 — RAG + editable persona
 - Kai can now answer from your own documents and its personality is editable without touching code:
@@ -614,12 +641,10 @@ Docs only — no code behaviour changed. The full test suite is green before and
 - New pre-warm threads at startup (same pattern as the voice assistant's): `rag.load_index()`
   and `rag.ensure_model_loaded()`, alongside the existing three.
 
-
 ## 2026-06-17 — Post-development additions
 - LOFI face parameter capture — yaw, pitch, roll, mouth, eyes, smile/kiss, distance; same algorithm as face-detection-movements; use `--lofi` flag for 19-digit output string
 - Auto USB driver loading — `face_track.py` now loads `ch341.ko` automatically if `/dev/ttyUSB0` is missing; no manual `modprobe` step needed
 - All files consolidated into the `face-servo` directory
-
 
 ## 2026-06-15 → 2026-06-17 — Initial R&D
 
