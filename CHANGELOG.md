@@ -48,11 +48,28 @@ flashed, and not compiled here: no Arduino toolchain was available on either box
   It strips C++ comments before searching — the first version matched this sketch's own explanation
   of why `toInt()` is wrong and failed on the change that fixed it.
 
-What is still true, and what is not yet: the host-side clamps are untouched, so this is defence in
-depth rather than a relocation, and `G:` gesture lines and the `J` fast channel dispatch exactly as
-before. But the sketch has not been compiled and the board has not been flashed. Until someone does
-both, the robot is running the old firmware no matter what is on `main`, and R4's on-hardware
-criterion stays open.
+What is still true: the host-side clamps are untouched, so this is defence in depth rather than a
+relocation, and `G:` gesture lines and the `J` fast channel dispatch exactly as before.
+
+**Compiled and flashed the same day, after an earlier note here wrongly said there was no Arduino
+toolchain.** That check had been run on the Windows dev box rather than the robot, and it searched
+for `gcc-avr` — a Debian package name, never a binary; the binary is `avr-gcc`. The Jetson has had
+`avr-gcc`, `avrdude 6.3`, `arduino-builder` and `arduino-core-avr` all along. The new firmware is
+**6122 bytes against the old 6262** — `parseAngle()` costs less than the `String::toInt()`
+instantiations it removes — with zero warnings under `-warnings all` and RAM unchanged at 262 bytes.
+
+The board had to be probed, because it enumerates as a bare CH340 (`1a86:7523`) with no Arduino
+VID/PID: **ATmega328P, signature `0x1e950f`, optiboot at 115200** (57600 and 19200 do not sync).
+Flash verified twice — avrdude's own verify plus an independent readback diff, 0 of 6122 bytes
+mismatched — and the previous firmware was read off the chip beforehand and kept at
+`~/firmware-backups/servo_serial-PRE-R4-20260811-083436.hex`.
+
+On the live link the new firmware boots to `READY`, accepts every legal form, survives empty fields,
+letters for digits, signed values, run-together lines, raw binary noise and truncated numbers, and
+still answers a reset with `READY` afterwards — so the parser does not wedge, which is the failure
+mode a hand-rolled one would actually have. **What could not be checked remotely is that the rejected
+lines produced no motion**: the link is fire-and-forget with no echo, so the board says nothing that
+distinguishes "rejected" from "moved". That half needs someone watching the head.
 
 ## 2026-08-10 — Kai forgot your name six questions after you gave it
 

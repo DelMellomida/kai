@@ -4,10 +4,35 @@
 > and a strict `parseAngle()` that replaces every `String::toInt()` coercion; a line is now applied
 > whole or not at all. Suite green (1244 passed, was 1239).
 >
-> **Two things this ticket cannot close from a keyboard.** The sketch was not compiled — there is no
-> Arduino toolchain on the Jetson or the dev box, so the C++ is reviewed but unbuilt. And the change
-> does nothing until someone **flashes the board**; until then the robot is running the old firmware
-> regardless of what is on `main`. The on-hardware criterion below stays unchecked for both reasons.
+> **Compiled and FLASHED on 2026-08-11.** The board is running this firmware now.
+>
+> **Correction — an earlier version of this banner said "there is no Arduino toolchain on the Jetson
+> or the dev box, so the C++ is reviewed but unbuilt". That was wrong, twice.** The check was run on
+> the Windows dev box rather than the robot, and it grepped for `gcc-avr`, which is a Debian *package*
+> name and never a binary — the binary is `avr-gcc`. The Jetson has had a complete toolchain the whole
+> time: `avr-gcc`, `avr-g++`, `avrdude 6.3`, `arduino-builder 1.3.25`, `arduino-core-avr 1.8.4`, and
+> the Servo library in `~/Arduino/libraries`. Nothing was blocking this but a bad search.
+>
+> **Build.** Compiles clean under `-warnings all`, zero warnings, and comes out *smaller* than the
+> firmware it replaces — `parseAngle()` costs less than the several `String::toInt()` instantiations
+> it removes:
+>
+> | | flash | RAM |
+> |---|---|---|
+> | old (`main`) | 6262 bytes | 262 bytes |
+> | new (R4) | **6122 bytes** | 262 bytes |
+>
+> **Board, finally identified.** It enumerates as a bare CH340 (`1a86:7523`) with no Arduino VID/PID,
+> so the board type is not discoverable from USB and had to be probed. It is an **ATmega328P
+> (signature `0x1e950f`) with an optiboot-class bootloader at 115200 baud** — STK500v1, hardware
+> version 3, firmware 4.4. Not the 57600 Nano bootloader; 57600 and 19200 both fail to sync. Record
+> this here, because the next person will have the same question and the USB descriptor will not
+> answer it.
+>
+> **Flash verified twice**: avrdude's own post-write verify (6122 bytes), plus an independent
+> readback-and-diff — **0 of 6122 bytes mismatched**. The pre-flash firmware was read off the chip
+> first and kept at `~/firmware-backups/servo_serial-PRE-R4-20260811-083436.hex`
+> (symlinked `latest-pre-r4.hex`), so the previous build can be restored without rebuilding it.
 
 | | |
 |---|---|
@@ -62,10 +87,21 @@ mechanical limit unconditionally is the one that doesn't.
 - [x] `G:` gesture lines and the `J` prefix continue to parse exactly as before. Both branches are
       untouched apart from the `J` branch's parse call; `G:` is matched and dispatched first, ahead
       of any numeric handling, exactly as it was.
-- [ ] **DEFERRED — needs the robot.** Verified on hardware: deliberately corrupted lines over
-      `servo/servo_serial.py`'s interactive mode produce no motion, and the head never travels past
-      the mechanical limits. **Also unbuilt** — no Arduino toolchain was available, so the sketch has
-      not been compiled. Flash and run this before trusting the change.
+- [~] **Mostly done on hardware; one half needs eyes on the robot.** Flashed 2026-08-11 and exercised
+      over the live serial link with `face_track.py` stopped:
+      * boots and prints `READY`;
+      * accepts every legal form — `pan,tilt`, `pan,tilt,jaw`, `J<angle>`, `G:<code>`;
+      * survives every corrupt form — empty fields (`,90`, `90,`, `J`), letters for digits (`9O,90`,
+        `1l0,90`, `Jab`), signed values (`-40,90`), a run-together line (`90,9012,90`), raw binary
+        noise, and truncated numbers;
+      * **does not wedge** — still answers a reset with `READY` after all of it, which is the failure
+        a hand-rolled parser would actually produce.
+
+      **What could not be checked from here: that the rejected lines produced no MOTION.** The link is
+      fire-and-forget by design — no checksum, no echo, no ack — so the board emits nothing to
+      distinguish "rejected the line" from "moved the servo", and `servo/servo.py` tracks its own
+      `last_pan` rather than reading the board. Someone standing at the robot needs to watch the head
+      while corrupt lines are sent. `/tmp/r4/probe.py` on the Jetson sends exactly that sequence.
 - [x] The host-side clamps in `servo/servo.py` are left in place — defence in depth, not a
       relocation. `servo/servo.py` is not modified by this ticket at all, and the existing
       `SERVO_MIN`/`SERVO_MAX` assertions pass unchanged.
