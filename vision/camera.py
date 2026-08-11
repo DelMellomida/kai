@@ -343,9 +343,27 @@ class CameraThread:
         return frame
 
     def close(self) -> None:
+        """Stop the reader and release the cameras — but only once the reader has actually stopped.
+
+        A camera closed underneath a thread still inside read() is a use-after-free in native code
+        (GStreamer's pipeline, V4L2's capture buffers), not a tidiness problem: the reader is parked
+        in cv2/Gst on the OTHER side of the handle we are about to free. read() can outlast the join
+        — a wedged V4L2 device blocks in cap.read() indefinitely, which is exactly the state that
+        makes an operator reach for the restart button in the first place.
+
+        So on a timed-out join we deliberately LEAK the camera handles. This only ever runs on the
+        way out of the process (run()'s `finally`), so the OS reclaims them moments later either
+        way, and the leak costs nothing while a segfault here would skip the rest of the teardown —
+        the servo close and, more importantly, the mic and Porcupine release that the replacement
+        process needs before it can open the same hardware.
+        """
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                print("[camera] WARNING: reader thread did not stop within 2s — leaving the camera "
+                      "to the OS rather than closing it underneath a live read()", flush=True)
+                return
         if self._camera is not self._live_camera:
             self._camera.close()
         self._live_camera.close()

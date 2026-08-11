@@ -1,4 +1,5 @@
 import queue
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -304,6 +305,40 @@ class TestFrameHealth(unittest.TestCase):
             t._frame = frame
             t._last_frame_t = 99.0
         self.assertEqual(t.last_frame_t, 99.0)
+
+
+class TestCloseNeverClosesUnderALiveRead(unittest.TestCase):
+    """close() frees native camera handles. Doing that while the reader thread is still parked
+    inside read() is a use-after-free in GStreamer/V4L2, and a wedged device is exactly when it
+    happens — cap.read() on a dead USB camera blocks well past the 2 s join."""
+
+    def test_a_stopped_reader_gets_its_cameras_closed(self):
+        cam = MagicMock()
+        cam.source_name = "local"
+        cam.read.return_value = None
+        t = CameraThread(cam, queue.Queue(maxsize=1)).start()
+        t.close()
+        cam.close.assert_called_once()
+
+    def test_a_wedged_reader_leaks_rather_than_closing_underneath_itself(self):
+        release = threading.Event()
+        cam = MagicMock()
+        cam.source_name = "local"
+        # read() that never returns until we say so — a wedged V4L2 device.
+        cam.read.side_effect = lambda: (release.wait(10.0), None)[1]
+
+        t = CameraThread(cam, queue.Queue(maxsize=1))
+        t._live_camera = t._camera = cam
+        t._running = True
+        t._thread = threading.Thread(target=t._loop, daemon=True)
+        t._thread.start()
+        try:
+            with patch.object(t._thread, "join"):        # simulate the join timing out
+                t.close()
+            cam.close.assert_not_called()
+        finally:
+            release.set()
+            t._thread.join(timeout=2.0)
 
 
 if __name__ == '__main__':

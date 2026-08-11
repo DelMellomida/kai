@@ -41,7 +41,7 @@ class _NullServo:
     last_pan = 90; last_tilt = 90; last_jaw = 90
     def send(self, pan, tilt, jaw=None): return False
     def send_jaw(self, angle): return False
-    def send_gesture(self, name): pass
+    def send_gesture(self, name): return False
     def center(self): pass
     def close(self): pass
 

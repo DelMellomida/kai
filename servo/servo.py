@@ -204,10 +204,27 @@ class ServoSerial:
         finally:
             self._lock.release()
 
-    def send_gesture(self, name: str) -> None:
-        with self._lock:
+    def send_gesture(self, name: str) -> bool:
+        """Fire a one-off gesture (nod, shake, …). Returns False if skipped.
+
+        NON-BLOCKING lock acquire, for the same reason send_jaw uses one: this is called from the
+        main tracking loop, and the control thread holds this lock for the whole of a USB reconnect
+        — _reconnect() sleeps 2 s waiting for the Arduino to reboot, and _ensure_usb() can add a
+        modprobe plus another 1.5 s on top of that. Waiting here would freeze face tracking, the
+        speaking jaw and the dashboard status publisher for seconds every time a flaky CH340 flaps,
+        which is precisely the stall send_jaw was made non-blocking to avoid.
+
+        A gesture is a cosmetic social cue with no state behind it, so dropping one during a
+        reconnect is strictly better than stalling the loop that drives everything else. The
+        detector will raise the next one.
+        """
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
             code = self._GESTURE_CODES.get(name, "?")
-            self._write(f"G:{code}\n".encode())
+            return self._write(f"G:{code}\n".encode())
+        finally:
+            self._lock.release()
 
     def center(self) -> None:
         with self._lock:
