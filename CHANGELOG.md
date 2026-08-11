@@ -20,6 +20,38 @@ Conventions:
 
 ---
 
+## 2026-08-11 — The module that decides whether Kai has a camera had no tests
+
+Suite green: 1270 passed (was 1239). Implements
+[S8](docs/tickets/S8-camera-supervisor-untested.md). Tests and one extracted method; no behaviour
+change.
+
+- **`app/camera_supervisor.py` was the only substantial module in the repo nothing imported from a
+  test.** Its own docstring had advertised testability since it was written — "it knows about
+  `vision/` and `settings.py`; it does not know about Flask, MediaPipe or the servo, so it can be
+  driven with a fake camera and a fake clock" — and nothing took it up.
+- **The untested logic is where the recorded bugs are.** The depth-3 swap queue exists because a
+  depth-1 one silently evicted a swap `CameraThread` had not applied yet. The `showing_live` gate on
+  the stall check exists because a stalled CSI pipeline was reported as a live feed at 0 fps. The
+  `cheap = not device_signature()` branch exists because a backoff was punishing failures that cost
+  microseconds to discover. Nothing was stopping a refactor from undoing any of them.
+- **`run()`'s while body became `_step() -> float`.** The ticket's own suggestion, and a pure move:
+  the decision logic is byte-identical and only the two loop-carried locals moved onto the instance,
+  so a single pass is meaningful on its own. `_step()` also consumes `_probe_now` and publishes
+  `next_probe_at`, so a test drives exactly what the supervisor does rather than a subset. `run()`
+  is now the wait and nothing else — the same shape as `ConversationSession.tick(now)`.
+- **31 tests, and they were verified by mutation rather than by passing.** "All green" is also what
+  an empty test file reports. Ten deliberate regressions were applied one at a time — each undoing a
+  behaviour the module was written to have — and the suite re-run against every one: **10 of 10
+  caught**, including all three of the recorded bugs above, the `and last` guard that stops a camera
+  being judged dead before its first frame, and `--no-camera` losing to the stored setting. Source
+  restored afterwards; the committed file differs from `main` only by the `_step()` extraction.
+
+Two cases the ticket did not ask for and the tests cover anyway: `--no-camera` releasing a camera
+already held must report the *locked* reason rather than "camera off (settings)", or the dashboard
+blames the wrong thing; and `_report_failure` publishes the reason to the dashboard on every call
+even though it only logs on a change — the rate limit is on the log, not on the state.
+
 ## 2026-08-10 — Kai forgot your name six questions after you gave it
 
 Suite green: 1239 passed, 2705 subtests (was 1190, 2700). Implements
