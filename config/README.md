@@ -23,7 +23,7 @@ set the noise floor.
 
 ## Two kinds of setting
 
-**These files hold the DEFAULTS, and changing one needs a restart.** Eleven of them can also be changed
+**These files hold the DEFAULTS, and changing one needs a restart.** Fifteen of them can also be changed
 live from the dashboard's ⚙ Settings tab, which stores an overlay in `~/.config/kai/settings.json`
 (never committed, never written here — see `settings.py`).
 
@@ -35,6 +35,9 @@ live from the dashboard's ⚙ Settings tab, which stores an overlay in `~/.confi
 | Mic noise floor | `wake.py` `VAD_RMS_FLOOR` | immediately |
 | Speak replies | `voice.py` `TTS_ENABLED` | next reply |
 | Volume / Speaking rate | `voice.py` `TTS_VOLUME`, `TTS_LENGTH_SCALE` | next reply, and re-records the cached "Yes?" |
+| Pause between sentences | `voice.py` `TTS_SENTENCE_SILENCE_S` | next reply, and re-records every cached line. 0 restores the pre-2026-08-10 sound, where sentences ran together with no breath |
+| Tone / Rhythm variation | `voice.py` `TTS_NOISE_SCALE`, `TTS_NOISE_W` | next reply, and re-records every cached line. Both ship at the voice model's own values because moving them measured *less* than the run-to-run noise floor — see the CHANGELOG entry before spending time on them |
+| Natural delivery | `voice.py` `DELIVERY_ENABLED` | next reply (breaths, tempo jitter, the occasional opener — `ai/delivery.py`) |
 | Follow faces / Move the jaw | — (both on) | immediately |
 | Think out loud | `thinking.py` `THINKING_SOUNDS` | next turn (gates the filler bank and the "hmm"; both are pre-synthesised at startup) |
 | Sweep while thinking | `thinking.py` `THINKING_SWEEP` | immediately, on the next control tick; also needs Follow faces on |
@@ -54,7 +57,7 @@ resolution are baked into constructors or bounded by hardware, and `tracking.py`
 
 Values are plain Python literals — no parsing, no restart-safe hot-reload; a restart picks
 them up. Each source module re-imports these names, so this package is the single source of
-truth: change it here and every consumer sees it. (The eleven live knobs are the exception: their
+truth: change it here and every consumer sees it. (The fifteen live knobs are the exception: their
 consumers read them through `settings.py`, which takes its defaults from here.)
 
 ## What is NOT here

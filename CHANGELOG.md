@@ -20,9 +20,60 @@ Conventions:
 
 ---
 
+## 2026-08-11 — One corrupted byte on the servo wire could slam the head into its stop
+
+Suite green: 1254 passed, 2710 subtests (was 1249, 2710). Implements
+[R4](docs/tickets/R4-firmware-servo-limits-mismatch.md). **Firmware — inert until the Arduino is
+flashed, and not compiled here: no Arduino toolchain was available on either box.**
+
+- **The limit that protects the SG90 existed only on the host.** `config/servo.py`'s `SERVO_MIN`/
+  `SERVO_MAX` (10/170) are applied in `servo/servo.py`'s `send()` and `send_jaw()`, but the sketch
+  constrained to the full `0..180` in all three of its `constrain()` calls. The host's clamp is
+  applied and then *destroyed in transit* if the line corrupts, and the link is fire-and-forget by
+  design — no checksum, no echo, no ack — so nothing downstream can tell a mangled line from a real
+  one. `ANGLE_MIN`/`ANGLE_MAX` now live in the sketch, which is the copy that survives the wire.
+- **`String::toInt()` returns 0 for anything it cannot parse, and 0 is the worst value on this
+  wire.** Not an inert default — a hard slam to the end of travel. So the one input the old parser
+  could not report was also the most damaging thing it could command, and the CH340 is documented as
+  flapping under servo brownout, which makes corruption *correlated* with the condition that makes a
+  stall worse: the stall current from a slam to 0 lands on the same rail whose sag caused the flap.
+  `parseAngle()` replaces it — rejects an empty field, any non-digit, and anything over 3 digits.
+- **A line is now applied whole or not at all.** Every field is parsed before any servo is written,
+  so a good pan with a corrupt jaw moves nothing. The tilt field is validated and then thrown away:
+  there is no tilt hardware (R10), but garbage in tilt means the *line* is corrupt, and the pan
+  field sitting beside it has no better claim to being intact.
+- **The "keep these in step with config/servo.py" comment is backed by a test.** R4 asked only for
+  the comment. `tests/test_servo.py::TestFirmwareAngleLimits` reads the real `.ino` and fails if the
+  constants drift, if a full-range `constrain(..., 0, 180)` reappears, or if `toInt()` comes back.
+  It strips C++ comments before searching — the first version matched this sketch's own explanation
+  of why `toInt()` is wrong and failed on the change that fixed it.
+
+What is still true: the host-side clamps are untouched, so this is defence in depth rather than a
+relocation, and `G:` gesture lines and the `J` fast channel dispatch exactly as before.
+
+**Compiled and flashed the same day, after an earlier note here wrongly said there was no Arduino
+toolchain.** That check had been run on the Windows dev box rather than the robot, and it searched
+for `gcc-avr` — a Debian package name, never a binary; the binary is `avr-gcc`. The Jetson has had
+`avr-gcc`, `avrdude 6.3`, `arduino-builder` and `arduino-core-avr` all along. The new firmware is
+**6122 bytes against the old 6262** — `parseAngle()` costs less than the `String::toInt()`
+instantiations it removes — with zero warnings under `-warnings all` and RAM unchanged at 262 bytes.
+
+The board had to be probed, because it enumerates as a bare CH340 (`1a86:7523`) with no Arduino
+VID/PID: **ATmega328P, signature `0x1e950f`, optiboot at 115200** (57600 and 19200 do not sync).
+Flash verified twice — avrdude's own verify plus an independent readback diff, 0 of 6122 bytes
+mismatched — and the previous firmware was read off the chip beforehand and kept at
+`~/firmware-backups/servo_serial-PRE-R4-20260811-083436.hex`.
+
+On the live link the new firmware boots to `READY`, accepts every legal form, survives empty fields,
+letters for digits, signed values, run-together lines, raw binary noise and truncated numbers, and
+still answers a reset with `READY` afterwards — so the parser does not wedge, which is the failure
+mode a hand-rolled one would actually have. **What could not be checked remotely is that the rejected
+lines produced no motion**: the link is fire-and-forget with no echo, so the board says nothing that
+distinguishes "rejected" from "moved". That half needs someone watching the head.
+
 ## 2026-08-11 — The module that decides whether Kai has a camera had no tests
 
-Suite green: 1270 passed (was 1239). Implements
+Suite green: 1301 passed, 2710 subtests (was 1270, 2710). Implements
 [S8](docs/tickets/S8-camera-supervisor-untested.md). Tests and one extracted method; no behaviour
 change.
 
@@ -51,6 +102,160 @@ Two cases the ticket did not ask for and the tests cover anyway: `--no-camera` r
 already held must report the *locked* reason rather than "camera off (settings)", or the dashboard
 blames the wrong thing; and `_report_failure` publishes the reason to the dashboard on every call
 even though it only logs on a change — the rate limit is on the log, not on the state.
+
+## 2026-08-11 — Every extra dashboard tab took the session lock 20 more times a second
+
+Suite green: 1270 passed, 2710 subtests (was 1263, 2710). Implements
+[S2](docs/tickets/S2-params-sse-snapshot-per-client.md).
+
+- **The cost scaled with the number of open tabs, on the locks the robot needs most.** Each
+  connected browser gets its own Flask generator thread calling `params_snapshot()` 20 times a
+  second, and that builds a ~70-key dict from four sources. One of them, `session.get_status()`,
+  holds the session `RLock` for most of its body and takes the assistant lock *inside* it — the same
+  `RLock` the ~30 blocks/s audio worker needs for VAD and the 20 Hz session tick holds. Two or three
+  tabs at a venue is a realistic load that had never been tested.
+- **And it was pure overhead.** The publishers only write at 25 Hz (`WEB_PUBLISH_INTERVAL`), so most
+  of that work produced JSON byte-identical to the previous tick. `DashboardState.cached_snapshot()`
+  now sits in front, with `WEB_PUBLISH_INTERVAL` as the max age — the rate the data can actually
+  change at, rather than a number chosen to feel safe.
+- **Measured builds per second: 1 tab 20.0 → 20.0, 2 tabs 40.0 → 20.0, 3 tabs 60.0 → 20.0, 5 tabs
+  100.0 → 20.0, 8 tabs 160.0 → 20.0.** Flat. **The single-tab case saves nothing** —
+  `_PARAMS_POLL_S` (0.05) is longer than `WEB_PUBLISH_INTERVAL` (0.04), so one client's polls always
+  find the cache expired. The ticket is about load scaling with tab count, and that is what goes
+  away; nobody testing with one tab open will see a difference, which is worth knowing before
+  someone concludes the change did nothing.
+- **One builder, not a thundering herd.** The ticket sketched the build outside any lock and accepted
+  duplicate builds under a race as harmless. It is harmless for correctness, but "a new client
+  connecting does not trigger an extra build" is one of the ticket's own criteria, and a wave of
+  tabs hitting a cold cache is exactly that case. A second `_build_lock` admits one builder; the
+  losers wait, re-check, and find the fresh snapshot. `build()` still never runs under the lock that
+  guards the cached value, so a slow `session.get_status()` cannot serialise readers.
+
+What is unchanged: `params_snapshot()` itself is untouched and still directly testable, the SSE key
+set and per-client cadence are identical, and `dashboard.html` needed no changes. What is unproven:
+the criterion that matters most — three `/params` clients plus a `/video` client with
+`[control] N Hz` holding and `sess_blocks_dropped` flat — measures contention on the robot and stays
+open.
+
+## 2026-08-11 — The main loop ran 200 times a second to decide it had nothing to do
+
+Suite green: 1263 passed, 2710 subtests (was 1254, 2710). Implements
+[R2](docs/tickets/R2-idle-spin-loop-gil-contention.md). Measured **185.0 Hz → 22.0 Hz on the idle
+path, 8.4× fewer iterations** — on the dev box, not the Jetson; see the caveat at the end.
+
+- **The loop polled for frames instead of waiting for them.** `CameraThread.latest()` is
+  non-blocking and returns `None` until a fresh frame arrives, so `face_track.run()` slept
+  `NO_FRAME_SLEEP` (5 ms) and went round again. With `--no-camera`, an unprobed camera, a stalled
+  feed, or simply between frames at 30 fps, that is ~200 iterations a second — each doing real work
+  before deciding there was nothing to do: a `settings.get()` under an `RLock`, a
+  `speaking_openness()` call taking the assistant lock, a time comparison.
+- **All of it holds the GIL, which `config/tracking.py` records as the resource this box actually
+  runs out of.** The note on `INFERENCE_FPS` measured raising perception 15 → 22 fps collapsing the
+  pure-Python control thread from ~14 Hz to 6–10 Hz, with CPU, memory and thermals all in hand. A
+  permanent 200 Hz Python loop contends for exactly that, alongside the 15 Hz control thread, the
+  20 Hz session tick and the ~30 blocks/s audio worker — and it is worst in the degraded states
+  (`--no-camera`, stalled feed) where the servo and voice paths are the only things still working.
+- **`CameraThread` now signals a stored frame; the loop blocks on it.** A `threading.Event` set and
+  cleared *inside* `_lock` alongside `_frame`, which makes "event set" and "frame waiting" the same
+  fact rather than two that can disagree — the failure mode being a set event with nothing behind
+  it, which restores the full-speed spin silently and with nothing else looking different.
+  `close()` sets it too, so shutdown does not pay out a timeout on a loop that is already stopping.
+- **This is not a latency trade.** The old path slept a fixed 5 ms and could not notice a frame that
+  arrived 0.1 ms into it; the loop now wakes on the store itself, so a frame is picked up sooner
+  than the poll managed on average.
+- **The wait is bounded by `WEB_PUBLISH_INTERVAL` (0.04), not `JAW_SEND_INTERVAL` (0.05).** R2
+  suggested the latter, and it would have quietly dropped `/params` and the `cam_retry_in_s`
+  countdown from 25 Hz to 20 Hz — which the same ticket's third acceptance criterion forbids. The
+  ticket's criteria disagreed with each other and the tighter obligation wins. Written as
+  `NO_FRAME_WAIT = WEB_PUBLISH_INTERVAL` rather than a literal so the two cannot drift, with
+  `tests/test_settings.py::TestIdleWaitBounds` pinning it against `JAW_SEND_INTERVAL` as well — the
+  two constants live in config modules that deliberately import nothing, so a test is the only place
+  that relationship can be stated.
+
+What is still unproven: the measurement above is off-robot, and the *reason* for the change — GIL
+headroom for the 15 Hz control thread — is a Jetson claim. `[control] N Hz` with `--no-camera`
+should now read at or above its old value, and that number is worth capturing before and after on
+the next deploy. R2's two on-hardware criteria stay open until it is.
+
+## 2026-08-11 — Kai never took a breath, and spoke in no room at all
+
+Suite green: 1249 passed, 2710 subtests (was 1239, 2705). Every number below was measured on the
+robot, most of them from the WAV the live `_speak` path produced, and every part reverts from
+`config/voice.py` alone. One judgement is deliberately left open — see the last bullet.
+
+- **Piper's `--sentence-silence` was never passed, and its default is 0.** `ai/tts._run_piper` built
+  its command line from `-m`, `--length-scale` and `-f`, so a four-sentence reply came out as one
+  continuous run. Measured longest interior silences at the three sentence boundaries of the same
+  reply, raw pre-sox: **0.20, 0.17, 0.14 s** — not pauses at all, just the decay of a phrase ending,
+  against 0.4–0.7 s for conversational speech. With `TTS_SENTENCE_SILENCE_S = 0.35` the live path
+  measures **0.59, 0.56, 0.54 s**. Note what already existed: `ai/delivery.py`'s `DELIVERY_PAUSE` was
+  measured and tuned to buy a 0.156 s breath *inside* long sentences, while the boundary a person
+  leans on hardest got nothing.
+- **The two VITS noise parameters were never passed either — and they do not do what was expected, so
+  they ship at the voice's own values.** `noise_scale` and `noise_w` control how much a line varies;
+  `voices/en_US-hfc_female-medium.onnx.json` carries the stock 0.667 / 0.8. Four repeats per config of
+  one long line, because VITS draws fresh noise every run and one sample cannot tell an effect from a
+  draw: today **9.58 st** mean p10–p90 intonation range, at `noise_scale 0.8 / noise_w 1.1` **9.43
+  st**, and within-config spread is **±0.4–0.9 st**. The knobs move intonation by *less than the noise
+  floor*, and the "livelier" setting measures marginally flatter. An 8-cell sweep (`noise_w` 0.8→1.2 ×
+  `noise_scale` 0.667/0.8) stayed inside 8.8–10.0 st. Plumbed and dashboard-settable so an ear can
+  overrule the numbers, defaulted to no change. **Add to the killed-hypothesis table in
+  [docs/plan/completed/expressive-voice-plan.md](docs/plan/completed/expressive-voice-plan.md): the
+  VITS noise parameters do not increase intonation range.**
+- **The output chain was loudness-only; it now has EQ and a room.** `TTS_POST_EFFECTS` was
+  `compand … gain -n -1` and nothing else, so every reply arrived bone-dry, dead-centre and flat — a
+  synthetic cue independent of which model produced it. `TTS_POST_HIGHPASS` runs **before** the compand
+  (energy a PAM8403 into a small driver cannot reproduce otherwise eats the headroom the compressor
+  then reacts to) and `TTS_POST_ROOM` **after** it, followed by a second `gain -n -1` because reverb
+  adds energy past the chain's own normalise. That order lives in `ai/tts._sox_chain()` and is pinned
+  by tests, since it is invisible from the config lists; emptying both constants reproduces the old
+  command line exactly, asserted rather than assumed. Confirmed live: the sub-90 Hz share of a real
+  reply fell from **0.55% raw to 0.18%** through the chain.
+- **The reverb costs nothing the other contracts care about**, which is what made it safe to ship.
+  Duration is **unchanged** — 7.84 s for the test line and 1.27 s for a filler stall under every chain
+  tried — because sox decays the tail into the silence Piper already pads onto every WAV instead of
+  appending to the file. So `FILLER_MAX_STALL_S` (1.8) and `FILLER_MAX_LINE_S` need no re-deriving, and
+  the jaw window (sized from `wav_duration`) does not change. Trailing silence actually **shrinks**,
+  0.13 → 0.10 s, which is the safe direction. Whisper transcribed all four candidate chains
+  identically, so the room costs nothing a decoder can detect.
+- **Tagalog replies were going out with no breaths at all.** `DELIVERY_BREATH_CONJUNCTIONS` was
+  English-only, so `ai/delivery.shape()` matched nothing in the language the room actually speaks.
+  Added on a Tagalog speaker's approval: `pero`, `kasi`, `kaya`, `tapos`, `kung`, `habang`, `para`.
+  **The semicolon buys more in Tagalog than in English** — same sentence, same voice: plain
+  **0.07 s**, comma **0.15 s**, semicolon **0.36 s**, against 0.156 s for English. Verified in the live
+  path by toggling `delivery_shaping` around one line: **off gives 0.05/0.05/0.06/0.05 s** (word
+  boundaries only), **on gives a 0.27 s breath**. Whisper confirms the punctuation is never voiced.
+  - **`at` and `o` are deliberately excluded** — both too common and too short, and a breath before
+    every "at" is a stutter rather than a rhythm. `kasi` and `kaya` are likeliest to misfire, since
+    they sit mid-clause more often than "because"/"so" do; drop those two first if it sounds choppy.
+  - **No Tagalog openers, and the asymmetry is the point.** Breaths insert punctuation and add no
+    words, so they cannot be mispronounced. An opener hands the `en_US` voice a new Tagalog word to
+    say — and there is no Filipino alternative offline: Piper ships no `tl`/`fil`/`ceb` across **173
+    voices / 54 language codes**, espeak-ng has no Tagalog phonemizer, and sherpa-onnx pre-converts
+    only 8 MMS languages, Tagalog not among them. Swapping *only* the espeak phonemizer to
+    `id`/`ms`/`es` does work and keeps Kai's pitch (200–206 Hz vs 206 Hz), but a native speaker judged
+    the result no better. Considered and dropped; `config/filler.py`'s claim that a "Tagalog voice"
+    exists was corrected in passing.
+- **Sentences may now differ in loudness.** `TTS_PIPER_NORMALIZE = False` passes `--no-normalize`, so
+  Piper stops normalising **every sentence** to full scale — per-sentence peaks measured **0.00 dB
+  apart**, meaning no two sentences Kai ever spoke differed in peak level — and sox's single
+  `gain -n -1` normalises the whole reply instead. Honest about the size: 3.42 dB of raw variation
+  arrives as **0.79 dB**, because the compand's upward compression eats the rest. Recovering it means
+  softening `compand`, which is what keeps Kai audible in a loud room; a venue beats 2.6 dB of
+  sentence dynamics. Coupled in code so the flag is only passed when `TTS_POST_PROCESS` is on —
+  without sox the raw output is ~10 dB quieter and nothing would put the level back.
+- **Still open, and it can only be closed in a venue: the reverb.** Everything above was judged at a
+  desk, and reverb trades against intelligibility in ambient noise — the same trade the wake path
+  already lost once to a loud room (`config/wake.py`'s ambient adaptation). If Kai gets harder to
+  understand at an event, `TTS_POST_ROOM = []` keeps the EQ and drops the space. A stronger variant
+  (`30 50 45 100 0 -2`) was rendered alongside the shipped one for comparison.
+
+The flag spellings are pinned by a test on purpose. Piper rejects an unknown flag by exiting non-zero,
+`_run_piper` reports that as a failed synthesis, and the result is **every reply silent** with nothing
+flag-shaped in the log — so `--sentence-silence`, `--noise-scale`, `--noise-w-scale` and
+`--no-normalize` were read off `python3 -m piper --help` against the pinned `piper-tts==1.4.2` on this
+robot rather than taken from any documentation. Re-check after a piper upgrade; that test is where it
+should break.
 
 ## 2026-08-10 — Kai forgot your name six questions after you gave it
 
@@ -233,7 +438,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
     actually rejects. Actively working today: the decoder bias, the skeleton matcher, the
     gazetteer's query expansion, the per-chunk titles, and the primer as a ranked document.
 
-
 ## 2026-08-07 — Bare "hey" wakes Kai on the Whisper tier
 - The wake phrase on tier 3 is now **"hey"** — the name is optional. `"Hey Kai"` still works and still
   wins when the name is recognized; `"hey"` alone is a third accepted form in `ai/wake_phrase.py`.
@@ -259,7 +463,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   `WAKE_ENGINE_FORCE = "whisper"` while evaluating this.
 - Rollback is one line: `WAKE_PHRASE_SOLO_PREFIXES = ()` in `config/wake.py` restores strict
   two-word matching. Tests pin both configurations.
-
 
 ## 2026-08-07 — Why the wake word barely worked — three bugs, none of them in the matcher
 - Shortening the phrase made it *worse*, and chasing that turned up two more problems upstream. The
@@ -305,7 +508,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
 
 ---
 
-
 ## 2026-08-06 — Documents first, and "DEVCON" by ear
 - **Retrieved documents now outrank the model's own knowledge.** The context block used to be
   introduced as *"Reference information (use only if relevant…)"*, which reads as optional — the
@@ -340,7 +542,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   the persona. If Kai ever sounds flat and generic on a long-document question, set `TOP_K = 2`
   before touching `OLLAMA_NUM_CTX` (raising the context window is what breaks GPU residency).
 
-
 ## 2026-07-28 — Wake-word fallback chain
 - Hands-free no longer depends on one vendor. Kai tries **three** wake engines in order and keeps the
   first that initializes: **Porcupine → openWakeWord → Whisper phrase spotting**. A tier failing is a
@@ -372,7 +573,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   nearby utterance rather than per button press. Left uncapped it starves the servo control loop and
   shows up as jittery face tracking rather than as anything audio-shaped — watch `[control] N Hz`.
 - Setup for tiers 2 and 3, plus the "hey kai" training recipe: **`wake/README.md`**.
-
 
 ## 2026-07-28 — Hands-free conversation — "Hey Kai"
 - Kai no longer needs a button. Say **"Hey Kai"**, he answers *"Yes?"*, and then you just talk:
@@ -426,7 +626,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   `gemma2:2b` (switched from `gemma3:4b` to fit the camera in 8 GB), so read `config/voice.py`
   rather than the model names in the older entries.
 
-
 ## 2026-07-06 — Voice assistant
 - Kai can now hear and reply: push-to-talk button on the web dashboard records from the
   Jetson's mic, transcribes locally with `faster-whisper`, and sends the text to a local
@@ -441,7 +640,6 @@ Docs only — no code behaviour changed. The full test suite is green before and
   ride the existing `/params` SSE stream (`voice_status`, `voice_transcript`, `voice_response`,
   `voice_error` fields).
 - Sanity-check the mic before use: `python3 -c "import sounddevice as sd; print(sd.query_devices())"`.
-
 
 ## 2026-07-06 — RAG + editable persona
 - Kai can now answer from your own documents and its personality is editable without touching code:
@@ -475,12 +673,10 @@ Docs only — no code behaviour changed. The full test suite is green before and
 - New pre-warm threads at startup (same pattern as the voice assistant's): `rag.load_index()`
   and `rag.ensure_model_loaded()`, alongside the existing three.
 
-
 ## 2026-06-17 — Post-development additions
 - LOFI face parameter capture — yaw, pitch, roll, mouth, eyes, smile/kiss, distance; same algorithm as face-detection-movements; use `--lofi` flag for 19-digit output string
 - Auto USB driver loading — `face_track.py` now loads `ch341.ko` automatically if `/dev/ttyUSB0` is missing; no manual `modprobe` step needed
 - All files consolidated into the `face-servo` directory
-
 
 ## 2026-06-15 → 2026-06-17 — Initial R&D
 

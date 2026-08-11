@@ -7,6 +7,7 @@ extracting the routes into a separate module. The import does cost ~13 s (MediaP
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ import face_track
 import settings
 from app import lifecycle
 from web import server as web_server
+from web.state import DashboardState
 
 
 class _FakeCamThread:
@@ -356,6 +358,7 @@ class TestSystemReboot(WebCase):
         self.assertEqual(res.status_code, 500)
         self.assertIn("may not run", res.get_json()["error"])
 
+
     def test_get_is_not_a_reboot(self):
         with patch.object(web_server, "REBOOT_ENABLED", True), \
              patch.object(lifecycle, "reboot_now") as rb:
@@ -374,6 +377,101 @@ class TestSystemReboot(WebCase):
         self.assertFalse(ok)
         self.assertIn("-l", run.call_args[0][0])
         self.assertIn("sudoers", detail)
+
+
+class TestCachedSnapshot(unittest.TestCase):
+    """`DashboardState.cached_snapshot` — the shared /params build (S2).
+
+    The property under test is not "it caches". It is that **build count stops scaling with client
+    count**, which is the whole reason the ticket exists: every extra dashboard tab was another
+    thread taking the session `RLock` at 20 Hz, contending with the ~30 blocks/s audio worker and
+    the 20 Hz session tick. So these count builds under concurrency rather than asserting that a
+    value came back."""
+
+    def setUp(self):
+        self.state = DashboardState()
+        self.builds = 0
+
+    def _build(self):
+        self.builds += 1
+        return {"n": self.builds}
+
+    def test_first_call_builds(self):
+        self.assertEqual(self.state.cached_snapshot(self._build, 100.0, 0.04), {"n": 1})
+        self.assertEqual(self.builds, 1)
+
+    def test_second_call_inside_the_window_does_not(self):
+        self.state.cached_snapshot(self._build, 100.0, 0.04)
+        self.assertEqual(self.state.cached_snapshot(self._build, 100.03, 0.04), {"n": 1})
+        self.assertEqual(self.builds, 1)
+
+    def test_call_past_the_window_rebuilds(self):
+        self.state.cached_snapshot(self._build, 100.0, 0.04)
+        self.assertEqual(self.state.cached_snapshot(self._build, 100.05, 0.04), {"n": 2})
+        self.assertEqual(self.builds, 2)
+
+    def test_boundary_is_exclusive(self):
+        # now - t < max_age, so exactly max_age old is stale. Pinned because "at most once per
+        # publish interval" is the acceptance criterion and an off-by-one here is invisible.
+        self.state.cached_snapshot(self._build, 100.0, 0.04)
+        self.state.cached_snapshot(self._build, 100.04, 0.04)
+        self.assertEqual(self.builds, 2)
+
+    def test_many_clients_on_a_cold_cache_build_once(self):
+        # The thundering herd: N tabs connecting at once with nothing cached. The ticket's own
+        # sketch allowed every one of them to build; this is the assertion that rules it out.
+        started = threading.Barrier(8)
+        results, errors = [], []
+        lock = threading.Lock()
+
+        def client():
+            try:
+                started.wait(timeout=5)
+                snap = self.state.cached_snapshot(self._build, 100.0, 0.04)
+                with lock:
+                    results.append(snap)
+            except Exception as exc:      # pragma: no cover — surfaced through `errors`
+                errors.append(exc)
+
+        threads = [threading.Thread(target=client) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 8)
+        self.assertEqual(self.builds, 1, "build count scaled with client count — S2 not fixed")
+        self.assertTrue(all(r == {"n": 1} for r in results), "clients disagreed about the snapshot")
+
+    def test_build_count_tracks_time_not_client_count(self):
+        # Same wall-clock window, 1 client vs 6. The build count must come out identical.
+        def drive(clients):
+            self.builds = 0
+            state = DashboardState()
+            for tick in range(10):                    # 10 ticks x 0.05 s = 0.5 s of stream
+                for _ in range(clients):
+                    state.cached_snapshot(self._build, 100.0 + tick * 0.05, 0.04)
+            return self.builds
+
+        self.assertEqual(drive(1), drive(6))
+
+    def test_build_does_not_run_under_the_snapshot_lock(self):
+        # Holding _snap_lock across build() would serialise every reader behind
+        # session.get_status(), which is the cost this change exists to remove rather than move.
+        # Proven from inside the build: if it can take _snap_lock, the lock was free.
+        reached = {}
+
+        def introspecting_build():
+            self.builds += 1
+            acquired = self.state._snap_lock.acquire(blocking=False)
+            reached["free"] = acquired
+            if acquired:
+                self.state._snap_lock.release()
+            return {"n": self.builds}
+
+        self.state.cached_snapshot(introspecting_build, 100.0, 0.04)
+        self.assertTrue(reached.get("free"), "_snap_lock was held across build()")
 
 
 if __name__ == "__main__":

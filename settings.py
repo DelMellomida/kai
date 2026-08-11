@@ -46,7 +46,10 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 from config.thinking import THINKING_SOUNDS, THINKING_SWEEP
-from config.voice import DELIVERY_ENABLED, TTS_ENABLED, TTS_LENGTH_SCALE, TTS_VOLUME
+from config.voice import (
+    DELIVERY_ENABLED, TTS_ENABLED, TTS_LENGTH_SCALE, TTS_NOISE_SCALE, TTS_NOISE_W,
+    TTS_SENTENCE_SILENCE_S, TTS_VOLUME,
+)
 from config.wake import HANDS_FREE_ENABLED, VAD_RMS_FLOOR, WAKE_SENSITIVITIES
 
 # Module constant, not a config knob: tests patch it. Kept out of config/ deliberately — this file's
@@ -75,6 +78,15 @@ _SPECS: dict[str, Spec] = {
     "tts_enabled":      Spec("bool",   TTS_ENABLED),
     "tts_volume":       Spec("float",  TTS_VOLUME,       lo=0.0,  hi=2.0),
     "tts_length_scale": Spec("float",  TTS_LENGTH_SCALE, lo=0.5,  hi=2.0),
+    # Piper's three prosody parameters. All live for the same reason tts_length_scale is: the only
+    # instrument that can judge them is an ear, and an ear needs to flip back and forth while Kai is
+    # talking. The upper bounds are not arbitrary — past ~1.2 the two noise parameters slur consonants
+    # and wander off pitch, and a sentence pause past ~1 s reads as Kai having given up rather than as
+    # a breath. All three re-warm the canned lines on change (face_track.py), because the filler bank
+    # and the wake ack are pre-synthesised and would otherwise keep the old prosody.
+    "tts_sentence_silence": Spec("float", TTS_SENTENCE_SILENCE_S, lo=0.0, hi=1.0),
+    "tts_noise_scale":  Spec("float",  TTS_NOISE_SCALE,  lo=0.0,  hi=1.5),
+    "tts_noise_w":      Spec("float",  TTS_NOISE_W,      lo=0.0,  hi=1.5),
     # Delivery shaping (ai/delivery.py) — breaths, opener, per-reply tempo jitter. PULL-read once per
     # reply, and live on purpose: it is a change only an ear can judge, so it has to be flippable
     # mid-conversation to A/B against the unshaped voice.

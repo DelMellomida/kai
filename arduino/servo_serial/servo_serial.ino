@@ -8,6 +8,24 @@ const int TILT_PIN = 10;   // no tilt hardware — pin left undriven
 const int JAW_PIN  = 6;
 const int LED_PIN  = 13;
 
+// Mechanical travel limits. MUST be kept in step with SERVO_MIN / SERVO_MAX in config/servo.py,
+// which is the source of truth and carries the reason: a Tower Pro SG90 overshoots into its
+// mechanical stop at 0 and at 180. tests/test_servo.py::TestFirmwareAngleLimits reads this file
+// and fails if the two ever drift apart, because a comment asking to keep them in step is not a
+// mechanism and nothing else here would notice.
+//
+// servo/servo.py's send()/send_jaw() clamp to the same window, and this is NOT a duplicate of that
+// check. It is the copy that still holds when the wire corrupts a line — which is precisely when
+// the host's clamp has already been applied and then destroyed in transit. The link is
+// fire-and-forget by design (no checksum, no echo, no ack), so nothing downstream can tell a
+// mangled line from a real one. The CH340 is documented as flapping under servo brownout, so this
+// is a correlated failure rather than a hypothetical: a slam to 0 draws stall current on the same
+// rail whose sag caused the flap.
+//
+// One window covers both axes: JAW_OPEN in config/tracking.py is already pinned at SERVO_MAX.
+const int ANGLE_MIN = 10;
+const int ANGLE_MAX = 170;
+
 // Detach the servos after this long with no command, so they stop holding position
 // (SG90s buzz and draw current while attached, even when idle).
 //
@@ -78,6 +96,31 @@ void serviceGestureAck() {
   ackNextMs = millis() + ACK_BLINK_MS;
 }
 
+// Parse one numeric field, strictly. Returns false — and writes nothing to `out` — for an empty
+// field or any character that is not a digit.
+//
+// This replaces String::toInt(), which does not report failure: it returns 0 for "", for "J", for
+// "9O" and for a field of pure line noise. 0 is not an inert value here, it is a hard slam to the
+// end of travel, so the one input the parser cannot distinguish was also the worst thing it could
+// command. Rejecting is always safe by comparison — the host re-sends pan at 10 Hz and jaw at
+// 20 Hz, so a dropped line costs at most one frame of an already self-correcting stream.
+//
+// No sign is accepted: every angle on this wire is 0..180 by construction, and a '-' can only be
+// corruption. The 3-digit cap keeps `value` far from overflow and rejects a run-together line
+// ("90,9012,90") that would otherwise parse as a plausible-looking number.
+bool parseAngle(const String &field, int &out) {
+  int n = field.length();
+  if (n == 0 || n > 3) return false;
+  int value = 0;
+  for (int i = 0; i < n; i++) {
+    char c = field[i];
+    if (c < '0' || c > '9') return false;
+    value = value * 10 + (c - '0');
+  }
+  out = value;
+  return true;
+}
+
 void loop() {
   serviceGestureAck();
 
@@ -97,8 +140,9 @@ void loop() {
     // Jaw-only fast channel: "J<angle>" — writes only the jaw servo (20 Hz speech path),
     // leaving pan untouched so it doesn't fight the pan/tilt command stream.
     if (line[0] == 'J') {
-      int jaw = constrain(line.substring(1).toInt(), 0, 180);
-      jaw_servo.write(jaw);
+      int jaw;
+      if (!parseAngle(line.substring(1), jaw)) return;   // malformed: write nothing at all
+      jaw_servo.write(constrain(jaw, ANGLE_MIN, ANGLE_MAX));
       return;
     }
 
@@ -108,17 +152,30 @@ void loop() {
     int comma  = line.indexOf(',');
     int comma2 = comma >= 0 ? line.indexOf(',', comma + 1) : -1;
 
+    // Every field is parsed and checked BEFORE any servo is written. A line is applied whole or
+    // not at all: a good pan with a corrupt jaw must not move the pan either, or a line truncated
+    // mid-flight becomes a half-command — the head turning to a real angle while the mouth holds a
+    // stale one, with nothing to indicate the command was never complete.
     int pan;
+    int jaw = -1;                        // -1 = this line carries no jaw field
     if (comma >= 0) {
-      pan = constrain(line.substring(0, comma).toInt(), 0, 180);
-      if (comma2 >= 0) {
-        int jaw = constrain(line.substring(comma2 + 1).toInt(), 0, 180);
-        jaw_servo.write(jaw);
-      }
+      if (!parseAngle(line.substring(0, comma), pan)) return;
+      // Tilt is validated and then thrown away. There is no tilt hardware (see R10), but garbage
+      // in the tilt field means this LINE is corrupt, and the pan field sitting next to it on the
+      // same line has no better claim to being intact.
+      int tilt;
+      String tiltField = comma2 >= 0 ? line.substring(comma + 1, comma2)
+                                     : line.substring(comma + 1);
+      if (!parseAngle(tiltField, tilt)) return;
+      if (comma2 >= 0 && !parseAngle(line.substring(comma2 + 1), jaw)) return;
     } else {
-      pan = constrain(line.toInt(), 0, 180);
+      if (!parseAngle(line, pan)) return;
     }
 
+    if (jaw >= 0) {
+      jaw_servo.write(constrain(jaw, ANGLE_MIN, ANGLE_MAX));
+    }
+    pan = constrain(pan, ANGLE_MIN, ANGLE_MAX);
     pan_servo.write(pan);
     if (ackEdgesLeft <= 0) {           // a gesture blink in flight owns the LED; don't fight it
       digitalWrite(LED_PIN, pan < 90 ? HIGH : LOW);

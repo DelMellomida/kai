@@ -13,7 +13,18 @@ web/server.py (WEB_PORT, UPLOAD_DIR, REBOOT_ENABLED)."""
 # perception moderate to protect the control cadence. Getting BOTH faster perception and smooth
 # control would need inference off the GIL (subprocess / native) — future work.
 INFERENCE_FPS      = 15
-NO_FRAME_SLEEP     = 0.005   # idle poll when CameraThread has no new frame — avoids busy-spin
+
+# NO_FRAME_SLEEP (0.005) used to live here. The main loop polled CameraThread.latest() and slept
+# 5 ms when it came back empty, so with --no-camera, an unprobed camera, or simply between frames at
+# 30 fps, it iterated ~200 times a second — doing real Python work each time (a settings read under
+# an RLock, a speaking_openness() call taking the assistant lock, a time comparison) before deciding
+# there was nothing to do. All of it holding the GIL, which the note above measures as the resource
+# this box actually runs out of, and worst in the degraded states where the servo and voice paths
+# are the only things still working and most need the headroom.
+#
+# The poll is gone. CameraThread signals a stored frame with a threading.Event and the loop waits on
+# it, so it wakes immediately on a frame and otherwise at NO_FRAME_WAIT (defined below, next to the
+# publish interval that bounds it).
 
 # Servo control loop (vision + face_track _control_loop). Decoupled from INFERENCE_FPS: the
 # control thread runs the pan PD + slew clamp at this rate toward the latest target, so the
@@ -49,6 +60,26 @@ EMA_RESET_FRAMES = 20    # no-face frames before EMA resets (prevents jump on br
 # be reported by the stale path instead of this one.
 SERVO_ABSENCE_FRAMES = 3
 WEB_PUBLISH_INTERVAL = 0.04   # cap shared-frame refresh to 25 fps
+
+# How long the main loop blocks waiting for a frame before going round anyway (see NO_FRAME_SLEEP's
+# obituary above). It is an upper bound on idleness, not a cadence: a real frame wakes the loop
+# immediately, so with a live camera this value is never reached.
+#
+# It must be no LARGER than the shortest thing the loop still has to do on a frameless tick, or that
+# work simply happens less often. There are two such obligations and they do not agree:
+#
+#   jaw animation      1 / JAW_SEND_INTERVAL   = 20 Hz   (config/servo.py)
+#   _publish_status    1 / WEB_PUBLISH_INTERVAL = 25 Hz
+#
+# so it is pinned to the tighter of the two. R2 proposed JAW_SEND_INTERVAL (0.05) — that would have
+# quietly dropped /params and the cam_retry_in_s countdown from 25 Hz to 20 Hz, which the ticket's
+# own third acceptance criterion forbids. Written as an alias rather than a literal 0.04 so the two
+# cannot drift apart; tests/test_settings.py pins it against JAW_SEND_INTERVAL, which lives in
+# another config module and so cannot be referenced here (these files deliberately import nothing).
+#
+# 200 Hz -> 25 Hz on the idle path. Shutdown is unaffected: the wait is bounded well under a second,
+# so SIGTERM/KeyboardInterrupt is still noticed within one tick.
+NO_FRAME_WAIT = WEB_PUBLISH_INTERVAL
 
 # Pan PD-controller gains (vision/controller.py PDAxis). Kd damps overshoot; tune on hardware.
 PAN_KP = 0.20
