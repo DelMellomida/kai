@@ -53,9 +53,14 @@ for the same reason config/thinking.py says so: a mangled line sounds fine as te
 # Keyed by the language code Whisper detects for the utterance, so the filler answers in the
 # language the person actually used (config/voice.py WHISPER_LANGUAGES bounds the set).
 #
-# "ceb" has no Piper voice of its own and there is no Cebuano anywhere else in the codebase.
-# The Tagalog voice is close enough phonetically that Bisaya reads as accented rather than
-# wrong; that is a judgement to confirm by ear on the robot, not from the text.
+# CORRECTED 2026-08-11: this used to say "the Tagalog voice is close enough phonetically that Bisaya
+# reads as accented rather than wrong". There is no Tagalog voice. Piper's catalogue is 173 voices
+# across 54 language codes and contains no tl, fil or ceb — so EVERY line in this file, Tagalog and
+# Bisaya alike, is spoken by an American English model (TTS_VOICE_MODEL) under English phonetics.
+# Swapping just the espeak phonemizer to Indonesian/Malay/Spanish was tried, keeps Kai's voice intact
+# (200-206 Hz either way), and a native speaker judged the result no better — see
+# docs/plan/wip/natural-audio-plan.md. The consequence for this file: Bisaya and Tagalog are equally
+# accented, so the ceb/tl split is about WORD CHOICE for the listener, not about pronunciation.
 #
 # The facts embedded here are the same ones in documents/kai_facts.txt, so a listener who asks
 # a follow-up ("what is a Jetson?") gets a consistent answer out of RAG.

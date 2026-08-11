@@ -256,6 +256,12 @@ class CameraThread:
         self._frame: np.ndarray | None = None
         self._running     = False
         self._thread: threading.Thread | None = None
+        # Set while a frame is waiting to be consumed, so the tracking loop can BLOCK for one
+        # instead of polling latest() every few milliseconds (R2 — the poll cost ~200 Hz of
+        # GIL-holding Python work on a loop that had nothing to do). Set and cleared only under
+        # _lock, together with _frame, which makes "event set" and "frame present" the same fact
+        # rather than two that can disagree.
+        self._frame_ready = threading.Event()
         # When the active source last produced a frame. The supervisor uses this to notice a camera
         # that has stopped delivering (unplugged mid-run, CSI pipeline wedged) — read() returning None
         # forever is indistinguishable from a healthy idle camera without it.
@@ -335,15 +341,35 @@ class CameraThread:
             with self._lock:
                 self._frame = frame
                 self._last_frame_t = time.monotonic()
+                self._frame_ready.set()
 
     def latest(self) -> np.ndarray | None:
         with self._lock:
             frame       = self._frame
             self._frame = None
+            self._frame_ready.clear()
         return frame
+
+    def wait_for_frame(self, timeout: float) -> bool:
+        """Block until a frame is waiting, or `timeout` seconds pass. True if a frame is ready.
+
+        Replaces the tracking loop's `time.sleep(NO_FRAME_SLEEP)` poll. The loop wakes the instant
+        a frame is stored — so this is not a latency trade, the frame is picked up sooner than the
+        old 5 ms poll managed on average — and otherwise at the caller's timeout, which is what
+        collapses the idle rate from ~200 Hz to 25 Hz.
+
+        The return value is advisory and the caller is not required to trust it: `latest()` is still
+        the only thing that consumes a frame, and it still returns None if another consumer got
+        there first. There is exactly one consumer today, and a caller that treated True as a
+        guarantee would be wrong the moment that stops being true."""
+        return self._frame_ready.wait(timeout)
 
     def close(self) -> None:
         self._running = False
+        # Wake any consumer parked in wait_for_frame() so shutdown is not held up for its full
+        # timeout. Harmless if none is waiting: latest() clears it before returning a frame, and a
+        # spuriously-set event only costs one extra pass round a loop that is stopping anyway.
+        self._frame_ready.set()
         if self._thread:
             self._thread.join(timeout=2.0)
         if self._camera is not self._live_camera:
