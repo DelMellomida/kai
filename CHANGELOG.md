@@ -42,6 +42,56 @@ Suite green: 1261 passed, 2685 subtests (was 1258). Deployed and exercised on th
 opener each turn drew is unverified**: nothing about the filler is published on `/params`, so that
 needs `/tmp/face-servo.log`, which needs a shell.
 
+## 2026-08-11 — Only one speaker plays. The USB dongle is faulty, and the amp the comments describe is not in the build
+
+No code behaviour changes here. **The Jetson is sending correct, balanced stereo; the C-Media USB
+dongle is driving only one channel and needs replacing.** This entry records the measurements that
+cleared the software, corrects the hardware the comments have been reasoning about for months, and
+writes down what a dongle swap will break.
+
+**How it was established — by substitution, after listening tests failed to settle it.** The speaker
+plays both channels correctly from a phone and from a laptop; the dongle reproduces the fault on a
+laptop with that same speaker. In between, two by-ear tests contradicted each other: a left-only and
+a right-only tone both seemed to come from the working driver (implying the channels are shorted),
+yet inverting one channel produced no audible cancellation (implying they never meet). Both cannot be
+true. **Swapping hardware settled in one minute what careful tone tests could not** — worth
+remembering the next time an audio fault is narrowed down to "somewhere physical".
+
+**A dongle swap is not plug-and-play**, and one of its consequences is silent. `TTS_SINK`, `TTS_CARD`
+and `TTS_CARD_PROFILE` all name this exact device, and a wrong value there is loud — Kai simply goes
+mute and says so. `SPEAKER_CARD_NAME_HINTS` is the dangerous one: it is the guard added earlier the
+same day to stop Kai capturing from the speaker's own card, it matches on a substring of the device
+name, and a differently-named adapter **stops matching with nothing in the log to say so**. Nothing
+breaks at the moment of the swap either — the guard only bites on the rare runs where the I2S mic
+fails its liveness probe — so the segfault would come back later, looking unrelated. Documented in
+`docs/hardware.md` with a per-constant table and a way to confirm the guard still bites.
+
+- **The output path is provably symmetric.** Sink `analog-stereo`, channel map
+  `front-left,front-right`, `Mute: no`, **balance 0.00**, both channels at 56210 / 86% / −4.00 dB;
+  ALSA `Front Left 33 [on]` / `Front Right 33 [on]`; every WAV Kai plays 2-channel with per-channel
+  RMS matched to within 0.05 dB (`kai_tts.wav`: −16.12 / −16.10). Nothing here can favour a side.
+- **PulseAudio is not folding anything to mono.** No remap, mono or combine module is loaded — only
+  the stock `module-filter-heuristics` / `module-filter-apply` — `~/.config/pulse/default.pa` is
+  stock, and every remix setting in `daemon.conf` sits at its commented default.
+- **There is no PAM8403.** `docs/hardware.md` listed one as the output stage and `config/voice.py`
+  justified both the mono→stereo duplication and the 90 Hz high-pass by its response into a small
+  driver. The build actually runs a self-powered USB desktop speaker off the same C-Media dongle
+  (`Audio Adapter (Unitek Y-247A)`). Corrected in both places, and **`TTS_POST_HIGHPASS` is now
+  marked inherited rather than measured** — 90 Hz was never re-derived against the speaker fitted.
+- **`TTS_POST_CHANNELS` stays at 2**, with the reason written down: the two channels are
+  byte-identical (L−R at −99.34 dB on the dry chain), so duplication costs nothing on a one-channel
+  speaker and stays right the moment a working stereo one is plugged in.
+- **`TTS_POST_ROOM`'s stereo-depth is deliberately left at 100.** The width is real — (L−R)/2 measures
+  −38.31 dB against a −16.14 dB sum, 22 dB down but far above the dry chain's −99.34 dB, which also
+  proves sox inserts its channel duplication *before* the reverb. Only one channel currently reaches
+  a driver, so that width is going nowhere at the moment; it is left alone because the cause is a
+  dongle on its way out, and tuning the voice around failing hardware would quietly cost the width
+  back the day it is replaced.
+
+Measured while looking, and **not** a regression: `compand` clips a few hundred samples mid-chain on
+every variant of the chain — **362 on the old pre-2026-08-11 chain, 323 with the new high-pass**, so
+the high-pass improved it. Final peak is −1.00 dB either way.
+
 ## 2026-08-11 — The startup greeting was spoken twice, a minute apart, with the jaw frozen partway through the first one
 
 Not a bug in the greeting. `face_track` **segfaulted at the first playback** and

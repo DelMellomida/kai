@@ -80,6 +80,15 @@ USB_MIC_NAME_HINTS = ("usb",)
 # thing" — a separate USB mic ("USB PnP Sound Device") is unaffected, and a build whose speaker is not
 # this dongle needs this list changed with it. Set to () to allow capturing from the speaker's card
 # again, i.e. the pre-2026-08-11 behaviour and the crash it carried.
+#
+# ⚠️ THIS GUARD FAILS SILENTLY IF THE DONGLE IS REPLACED, and as of 2026-08-11 that replacement is
+# expected: the C-Media adapter drives only one speaker channel and is on its way out (see
+# docs/hardware.md, which lists every constant a swap touches). The match is a case-insensitive
+# substring of the PortAudio device name, so a new adapter named anything else simply stops matching
+# and the segfault comes back with nothing in the log to explain it. Nothing breaks at the moment of
+# the swap — the guard only matters on the rare runs where the I2S mic fails its liveness probe — so
+# confirm it deliberately after swapping: look for "[mic] skipping input device" in
+# /tmp/face-servo.log, or confirm the new adapter offers no input at all.
 SPEAKER_CARD_NAME_HINTS = ("usb audio device",)
 
 # Rates to try for a NON-I2S mic, in order, before giving up on that device. The I2S mic is
@@ -430,7 +439,8 @@ SPEAK_OPEN_S         = 0.22   # ramp-open time at the start of a sentence (smoot
 SPEAK_CLOSE_S        = 0.22   # ramp-close time at the end of a sentence
 
 # ── Text-to-speech (Piper) ────────────────────────────────────────────────────────
-# Kai speaks its replies aloud through the USB audio dongle + PAM8403 amp (PulseAudio sink
+# Kai speaks its replies aloud through the USB audio dongle + a self-powered desktop speaker
+# (PulseAudio sink
 # TTS_SINK). ai/tts.py shells out to Piper (piper-tts, CPU/onnxruntime — no API key, no runtime
 # internet, ~tens of MB RAM, so it fits alongside Ollama/Whisper/MediaPipe on the 8GB Jetson) to
 # synthesize a WAV, then plays it with paplay. When TTS is unavailable (disabled, engine missing,
@@ -551,7 +561,8 @@ TTS_VOLUME       = 1.0   # playback volume, applied to paplay's sink input (1.0 
                          # `gain -n -1`, which normalises a synthesis-time gain straight back out
                          # (measured — identical output peak at 0.4 and 1.6, and 1.6 clipped the raw
                          # audio). Dashboard-settable, 0..2.
-# PulseAudio sink for playback — the USB dongle/PAM8403. Named (not index 0) so it survives
+# PulseAudio sink for playback — the USB dongle, which pulse describes as
+# "Audio Adapter (Unitek Y-247A) Analog Stereo". Named (not index 0) so it survives
 # re-enumeration. Find it with `pactl list short sinks`.
 TTS_SINK         = "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo"
 
@@ -688,13 +699,17 @@ TTS_LATENCY_MSEC = 200
 
 # ── TTS loudness post-processing ────────────────────────────────────────────────
 # Piper emits a quiet, MONO WAV (~6 dB lower RMS than typical playback, and mono routes to only
-# part of a stereo speaker path). Pipe it through sox to (a) duplicate to stereo so BOTH amp
+# part of a stereo speaker path). Pipe it through sox to (a) duplicate to stereo so BOTH output
 # channels are driven, and (b) compress + peak-normalize so speech is as loud as other audio.
 # Best-effort: if sox is missing or the filter fails, ai/tts.py falls back to the raw Piper WAV
 # unchanged (speech still plays, just quieter/mono). Set TTS_POST_PROCESS False to disable.
 TTS_POST_PROCESS  = True
 TTS_POST_SOX      = "sox"   # sox binary (on PATH); swap for an absolute path if needed
-TTS_POST_CHANNELS = 2       # 2 = duplicate mono -> stereo (drive both speaker channels)
+TTS_POST_CHANNELS = 2       # 2 = duplicate mono -> stereo (drive both output channels)
+# Keep this at 2 even though only one channel currently reaches a driver — the USB dongle is faulty
+# and due for replacement (docs/hardware.md). The two channels are byte-identical here — measured, L-R
+# at -99.34 dB on the dry chain — so duplication costs nothing today and is already correct the moment
+# a working adapter is plugged in. Dropping to 1 would only hand the upmix to PulseAudio.
 # sox effect chain applied after synthesis: light compression to lift perceived loudness, then
 # peak-normalize to -1 dB. Tune here without touching code (verified against sox 14.4.x).
 TTS_POST_EFFECTS  = ["compand", "0.3,1", "6:-70,-60,-20", "-5", "-90", "0.2", "gain", "-n", "-1"]
@@ -708,10 +723,16 @@ TTS_POST_EFFECTS  = ["compand", "0.3,1", "6:-70,-60,-20", "-5", "-90", "0.2", "g
 # These two run either side of the loudness chain (see ai/tts._post_process for the order and why),
 # and each is its own constant so loudness, EQ and space revert independently. Empty list = off.
 
-# Everything below ~90 Hz is energy this hardware cannot reproduce: a PAM8403 into a small driver has
-# no output down there, so it only eats the headroom the compand then reacts to, and it is what makes
-# the chassis buzz on plosives. Applied BEFORE the compand for that reason — removing it afterwards
-# would be too late to matter. Mirrors MIC_HIGHPASS_HZ = 80 on the capture side.
+# Everything below ~90 Hz is energy this hardware cannot reproduce, so it only eats the headroom the
+# compand then reacts to, and it is what makes the chassis buzz on plosives. Applied BEFORE the compand
+# for that reason — removing it afterwards would be too late to matter. Mirrors MIC_HIGHPASS_HZ = 80 on
+# the capture side.
+# ⚠ CORRECTED 2026-08-11: this said "a PAM8403 into a small driver has no output down there". **There
+# is no PAM8403 in this build** — the output stage is a self-powered USB desktop speaker (see
+# docs/hardware.md). 90 Hz was never re-derived against the speaker actually fitted, so treat it as
+# inherited rather than measured. What IS measured here: the high-pass reduced the compand's mid-chain
+# clipping from 362 samples to 323 on the same line, so it is doing something useful either way, and
+# the final peak is -1.00 dB with or without it.
 TTS_POST_HIGHPASS = ["highpass", "90"]
 
 # A small room, applied AFTER the compand: compress the dry signal, then add the space, which is the
@@ -734,4 +755,14 @@ TTS_POST_HIGHPASS = ["highpass", "90"]
 # What none of that measures is the VENUE. Reverb trades against clarity in ambient noise, and this
 # robot has already lost hands-free once to a loud room (see config/wake.py's ambient adaptation). If
 # Kai gets harder to understand at an event, set this to [] and keep the high-pass.
+#
+# The stereo-depth of 100 is REAL, and right now half of it is going nowhere. Measured 2026-08-11 on
+# kai_tts.wav: the difference signal (L-R)/2 is -38.31 dB against a -16.14 dB sum, i.e. 22 dB down but
+# well above the -99.34 dB of the dry chain, whose channels are byte-identical. So sox inserts its
+# channel duplication BEFORE the reverb and the reverb genuinely decorrelates the two tails — there is
+# a real stereo image here, and the faulty dongle (docs/hardware.md) is delivering one channel of it.
+# DELIBERATELY NOT CHANGED. Setting the fourth argument to 0 would collapse the room to mono, which
+# costs nothing while the output is one-channel anyway — but the cause is hardware that is being
+# replaced, and tuning the voice around it would quietly cost the width back the day it is. Judge this
+# by ear again once a working adapter is in, not before.
 TTS_POST_ROOM = ["reverb", "18", "50", "28", "100", "0", "-4"]
