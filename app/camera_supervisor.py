@@ -59,6 +59,12 @@ class CameraSupervisor:
         self._network_port = 0
         self._forced_off = False
 
+        # Loop carry-over, on the instance rather than local to run(), so _step() is a complete pass
+        # on its own and tests can call it one at a time. _interval is what the backoff accumulates
+        # into; _first distinguishes the startup probe (a longer Argus budget) from a re-probe.
+        self._interval = CAMERA_RETRY_INTERVAL_S
+        self._first    = True
+
     # ── setup ───────────────────────────────────────────────────────────────
 
     def configure(self, index: int, network_host: str | None, network_port: int,
@@ -134,53 +140,8 @@ class CameraSupervisor:
         try_open_camera returns in microseconds, so those attempts stay at the base interval —
         there is nothing to spare the machine from.
         """
-        interval = CAMERA_RETRY_INTERVAL_S
-        first    = True
         while not stop_evt.is_set():
-            mode   = self.effective_mode()
-            locked = self._forced_off
-            self.set_state(mode=mode, locked=locked)
-
-            if mode == "off":
-                if self._live:
-                    self._release("camera off (settings)" if not locked
-                                  else "locked off by --no-camera")
-                elif locked:
-                    self.set_state(reason="locked off by --no-camera", next_probe_at=0.0)
-                else:
-                    self.set_state(reason="camera off (settings)", next_probe_at=0.0)
-                interval = CAMERA_RETRY_INTERVAL_S
-            elif self._live:
-                # Parked on a live camera — but verify it is still DELIVERING. A camera unplugged
-                # mid-run (or a wedged CSI pipeline) just returns no frames forever, which is
-                # indistinguishable from a healthy idle camera unless we time it. Without this the
-                # dashboard goes on reporting cam_source="csi" at 0 fps, claiming a feed that no
-                # longer exists.
-                last = self._cam_thread.last_frame_t if self._cam_thread is not None else 0.0
-                if (self._cam_thread is not None and self._cam_thread.showing_live and last
-                        and (time.monotonic() - last) > CAMERA_STALL_S):
-                    self._release(f"camera stopped delivering frames "
-                                  f"({CAMERA_STALL_S:g}s with none) — looking for it again")
-                    interval = CAMERA_RETRY_INTERVAL_S
-            else:
-                # A shorter Argus budget on retries than at startup: a node that just appeared is
-                # warm, and we would rather come back around than block this thread for 10s.
-                budget = CSI_FIRST_FRAME_S if first else CSI_FIRST_FRAME_RETRY_S
-                cheap  = not device_signature()
-                cam, reason = try_open_camera(self._index, self._network_host, self._network_port,
-                                              csi_first_frame_s=budget,
-                                              force=self._probe_now.is_set())
-                first = False
-                if cam is not None:
-                    self._acquire(cam)
-                    interval = CAMERA_RETRY_INTERVAL_S
-                else:
-                    self._report_failure(reason)
-                    interval = (CAMERA_RETRY_INTERVAL_S if cheap
-                                else min(interval * 2, CAMERA_RETRY_MAX_S))
-
-            self._probe_now.clear()
-            self.set_state(next_probe_at=time.monotonic() + interval)
+            interval = self._step()
             # Wake early for shutdown or for an explicit "Probe now".
             deadline = time.monotonic() + interval
             while not stop_evt.is_set() and not self._probe_now.is_set():
@@ -188,6 +149,62 @@ class CameraSupervisor:
                 if remaining <= 0:
                     break
                 stop_evt.wait(min(0.25, remaining))
+
+    def _step(self) -> float:
+        """One decision pass. Returns how long to wait before the next one.
+
+        Split out of run()'s while body so it can be driven one pass at a time against a fake clock
+        and a fake try_open_camera, with no sleeping and no camera — the same shape as
+        ConversationSession.tick(now), and for the same reason. run() keeps only the waiting.
+
+        Everything observable happens here, including consuming the probe-now request and publishing
+        next_probe_at, so a test that calls this sees exactly what the running supervisor would do.
+        """
+        mode   = self.effective_mode()
+        locked = self._forced_off
+        self.set_state(mode=mode, locked=locked)
+
+        if mode == "off":
+            if self._live:
+                self._release("camera off (settings)" if not locked
+                              else "locked off by --no-camera")
+            elif locked:
+                self.set_state(reason="locked off by --no-camera", next_probe_at=0.0)
+            else:
+                self.set_state(reason="camera off (settings)", next_probe_at=0.0)
+            self._interval = CAMERA_RETRY_INTERVAL_S
+        elif self._live:
+            # Parked on a live camera — but verify it is still DELIVERING. A camera unplugged
+            # mid-run (or a wedged CSI pipeline) just returns no frames forever, which is
+            # indistinguishable from a healthy idle camera unless we time it. Without this the
+            # dashboard goes on reporting cam_source="csi" at 0 fps, claiming a feed that no
+            # longer exists.
+            last = self._cam_thread.last_frame_t if self._cam_thread is not None else 0.0
+            if (self._cam_thread is not None and self._cam_thread.showing_live and last
+                    and (time.monotonic() - last) > CAMERA_STALL_S):
+                self._release(f"camera stopped delivering frames "
+                              f"({CAMERA_STALL_S:g}s with none) — looking for it again")
+                self._interval = CAMERA_RETRY_INTERVAL_S
+        else:
+            # A shorter Argus budget on retries than at startup: a node that just appeared is
+            # warm, and we would rather come back around than block this thread for 10s.
+            budget = CSI_FIRST_FRAME_S if self._first else CSI_FIRST_FRAME_RETRY_S
+            cheap  = not device_signature()
+            cam, reason = try_open_camera(self._index, self._network_host, self._network_port,
+                                          csi_first_frame_s=budget,
+                                          force=self._probe_now.is_set())
+            self._first = False
+            if cam is not None:
+                self._acquire(cam)
+                self._interval = CAMERA_RETRY_INTERVAL_S
+            else:
+                self._report_failure(reason)
+                self._interval = (CAMERA_RETRY_INTERVAL_S if cheap
+                                  else min(self._interval * 2, CAMERA_RETRY_MAX_S))
+
+        self._probe_now.clear()
+        self.set_state(next_probe_at=time.monotonic() + self._interval)
+        return self._interval
 
     # ── internals ───────────────────────────────────────────────────────────
 
