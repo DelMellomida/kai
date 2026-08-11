@@ -1,5 +1,8 @@
 import json
+import os
 import random
+import shutil
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -258,6 +261,16 @@ class SessionCase(unittest.TestCase):
         # _prewarm_bank a session that never looks quiet. TestGreeting turns it on and drives the
         # flag itself.
         p = patch("ai.session.GREETING_ENABLED", False)
+        p.start()
+        self.addCleanup(p.stop)
+        # The cross-process greeting latch is a FILE (see GREETING_REPEAT_SUPPRESS_S). Pointed at a
+        # fresh temp path for every test, because the real one lives in /tmp and is shared with the
+        # robot: a test that wrote it would suppress the greeting on the next boot, and a test that
+        # read it would pass or fail depending on how recently Kai had been restarted.
+        self._greet_stamp_dir = tempfile.mkdtemp(prefix="kai-greet-stamp-")
+        self.greet_stamp = os.path.join(self._greet_stamp_dir, "kai_greeted.stamp")
+        self.addCleanup(shutil.rmtree, self._greet_stamp_dir, True)
+        p = patch("ai.session.GREETING_STAMP_PATH", self.greet_stamp)
         p.start()
         self.addCleanup(p.stop)
 
@@ -1293,6 +1306,88 @@ class TestGreeting(SessionCase):
             s._warm_all()
         self.assertEqual(self.voice.spoken, [GREETING_TEXT])
         self.assertEqual(self.mock_prewarm_canned.call_args_list, [])
+
+
+class TestGreetingAcrossProcesses(SessionCase):
+    """The second way to greet twice: a DIFFERENT process starting right after this one.
+
+    The in-memory latch cannot see that. Measured on the robot 2026-08-11 — a segfault at the
+    greeting, an automatic relaunch, and the whole line spoken again 57 s later. See
+    GREETING_REPEAT_SUPPRESS_S in config/wake.py.
+    """
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("GREETING_ENABLED", True), ("GREETING_QUIET_WAIT_S", 0.0)):
+            p = patch(f"ai.session.{name}", value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def stamp(self, age_s):
+        """Write the stamp as though a previous process greeted `age_s` seconds ago."""
+        import time as _time
+        with open(self.greet_stamp, "w") as fh:
+            fh.write("previous process\n")
+        when = _time.time() - age_s
+        os.utime(self.greet_stamp, (when, when))
+
+    def test_a_relaunch_inside_the_window_stays_quiet(self):
+        self.stamp(10.0)
+        self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [])
+
+    def test_a_relaunch_after_the_window_greets_normally(self):
+        # Restarting to hear a change is normal, and must not be answered with silence.
+        self.stamp(sess_mod.GREETING_REPEAT_SUPPRESS_S + 5.0)
+        self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_a_first_ever_boot_greets(self):
+        # No stamp at all: /tmp cleared by a reboot, or a robot that has never greeted.
+        self.assertFalse(os.path.exists(self.greet_stamp))
+        self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_the_stamp_is_written_before_the_audio_starts(self):
+        # THE case this exists for: the crashing run died partway through its own greeting. A stamp
+        # written only after the audio finished would never have been written by that run at all,
+        # and the relaunch would have greeted anyway.
+        seen = []
+        s = self.make()
+        self.voice.speak_text = lambda text, epoch=None: seen.append(
+            os.path.exists(self.greet_stamp))
+        s._speak_greeting()
+        self.assertEqual(seen, [True])
+
+    def test_a_stamp_dated_in_the_future_still_greets(self):
+        # This board has no RTC battery, so the clock steps when NTP lands. An unreadable age must
+        # err toward greeting: a missing greeting is the failure this feature must not cause.
+        self.stamp(-3600.0)
+        self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_zero_suppression_restores_greeting_on_every_start(self):
+        self.stamp(1.0)
+        with patch("ai.session.GREETING_REPEAT_SUPPRESS_S", 0.0):
+            self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_an_unwritable_stamp_never_costs_the_greeting(self):
+        # Best-effort in the one direction that matters: no stamp means a possible duplicate, and a
+        # duplicate greeting is far cheaper than a silent boot.
+        with patch("ai.session.GREETING_STAMP_PATH", os.path.join(self.greet_stamp, "nope", "x")):
+            self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_a_suppressed_greeting_still_leaves_a_working_session(self):
+        # The stamp gates the greeting and nothing else: the warm thread goes on to the bank, and a
+        # wake arriving straight after still gets its cached "Yes?".
+        self.stamp(1.0)
+        s = self.make()
+        s._warm_all()
+        self.assertEqual(self.voice.spoken, [])
+        self.wake(s, T0)
+        self.assertEqual([wav for wav, _ in self.voice.spoken_wavs], ["/tmp/ack.wav"])
 
 
 class TestWhisperTierScan(SessionCase):

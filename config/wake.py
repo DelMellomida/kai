@@ -243,6 +243,32 @@ GREETING_TEXT = (
     "Hi, I'm Kai. Everything I think runs on an NVIDIA Jetson Orin Nano behind this face, "
     "no cloud. Say Hey Kai, and ask me anything about DEVCON."
 )
+# A crash is not a boot, and the room can tell the difference.
+#
+# Measured on the robot 2026-08-11: face_track segfaulted 32 s in, exactly as the greeting's first
+# audio began (see SPEAKER_CARD_NAME_HINTS in config/voice.py for the cause), scripts/autostart.sh
+# relaunched it, and the room heard the entire greeting a SECOND time 57 s later. The first one still
+# played in full — paplay is a child process and outlives the parent that spawned it — with the jaw
+# frozen partway through, because the process driving it was gone.
+#
+# `_greeted` in ai/session.py cannot see any of that: it is a per-INSTANCE latch, and the second
+# greeting comes from a different process. So the fact is also written down where the NEXT process can
+# read it (GREETING_STAMP_PATH). Within this many seconds of the last greeting any Kai process spoke,
+# a starting process stays quiet and logs why.
+#
+# 90 s is sized against the relaunch cost, not taste: 5 s of supervisor backoff, up to 15 s waiting
+# for the capture device to be released, and ~30 s of startup before the greeting — so ~50 s is the
+# fastest a crash-relaunch can greet again, and this sits above it with slack. Deliberately NOT
+# minutes: restarting to hear a voice change is a normal thing to do, and a robot that stays silent
+# for five minutes reads as broken. It also covers an operator double-tapping /restart.
+#
+# Set 0.0 to greet on every process start, as before.
+GREETING_REPEAT_SUPPRESS_S = 90.0
+# Under ACK_WAV_DIR because it wants exactly that directory's lifetime: /tmp is cleared on reboot, so
+# a genuine cold boot always greets no matter how recently the previous process did. Wall-clock mtime
+# rather than a written timestamp is what is compared — see _greeting_age in ai/session.py for why a
+# monotonic clock cannot be used across two processes.
+GREETING_STAMP_PATH = "/tmp/kai_ack/kai_greeted.stamp"
 
 # ── Always-open capture ──────────────────────────────────────────────────────────
 # 1536 = 3 x WAKE_FRAME_LENGTH: at I2S_CAPTURE_RATE (48 kHz) each callback decimates to exactly one

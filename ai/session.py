@@ -24,6 +24,7 @@ Two design choices carry most of the weight:
 
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
@@ -50,7 +51,7 @@ from config.wake import (
     ACK_PRESYNTH, ACK_WAV_DIR, CANNED_ERROR, CANNED_NO_SPEECH,
     DEBUG_CAPTURE_DIR, DEBUG_CAPTURE_ENABLED,
     DEBUG_CAPTURE_KINDS, DEBUG_CAPTURE_MAX_FILES, DEBUG_CAPTURE_MAX_MB, GREETING_ENABLED,
-    GREETING_TEXT, HANDS_FREE_ENABLED,
+    GREETING_REPEAT_SUPPRESS_S, GREETING_STAMP_PATH, GREETING_TEXT, HANDS_FREE_ENABLED,
     MAX_UTTERANCE_S, MIC_LEGACY_CAPTURE,
     MIN_UTTERANCE_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
     SESSION_MAX_NO_SPEECH_STREAK, SESSION_NO_FACE_S, SESSION_NO_SPEECH_S,
@@ -104,6 +105,41 @@ REWARM_RETRY_S = 1.5         # one retry if the ack still got cancelled
 # thread forever, and the bank is best-effort anyway.
 GREETING_QUIET_WAIT_S = 20.0
 GREETING_POLL_S = 0.25
+
+
+def _greeting_age(now: float | None = None) -> float | None:
+    """Seconds since ANY Kai process last spoke the greeting, or None if that isn't known.
+
+    Wall clock (the stamp's mtime), deliberately not monotonic: the whole point is that a different
+    process wrote it, and monotonic clocks are not comparable across processes.
+
+    A stamp dated in the FUTURE reads as unknown rather than as recent. That happens for real on this
+    board — no RTC battery, so the clock steps when NTP lands — and unknown is the safe direction:
+    the failure this feature must never cause is a robot that stops greeting."""
+    try:
+        mtime = os.stat(GREETING_STAMP_PATH).st_mtime
+    except OSError:
+        return None            # never greeted, /tmp cleared by a reboot, or the path is unreadable
+    age = (time.time() if now is None else now) - mtime
+    return age if age >= 0.0 else None
+
+
+def _mark_greeting_spoken() -> None:
+    """Record that the greeting is being spoken NOW, for the next process to read.
+
+    Written BEFORE the audio starts, not after: the case this exists for is a process that dies
+    partway through the greeting, and one that stamped only on completion would never stamp at all —
+    which is precisely the run whose relaunch must stay quiet.
+
+    Best-effort. A stamp that cannot be written costs a duplicated greeting, so it must never cost
+    the greeting itself."""
+    try:
+        os.makedirs(os.path.dirname(GREETING_STAMP_PATH) or ".", exist_ok=True)
+        with open(GREETING_STAMP_PATH, "w") as fh:
+            fh.write(f"{time.time():.0f}\n")   # mtime is what's read; the text is for a human
+    except OSError as exc:
+        print(f"[session] WARNING: could not write the greeting stamp "
+              f"({GREETING_STAMP_PATH}: {exc}) — a crash-relaunch may greet twice", flush=True)
 
 
 class ConversationSession:
@@ -390,6 +426,18 @@ class ConversationSession:
             if self._greeted:
                 return
             self._greeted = True
+        # Two latches, because there are two ways to greet twice. The one above is this process
+        # re-entering start() (reresolve_mic). This one is a DIFFERENT process starting shortly after
+        # ours — a crash-relaunch, or an operator double-tapping /restart — which the in-memory latch
+        # cannot see. See GREETING_REPEAT_SUPPRESS_S in config/wake.py for the measurement.
+        age = _greeting_age()
+        if GREETING_REPEAT_SUPPRESS_S > 0.0 and age is not None and age < GREETING_REPEAT_SUPPRESS_S:
+            print(f"[session] greeting suppressed — a Kai process greeted {age:.0f}s ago, inside the "
+                  f"{GREETING_REPEAT_SUPPRESS_S:.0f}s window (GREETING_REPEAT_SUPPRESS_S). If this "
+                  f"was not a restart you asked for, look above for a non-zero exit: this is what a "
+                  f"crash-and-relaunch looks like from here.", flush=True)
+            return
+        _mark_greeting_spoken()
         print(f"[session] greeting: {GREETING_TEXT}", flush=True)
         self._voice.speak_text(GREETING_TEXT)
         deadline = time.monotonic() + GREETING_QUIET_WAIT_S
