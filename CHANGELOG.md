@@ -37,7 +37,10 @@ after a restart). For that case `ai/filler._off_cooldown` relaxes the window one
 line that had just played, which is the one bar that matters most. A two-line pool therefore
 alternates rather than repeating. Stalls are untouched — their no-repeat story is per-wait, not
 per-exchange. Set the constant to 0 to switch the window off entirely. Restart-only.
-Suite green: 1261 passed, 2685 subtests (was 1258). Not yet verified on the robot.
+Suite green: 1261 passed, 2685 subtests (was 1258). Deployed and exercised on the robot — five
+`/voice/wake` turns ran clean through `recording → transcribing → thinking → done` — but **which
+opener each turn drew is unverified**: nothing about the filler is published on `/params`, so that
+needs `/tmp/face-servo.log`, which needs a shell.
 
 ## 2026-08-11 — Kai now speaks in a room, and breathes in Tagalog too
 
