@@ -20,6 +20,40 @@ Conventions:
 
 ---
 
+## 2026-08-11 — Every extra dashboard tab took the session lock 20 more times a second
+
+Suite green: 1246 passed (was 1239). Implements
+[S2](docs/tickets/S2-params-sse-snapshot-per-client.md).
+
+- **The cost scaled with the number of open tabs, on the locks the robot needs most.** Each
+  connected browser gets its own Flask generator thread calling `params_snapshot()` 20 times a
+  second, and that builds a ~70-key dict from four sources. One of them, `session.get_status()`,
+  holds the session `RLock` for most of its body and takes the assistant lock *inside* it — the same
+  `RLock` the ~30 blocks/s audio worker needs for VAD and the 20 Hz session tick holds. Two or three
+  tabs at a venue is a realistic load that had never been tested.
+- **And it was pure overhead.** The publishers only write at 25 Hz (`WEB_PUBLISH_INTERVAL`), so most
+  of that work produced JSON byte-identical to the previous tick. `DashboardState.cached_snapshot()`
+  now sits in front, with `WEB_PUBLISH_INTERVAL` as the max age — the rate the data can actually
+  change at, rather than a number chosen to feel safe.
+- **Measured builds per second: 1 tab 20.0 → 20.0, 2 tabs 40.0 → 20.0, 3 tabs 60.0 → 20.0, 5 tabs
+  100.0 → 20.0, 8 tabs 160.0 → 20.0.** Flat. **The single-tab case saves nothing** —
+  `_PARAMS_POLL_S` (0.05) is longer than `WEB_PUBLISH_INTERVAL` (0.04), so one client's polls always
+  find the cache expired. The ticket is about load scaling with tab count, and that is what goes
+  away; nobody testing with one tab open will see a difference, which is worth knowing before
+  someone concludes the change did nothing.
+- **One builder, not a thundering herd.** The ticket sketched the build outside any lock and accepted
+  duplicate builds under a race as harmless. It is harmless for correctness, but "a new client
+  connecting does not trigger an extra build" is one of the ticket's own criteria, and a wave of
+  tabs hitting a cold cache is exactly that case. A second `_build_lock` admits one builder; the
+  losers wait, re-check, and find the fresh snapshot. `build()` still never runs under the lock that
+  guards the cached value, so a slow `session.get_status()` cannot serialise readers.
+
+What is unchanged: `params_snapshot()` itself is untouched and still directly testable, the SSE key
+set and per-client cadence are identical, and `dashboard.html` needed no changes. What is unproven:
+the criterion that matters most — three `/params` clients plus a `/video` client with
+`[control] N Hz` holding and `sess_blocks_dropped` flat — measures contention on the robot and stays
+open.
+
 ## 2026-08-10 — Kai forgot your name six questions after you gave it
 
 Suite green: 1239 passed, 2705 subtests (was 1190, 2700). Implements
