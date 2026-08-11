@@ -270,7 +270,7 @@ def _publish_status(cam_thread, servo, last_status_t: float) -> float:
 def _register_settings_callbacks() -> None:
     """Subscribe the knobs that cannot simply be read at the point of use.
 
-    Everything else (camera_mode, servo_tracking, jaw_enabled, and all three TTS values) is PULLED via
+    Everything else (camera_mode, servo_tracking, jaw_enabled, and all six TTS values) is PULLED via
     settings.get() where it is used, which needs no wiring at all. The ones here either live inside an
     object that holds its own copy, or need a side effect beyond storing a number.
     """
@@ -282,6 +282,12 @@ def _register_settings_callbacks() -> None:
     # other reply used the new one.
     settings.on_change("tts_volume",       lambda v: _session.reprewarm_canned(), debounce=1.5)
     settings.on_change("tts_length_scale", lambda v: _session.reprewarm_canned(), debounce=1.5)
+    # The prosody parameters are the same case: the filler bank, the wake ack and the greeting are all
+    # pre-synthesised, so without these a sentence-pause or noise change would apply to live replies
+    # only and the cached lines would audibly disagree with them mid-conversation.
+    settings.on_change("tts_sentence_silence", lambda v: _session.reprewarm_canned(), debounce=1.5)
+    settings.on_change("tts_noise_scale",  lambda v: _session.reprewarm_canned(), debounce=1.5)
+    settings.on_change("tts_noise_w",      lambda v: _session.reprewarm_canned(), debounce=1.5)
 
     # Apply the persisted values ONCE at startup. Callbacks only fire on change, and the gate and the
     # wake detector were constructed from the config defaults before settings.load() ran — so a value
