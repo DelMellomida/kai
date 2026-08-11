@@ -42,6 +42,40 @@ Suite green: 1261 passed, 2685 subtests (was 1258). Deployed and exercised on th
 opener each turn drew is unverified**: nothing about the filler is published on `/params`, so that
 needs `/tmp/face-servo.log`, which needs a shell.
 
+## 2026-08-11 — Only one speaker plays, and it is not this repo's fault. The amp the comments describe is not in the build
+
+No code behaviour changes here. **The Jetson is sending correct, balanced stereo and the fault is
+inside the speaker set**, so this entry exists to record the measurements that cleared the software
+and to correct the hardware the comments have been reasoning about for months.
+
+- **The output path is provably symmetric.** Sink `analog-stereo`, channel map
+  `front-left,front-right`, `Mute: no`, **balance 0.00**, both channels at 56210 / 86% / −4.00 dB;
+  ALSA `Front Left 33 [on]` / `Front Right 33 [on]`; every WAV Kai plays 2-channel with per-channel
+  RMS matched to within 0.05 dB (`kai_tts.wav`: −16.12 / −16.10). Nothing here can favour a side.
+- **The speaker sums L+R into its one working driver.** A left-only and a right-only 500 Hz tone —
+  verified genuinely one-sided at −9.03 / −inf and −inf / −9.03 before playing — **both came out of
+  the same driver**. That is the whole diagnosis: no signal is lost, the second driver simply
+  receives nothing, and the summing happens downstream of everything this repo controls. It also
+  rules out the obvious suspect, a half-inserted TRS plug, which would have made the right tone
+  *silent* rather than audible from the other side.
+- **There is no PAM8403.** `docs/hardware.md` listed one as the output stage and `config/voice.py`
+  justified both the mono→stereo duplication and the 90 Hz high-pass by its response into a small
+  driver. The build actually runs a self-powered USB desktop speaker off the same C-Media dongle
+  (`Audio Adapter (Unitek Y-247A)`). Corrected in both places, and **`TTS_POST_HIGHPASS` is now
+  marked inherited rather than measured** — 90 Hz was never re-derived against the speaker fitted.
+- **`TTS_POST_CHANNELS` stays at 2**, with the reason written down: the two channels are
+  byte-identical (L−R at −99.34 dB on the dry chain), so duplication costs nothing on a mono-summing
+  speaker and stays right the moment a working stereo one is plugged in.
+- **`TTS_POST_ROOM`'s stereo-depth is deliberately left at 100.** The width is real — (L−R)/2 measures
+  −38.31 dB against a −16.14 dB sum, 22 dB down but far above the dry chain's −99.34 dB, which also
+  proves sox inserts its channel duplication *before* the reverb — and a mono-summing speaker cancels
+  part of it. Setting it to 0 would recover that, but it tunes the voice to a speaker with a dead
+  driver. Fix the speaker first.
+
+Measured while looking, and **not** a regression: `compand` clips a few hundred samples mid-chain on
+every variant of the chain — **362 on the old pre-2026-08-11 chain, 323 with the new high-pass**, so
+the high-pass improved it. Final peak is −1.00 dB either way.
+
 ## 2026-08-11 — The startup greeting was spoken twice, a minute apart, with the jaw frozen partway through the first one
 
 Not a bug in the greeting. `face_track` **segfaulted at the first playback** and

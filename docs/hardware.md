@@ -27,8 +27,17 @@ Kai runs with **none** of these attached — "no camera" is a reported state, no
 |-----------|-------|
 | INMP441 I2S MEMS microphone | The default mic. Captured raw on ALSA card `APE` at 48 kHz with PulseAudio suspended — see `config/voice.py` |
 | USB audio dongle (C-Media) | Output DAC. Named as a PulseAudio sink in `TTS_SINK`, and its card profile is asserted on every start because Pulse flips it to S/PDIF unprompted |
-| PAM8403 amplifier + speaker | Driven from the dongle's analog jack |
+| Self-powered USB desktop speaker | Driven from the dongle's analog jack; USB carries power only. **Not** the PAM8403 this table claimed until 2026-08-11 — that amp is not in the build, and several tuning comments in `config/voice.py` still rest on its response |
 | USB microphone *(optional)* | Automatic fallback when the I2S mic reads silent or refuses to open |
+
+> **The speaker sums left and right into one driver, and its second driver is silent.** Measured
+> 2026-08-11: a left-only and a right-only 500 Hz tone (verified one-sided at −9.03 / −inf and
+> −inf / −9.03) both came out of the *same* driver. Nothing is lost — the working driver receives
+> both channels — but a fault inside the speaker set or its inter-satellite lead means half the
+> enclosure is dead. **The Jetson side was cleared in the same session**: sink `analog-stereo`,
+> channel map `front-left,front-right`, balance 0.00, both channels at 86% / −4.00 dB, ALSA
+> `Front Left`/`Front Right` both on, and every WAV Kai plays 2-channel with per-channel RMS matched
+> to within 0.05 dB. Check the speaker on another source before suspecting this repo.
 
 > **The I2S wiring is not recorded in this repo.** `config/voice.py` documents the *software* side
 > in detail — the XBAR/I2S2 route applied by `apply_i2s_route()`, the 48 kHz clock, stereo capture

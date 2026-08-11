@@ -278,9 +278,11 @@ to understand at an event, `TTS_POST_ROOM = []` keeps the EQ and drops the space
 
 Two additions, each behind its own constant so loudness and naturalness revert independently:
 
-- **A high-pass around 90 Hz.** The PAM8403 into a small driver reproduces nothing down there; the
+- **A high-pass around 90 Hz.** A small driver reproduces nothing down there; the
   energy only eats headroom that the compand then reacts to. Also the cheapest way to stop the
-  chassis buzzing on plosives.
+  chassis buzzing on plosives. *(Written against "the PAM8403", which turned out not to be in the
+  build — see docs/hardware.md. The 90 Hz figure is inherited, not measured against the speaker
+  actually fitted.)*
 - **A very short room** — sox `reverb` at low wetness, small room scale. Bone-dry mono is a synthetic
   cue in itself, and this is the one item in the whole plan that changes the *space* rather than the
   voice. Free: sox is already in the chain.
