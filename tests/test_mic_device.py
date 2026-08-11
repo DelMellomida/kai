@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
+from ai import mic_device
 from ai.mic_device import (
     _candidate_input_devices,
     _capture_rates_for,
@@ -58,6 +59,96 @@ class TestCandidateInputDevices(unittest.TestCase):
             candidates = _candidate_input_devices(devices)
         self.assertNotIn(0, candidates)
         self.assertIn(1, candidates)
+
+
+class TestSpeakerCardIsNeverCaptured(unittest.TestCase):
+    """The 2026-08-11 segfault: capturing the card the speaker plays out of.
+
+    The C-Media dongle is both the only output sink and an input device. Raw capture there, plus the
+    `pactl set-card-profile` tts.play() runs before the first reply, took the process down at the
+    startup greeting — and the relaunch greeted the room a second time. See SPEAKER_CARD_NAME_HINTS
+    in config/voice.py.
+    """
+
+    def setUp(self):
+        # The skip log is once per device name per process; clear it so each test sees its own state.
+        mic_device._speaker_card_logged.clear()
+
+    def test_an_input_on_the_speakers_card_is_not_a_candidate(self):
+        devices = [
+            {"name": "USB Audio Device: - (hw:0,0)", "max_input_channels": 1},
+            {"name": "NVIDIA Jetson Orin Nano APE: - (hw:2,1)", "max_input_channels": 16},
+        ]
+        with patch("ai.mic_device.sd.default") as mock_default:
+            mock_default.device = [-1, -1]
+            candidates = _candidate_input_devices(devices)
+        self.assertEqual(candidates, [1])
+
+    def test_the_system_default_is_dropped_too_when_it_points_at_that_card(self):
+        # The default seed bypasses the classification loop, so it needs the check of its own.
+        devices = [
+            {"name": "USB Audio Device: - (hw:0,0)", "max_input_channels": 1},
+            {"name": "APE (hw:2,1)", "max_input_channels": 16},
+        ]
+        with patch("ai.mic_device.sd.default") as mock_default:
+            mock_default.device = [0, 0]
+            candidates = _candidate_input_devices(devices)
+        self.assertNotIn(0, candidates)
+
+    def test_a_pulse_default_entry_is_kept(self):
+        # "default"/"pulse" do not match the hints, and that asymmetry is the point: going through
+        # pulse is the SAFE way to touch that card, because pulse coordinates access to it.
+        devices = [
+            {"name": "default", "max_input_channels": 32},
+            {"name": "USB Audio Device: - (hw:0,0)", "max_input_channels": 1},
+        ]
+        with patch("ai.mic_device.sd.default") as mock_default:
+            mock_default.device = [0, 0]
+            candidates = _candidate_input_devices(devices)
+        self.assertEqual(candidates, [0])
+
+    def test_a_separate_usb_mic_is_unaffected(self):
+        # The guard names the speaker's card, not "anything USB" — a real USB mic stays the fallback.
+        devices = [{"name": "USB PnP Sound Device: - (hw:1,0)", "max_input_channels": 1}]
+        with patch("ai.mic_device.sd.default") as mock_default:
+            mock_default.device = [-1, -1]
+            candidates = _candidate_input_devices(devices)
+        self.assertEqual(candidates, [0])
+
+    def test_emptying_the_hints_restores_the_old_behaviour(self):
+        devices = [{"name": "USB Audio Device: - (hw:0,0)", "max_input_channels": 1}]
+        with patch("ai.mic_device.sd.default") as mock_default, \
+             patch("ai.mic_device.SPEAKER_CARD_NAME_HINTS", ()):
+            mock_default.device = [-1, -1]
+            candidates = _candidate_input_devices(devices)
+        self.assertEqual(candidates, [0])
+
+    def test_resolution_prefers_no_mic_over_the_speakers_card(self):
+        """The trade, asserted so nobody has to rediscover it.
+
+        With the I2S mic reading silent and only the speaker's card left, resolution falls through to
+        the pulse-mediated default (device=None) instead of handing back the dongle. That run may be
+        deaf; the alternative was a SIGSEGV at the greeting and a relaunch that greeted again.
+        """
+        devices = [
+            {"name": "APE tegra-dlink-0 (hw:APE,0)", "max_input_channels": 16,
+             "default_samplerate": 48000.0},
+            {"name": "USB Audio Device: - (hw:0,0)", "max_input_channels": 1,
+             "default_samplerate": 44100.0},
+        ]
+        probed = []
+
+        def probe(device, rate, channels, take_channel, retries=0):
+            probed.append(device)
+            return False            # the I2S mic reads silent, as it did on the robot
+
+        with patch("ai.mic_device.sd.query_devices", return_value=devices), \
+             patch("ai.mic_device.sd.default") as mock_default, \
+             patch("ai.mic_device._probe_is_live", side_effect=probe):
+            mock_default.device = [-1, -1]
+            choice = resolve_input_device()
+        self.assertIsNone(choice.device)
+        self.assertNotIn(1, probed)   # never even opened for a probe
 
 
 class TestPulseSuspend(unittest.TestCase):
@@ -229,6 +320,12 @@ class TestResolveInputDevice(unittest.TestCase):
         resampled. The old code took the advertised rate and handed back 44100, and MicStream.open()
         died on `decimation needs an integer ratio, got 44100 -> 16000`, which took hands-free AND
         push-to-talk down. 48000 was available the entire time.
+
+        SPEAKER_CARD_NAME_HINTS is emptied here on purpose. On the real robot this exact device is now
+        skipped outright, because it is also the speaker (2026-08-11 — see
+        TestSpeakerCardIsNeverCaptured). What is under test in THIS case is the rate arithmetic, which
+        every non-I2S device still depends on, so the guard is switched off rather than the device
+        renamed — a renamed device would stop being the dongle whose hw params are quoted above.
         """
         devices = [
             {"name": "USB Audio Device: - (hw:0,0)", "max_input_channels": 1,
@@ -239,6 +336,7 @@ class TestResolveInputDevice(unittest.TestCase):
             return rate in (44100, 48000)      # exactly what this dongle supports
 
         with patch("ai.mic_device.sd.query_devices", return_value=devices), \
+             patch("ai.mic_device.SPEAKER_CARD_NAME_HINTS", ()), \
              patch("ai.mic_device.sd.default") as mock_default, \
              patch("ai.mic_device._probe_is_live", side_effect=probe):
             mock_default.device = [-1, -1]

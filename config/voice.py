@@ -47,6 +47,41 @@ I2S_PROBE_RETRY_DELAY_S  = 0.4
 I2S_MIC_NAME_HINTS = ("APE", "tegra-dlink", "i2s")  # INMP441 enumerates on card "APE" / PCM "tegra-dlink-0"
 USB_MIC_NAME_HINTS = ("usb",)
 
+# Input devices that must NEVER be captured, because they are the SPEAKER's card.
+#
+# On this build the C-Media dongle is both the only output sink (TTS_SINK below) and an input device
+# ("USB Audio Device: - (hw:0,0)", one mono input). Capture there is RAW ALSA with pulse suspended
+# (see free_i2s_device), while playback goes through pulse on the same card — and tts.play() runs
+# `pactl set-card-profile` against that card immediately before the first paplay, i.e. re-opens its
+# ALSA devices underneath a live PortAudio capture stream.
+#
+# Measured on the robot 2026-08-11. Across 22 runs in one log the I2S probe timed out twice
+# (LIVE_PROBE_TIMEOUT_S), and both times selection fell to `device=0 rate=48000 ch=1 i2s=False` —
+# the speaker. One of those two runs died with SIGSEGV at 32 s, exactly as the startup greeting's
+# first audio began:
+#
+#   [session] greeting: Hi, I'm Kai. ...
+#   autostart.sh: line 196: 50270 Segmentation fault (core dumped) python3 .../face_track.py
+#   [autostart] face_track exited rc=139 after 32s — restarting in 5s
+#
+# and the relaunch greeted the room a second time. A milder form of the same collision is in the same
+# log as `could not set output card profile (... exit 1)` followed by `playback failed (Stream error:
+# No such entity)` — the sink disappearing out from under a reply.
+#
+# The trade, stated plainly: when the I2S mic fails to probe, that run now gets the pulse-mediated
+# system default instead of the raw dongle (MicChoice(None, ...) — and MicStream calls
+# resume_pulse_source() on any non-I2S choice, so that path is not left suspended). Pulse coordinates
+# access to the card, so it is safe where a raw open is not. If nothing usable is left, Kai is deaf
+# for that run and the log says so — strictly better than a segfault at the greeting, and
+# /audio/reresolve retries the mic without a restart.
+#
+# Matched as case-insensitive substrings of the PortAudio device name, exactly like the two hint lists
+# above. Because it IS a name match, keep it specific: it names the speaker's card, not "any USB audio
+# thing" — a separate USB mic ("USB PnP Sound Device") is unaffected, and a build whose speaker is not
+# this dongle needs this list changed with it. Set to () to allow capturing from the speaker's card
+# again, i.e. the pre-2026-08-11 behaviour and the crash it carried.
+SPEAKER_CARD_NAME_HINTS = ("usb audio device",)
+
 # Rates to try for a NON-I2S mic, in order, before giving up on that device. The I2S mic is
 # clock-locked to I2S_CAPTURE_RATE below and ignores this list.
 #
