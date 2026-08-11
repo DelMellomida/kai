@@ -20,6 +20,30 @@ Conventions:
 
 ---
 
+## 2026-08-11 — A long filler line now sits out two exchanges before it can come back
+
+The once-per-conversation rule (`_filler_used_openers`) only covers the FIRST lap through a
+language's openers. After that the rung is empty permanently and the only thing left was a
+single-entry back-to-back guard — so on the four-line `ceb` and `en` pools, which lap in four
+exchanges, a conversation could settle into A B A B for the rest of the demo. Two lines alternating
+announces itself as canned faster than either line simply recurring does.
+
+`FILLER_OPENER_COOLDOWN_TURNS = 2` (`config/filler.py`): the session keeps the openers of the last
+two exchanges instead of just the last one, so the tightest possible recurrence is A B C A. Not
+larger, because a pool must hold more than the window for it to bind at all — and the length cap can
+leave a language with as few as two warm openers (robot, 2026-08-09: `ceb 1op/10st, en 2op/10st`
+after a restart). For that case `ai/filler._off_cooldown` relaxes the window one exchange at a time,
+**oldest bar first**: a flat "bar all of them, else allow everything" fallback would hand back the
+line that had just played, which is the one bar that matters most. A two-line pool therefore
+alternates rather than repeating. Stalls are untouched — their no-repeat story is per-wait, not
+per-exchange. Set the constant to 0 to switch the window off entirely. Restart-only.
+
+Suite green: 1304 passed, 2710 subtests, the three new cases here being the only tests added.
+Deployed and exercised on the robot — five
+`/voice/wake` turns ran clean through `recording → transcribing → thinking → done` — but **which
+opener each turn drew is unverified**: nothing about the filler is published on `/params`, so that
+needs `/tmp/face-servo.log`, which needs a shell.
+
 ## 2026-08-11 — One corrupted byte on the servo wire could slam the head into its stop
 
 Suite green: 1254 passed, 2710 subtests (was 1249, 2710). Implements
