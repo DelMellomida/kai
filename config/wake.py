@@ -234,7 +234,15 @@ GREETING_ENABLED = True
 # only mean re-synthesising it on every voice change for a line that will never be said again), and
 # it plays while the filler bank is still cold — so a long greeting is dead air the robot cannot
 # fill. Set GREETING_ENABLED False for a silent boot (a demo table, a quiet room).
-GREETING_TEXT = "Hi, I'm Kai. Say Hey Kai, and ask me anything about DEVCON."
+#
+# The middle clause is the one people at a table actually react to: a cardboard face does not look
+# like it is doing anything locally, and "no cloud" is the whole point of the build. Phrased the same
+# way as the loud-room filler in config/filler.py so the two never contradict each other. It costs
+# roughly three extra seconds of boot audio — that is the trade, and it is paid once per process.
+GREETING_TEXT = (
+    "Hi, I'm Kai. Everything I think runs on an NVIDIA Jetson Orin Nano behind this face, "
+    "no cloud. Say Hey Kai, and ask me anything about DEVCON."
+)
 
 # ── Always-open capture ──────────────────────────────────────────────────────────
 # 1536 = 3 x WAKE_FRAME_LENGTH: at I2S_CAPTURE_RATE (48 kHz) each callback decimates to exactly one
