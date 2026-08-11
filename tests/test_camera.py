@@ -1,4 +1,6 @@
 import queue
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -304,6 +306,64 @@ class TestFrameHealth(unittest.TestCase):
             t._frame = frame
             t._last_frame_t = 99.0
         self.assertEqual(t.last_frame_t, 99.0)
+
+
+class TestFrameReadyEvent(unittest.TestCase):
+    """The signal that replaced the tracking loop's poll (R2).
+
+    The invariant these protect: the event is set exactly while a frame is waiting to be consumed.
+    If it can be set with no frame behind it, the main loop spins at full speed again — silently,
+    because nothing else would look different — which is the bug this change exists to remove."""
+
+    def _thread(self, frame=None):
+        cam = MagicMock()
+        cam.source_name = "local"
+        cam.read.return_value = frame
+        return CameraThread(cam, queue.Queue(maxsize=1))
+
+    def _store_one(self, t):
+        """One pass of the reader loop's store step, without running the thread."""
+        with t._lock:
+            t._frame = t._camera.read()
+            t._last_frame_t = 1.0
+            t._frame_ready.set()
+
+    def test_starts_clear(self):
+        self.assertFalse(self._thread().wait_for_frame(0))
+
+    def test_set_when_a_frame_is_stored(self):
+        t = self._thread(np.zeros((4, 4, 3), dtype=np.uint8))
+        self._store_one(t)
+        self.assertTrue(t.wait_for_frame(0))
+
+    def test_cleared_once_the_frame_is_consumed(self):
+        t = self._thread(np.zeros((4, 4, 3), dtype=np.uint8))
+        self._store_one(t)
+        self.assertIsNotNone(t.latest())
+        self.assertFalse(t.wait_for_frame(0),
+                         "event still set after latest() consumed the frame — the loop would spin")
+
+    def test_wait_returns_promptly_when_no_frame_arrives(self):
+        # The bound that keeps shutdown responsive and the idle rate at 25 Hz rather than 200.
+        t = self._thread()
+        started = time.monotonic()
+        self.assertFalse(t.wait_for_frame(0.02))
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_wait_wakes_as_soon_as_a_frame_is_stored(self):
+        # The half that makes this a latency improvement and not just a cheaper idle: a frame does
+        # not wait out the timeout. Generous bound — this asserts "woke early", not a deadline.
+        t = self._thread(np.zeros((4, 4, 3), dtype=np.uint8))
+        threading.Timer(0.01, lambda: self._store_one(t)).start()
+        started = time.monotonic()
+        self.assertTrue(t.wait_for_frame(5.0))
+        self.assertLess(time.monotonic() - started, 4.0)
+
+    def test_close_releases_a_waiter(self):
+        # Otherwise shutdown pays the full timeout on a loop that is already stopping.
+        t = self._thread()
+        t.close()
+        self.assertTrue(t.wait_for_frame(0))
 
 
 if __name__ == '__main__':

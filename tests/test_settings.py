@@ -7,7 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import settings
+from config.servo import JAW_SEND_INTERVAL
 from config.thinking import THINKING_SOUNDS, THINKING_SWEEP
+from config.tracking import NO_FRAME_WAIT, WEB_PUBLISH_INTERVAL
 from config.voice import TTS_ENABLED, TTS_LENGTH_SCALE, TTS_VOLUME
 from config.wake import HANDS_FREE_ENABLED, VAD_RMS_FLOOR, WAKE_SENSITIVITIES
 
@@ -342,6 +344,33 @@ class TestConcurrency(SettingsTestCase):
         self.assertTrue(seen)
         self.assertLessEqual(set(seen), wanted | {TTS_VOLUME},
                              "every observed value must be one that was actually written")
+
+
+class TestIdleWaitBounds(unittest.TestCase):
+    """`NO_FRAME_WAIT` against the two cadences it must not slow down (R2).
+
+    With no camera, this value IS the main loop's period, and the loop is the only thing driving the
+    jaw and `_publish_status` on that path. Set it above either obligation and the work does not stop
+    — it just quietly happens less often, which no other test would notice and no one would see on a
+    dashboard until a countdown looked wrong.
+
+    The two constants live in different config modules, and those modules deliberately import
+    nothing (they are flat constant files), so the relationship cannot be expressed as an assignment.
+    This is where it gets expressed instead."""
+
+    def test_does_not_slow_the_status_publisher(self):
+        self.assertLessEqual(NO_FRAME_WAIT, WEB_PUBLISH_INTERVAL)
+
+    def test_does_not_slow_the_jaw(self):
+        # R2 suggested pinning the wait to JAW_SEND_INTERVAL (0.05). That is the looser of the two
+        # and would have dropped /params from 25 Hz to 20 Hz — forbidden by the ticket's own third
+        # acceptance criterion. This assertion is what makes choosing the wrong one fail loudly.
+        self.assertLessEqual(NO_FRAME_WAIT, JAW_SEND_INTERVAL)
+
+    def test_is_bounded_well_under_a_second(self):
+        # Shutdown latency: the loop notices SIGTERM/KeyboardInterrupt one wait at a time.
+        self.assertGreater(NO_FRAME_WAIT, 0.0)
+        self.assertLess(NO_FRAME_WAIT, 0.5)
 
 
 if __name__ == "__main__":
