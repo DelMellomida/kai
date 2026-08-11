@@ -20,6 +20,46 @@ Conventions:
 
 ---
 
+## 2026-08-11 — The main loop ran 200 times a second to decide it had nothing to do
+
+Suite green: 1263 passed, 2710 subtests (was 1254, 2710). Implements
+[R2](docs/tickets/R2-idle-spin-loop-gil-contention.md). Measured **185.0 Hz → 22.0 Hz on the idle
+path, 8.4× fewer iterations** — on the dev box, not the Jetson; see the caveat at the end.
+
+- **The loop polled for frames instead of waiting for them.** `CameraThread.latest()` is
+  non-blocking and returns `None` until a fresh frame arrives, so `face_track.run()` slept
+  `NO_FRAME_SLEEP` (5 ms) and went round again. With `--no-camera`, an unprobed camera, a stalled
+  feed, or simply between frames at 30 fps, that is ~200 iterations a second — each doing real work
+  before deciding there was nothing to do: a `settings.get()` under an `RLock`, a
+  `speaking_openness()` call taking the assistant lock, a time comparison.
+- **All of it holds the GIL, which `config/tracking.py` records as the resource this box actually
+  runs out of.** The note on `INFERENCE_FPS` measured raising perception 15 → 22 fps collapsing the
+  pure-Python control thread from ~14 Hz to 6–10 Hz, with CPU, memory and thermals all in hand. A
+  permanent 200 Hz Python loop contends for exactly that, alongside the 15 Hz control thread, the
+  20 Hz session tick and the ~30 blocks/s audio worker — and it is worst in the degraded states
+  (`--no-camera`, stalled feed) where the servo and voice paths are the only things still working.
+- **`CameraThread` now signals a stored frame; the loop blocks on it.** A `threading.Event` set and
+  cleared *inside* `_lock` alongside `_frame`, which makes "event set" and "frame waiting" the same
+  fact rather than two that can disagree — the failure mode being a set event with nothing behind
+  it, which restores the full-speed spin silently and with nothing else looking different.
+  `close()` sets it too, so shutdown does not pay out a timeout on a loop that is already stopping.
+- **This is not a latency trade.** The old path slept a fixed 5 ms and could not notice a frame that
+  arrived 0.1 ms into it; the loop now wakes on the store itself, so a frame is picked up sooner
+  than the poll managed on average.
+- **The wait is bounded by `WEB_PUBLISH_INTERVAL` (0.04), not `JAW_SEND_INTERVAL` (0.05).** R2
+  suggested the latter, and it would have quietly dropped `/params` and the `cam_retry_in_s`
+  countdown from 25 Hz to 20 Hz — which the same ticket's third acceptance criterion forbids. The
+  ticket's criteria disagreed with each other and the tighter obligation wins. Written as
+  `NO_FRAME_WAIT = WEB_PUBLISH_INTERVAL` rather than a literal so the two cannot drift, with
+  `tests/test_settings.py::TestIdleWaitBounds` pinning it against `JAW_SEND_INTERVAL` as well — the
+  two constants live in config modules that deliberately import nothing, so a test is the only place
+  that relationship can be stated.
+
+What is still unproven: the measurement above is off-robot, and the *reason* for the change — GIL
+headroom for the 15 Hz control thread — is a Jetson claim. `[control] N Hz` with `--no-camera`
+should now read at or above its old value, and that number is worth capturing before and after on
+the next deploy. R2's two on-hardware criteria stay open until it is.
+
 ## 2026-08-11 — One corrupted byte on the servo wire could slam the head into its stop
 
 Suite green: 1254 passed, 2710 subtests (was 1249, 2710). Implements

@@ -49,7 +49,7 @@ class _NullServo:
 # ── Tuning ────────────────────────────────────────────────────────────────────
 # Tunable knobs live in config/tracking.py; re-imported here so the names stay module-level.
 from config.tracking import (
-    INFERENCE_FPS, NO_FRAME_SLEEP, EMA_ALPHA, PAN_SCALE, TILT_SCALE, MIN_FACE_AREA,
+    INFERENCE_FPS, NO_FRAME_WAIT, EMA_ALPHA, PAN_SCALE, TILT_SCALE, MIN_FACE_AREA,
     JAW_CLOSED, JAW_OPEN, JAW_EMA_ALPHA, JAW_DEADBAND, EMA_RESET_FRAMES,
     WEB_PUBLISH_INTERVAL, FACE_MIN_DETECTION_CONF, FACE_MIN_TRACKING_CONF,
     WEB_PORT, UPLOAD_DIR, SERVO_ABSENCE_FRAMES, NO_FACE_LOG_INTERVAL_S,
@@ -423,7 +423,11 @@ def run(args: argparse.Namespace) -> None:
             # frozen LIVE badge.
             last_status_t = _publish_status(cam_thread, servo, last_status_t)
             if frame is None:
-                time.sleep(NO_FRAME_SLEEP)   # avoid busy-spin when consuming faster than camera
+                # Block for the next frame instead of polling for it. Wakes immediately when one is
+                # stored, and otherwise after NO_FRAME_WAIT — which is what keeps the jaw animating
+                # and _publish_status honest on a robot with no camera at all. See config/tracking.py
+                # for why the bound is the publish interval and not the jaw interval.
+                cam_thread.wait_for_frame(NO_FRAME_WAIT)
                 continue
 
             live_rotate = args.rotate and cam_thread.source_name != "video_file"
