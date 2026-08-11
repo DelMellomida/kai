@@ -24,7 +24,8 @@ exists; the floor is what keeps it from sounding like a queue draining rather th
 No line repeats inside one conversation, openers or stalls -- the session tracks what it has spent
 and clears it in _begin_session, so a fresh greeting gets the whole bank back. That is a
 preference, not a promise: a conversation that outlasts the bank starts a second lap rather than
-going quiet.
+going quiet. On that second lap an opener still has to sit out FILLER_OPENER_COOLDOWN_TURNS
+exchanges, which is what keeps a small pool from settling into A B A B.
 
 Everything here is a plain string, pre-synthesised at startup like the other canned lines
 (see ai/tts.py prewarm_canned), so nothing in this file costs latency at speak time.
@@ -171,6 +172,25 @@ FILLER_DEFAULT_LANG = "tl"
 # lowest-stakes place in the whole system to mix them. Set to 0.0 to switch it off entirely.
 # English turns are never affected.
 FILLER_CEB_SHARE = 0.25
+
+# ── The opener cooldown ───────────────────────────────────────────────────────
+# How many exchanges an opener sits out after it plays, on top of the once-per-conversation
+# preference the session already keeps.
+#
+# The two rules cover different halves of a conversation. `_filler_used_openers` carries the FIRST
+# lap: nothing twice until the language's pool is spent. That rung then empties permanently, and
+# from that point on the only thing standing between a listener and a repeat is this window — which
+# was 1 (a single `_filler_last_opener`), so a Bisaya or English conversation, whose pools hold four
+# openers each and lap in four exchanges, could go A B A B for the rest of the demo. Two lines
+# alternating is more obviously canned than either line simply recurring.
+#
+# 2 means at least two other exchanges before a line can come back, so the tightest possible
+# recurrence is A B C A. Deliberately not larger: a pool has to hold more than this for the window
+# to bind at all, and the length cap can leave a language with as few as two warm openers (robot,
+# 2026-08-09: "ceb 1op/10st, en 2op/10st" after a restart). When the window would bar everything
+# ai/filler.pick_opener relaxes it one exchange at a time, oldest bar first, so a two-line pool
+# still alternates rather than going quiet — repeating beats silence, as everywhere else here.
+FILLER_OPENER_COOLDOWN_TURNS = 2
 
 # ── Rollout ───────────────────────────────────────────────────────────────────
 # Master switch. Off falls back to the single "Hmm, hmm. Hmm." in config/thinking.py, which is

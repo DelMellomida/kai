@@ -106,23 +106,42 @@ def _available(keys: list[str], have: set[str] | None = None,
     return keys
 
 
-def pick_opener(lang: str, rng: random.Random, avoid: str = "",
-                have: set[str] | None = None, used: set[str] | None = None) -> str:
-    """Key of the opener to play, never `avoid` (the one used last turn) unless it is the only one.
+def _off_cooldown(keys: list[str], recent: list[str]) -> list[str]:
+    """`keys` minus the recently played ones, relaxing the window from the OLDEST bar inward.
 
-    Back-to-back repeats are the single most noticeable tell that audio is canned — far more than
-    a repeat two or three turns apart — so that one case is excluded explicitly rather than left
-    to a uniform draw that hits it 1-in-12. `used` makes the stronger promise for the ordinary
-    case (nothing twice in one conversation); `avoid` is what still holds at the seam between two
-    conversations, where `used` has just been cleared.
+    A flat "exclude all of `recent`, or fall back to everything" collapses the moment a pool is no
+    bigger than the window: with two warm openers and a two-deep window, every candidate is barred
+    and the fallback hands back the full pool — including the line that played last turn, which is
+    the one case the window most needs to hold. Shrinking the window instead keeps the strongest
+    part of the promise for as long as the pool can pay for it, so a two-line pool alternates."""
+    for depth in range(len(recent), 0, -1):
+        fresh = [k for k in keys if k not in recent[-depth:]]
+        if fresh:
+            return fresh
+    return keys
+
+
+def pick_opener(lang: str, rng: random.Random, avoid: str | list[str] = "",
+                have: set[str] | None = None, used: set[str] | None = None) -> str:
+    """Key of the opener to play, never one of `avoid` (the recent ones) unless nothing else is left.
+
+    `avoid` is the openers of the last FILLER_OPENER_COOLDOWN_TURNS exchanges, OLDEST FIRST — a bare
+    string is accepted as a one-deep window. Repeats near in time are the single most noticeable
+    tell that audio is canned — far more than a repeat several turns apart — so those are excluded
+    explicitly rather than left to a uniform draw that hits them 1-in-12.
+
+    `used` makes the stronger promise for the ordinary case (nothing twice in one conversation), but
+    it empties permanently once a conversation has been through the pool. `avoid` is what carries
+    from there, and what holds at the seam between two conversations where `used` has just been
+    cleared. See _off_cooldown for what happens when the window outgrows the pool.
 
     Returns "" when nothing is warm, which is what lets the session fall back to the old "Hmm"."""
+    recent = [avoid] if isinstance(avoid, str) else list(avoid)
     keys = _available([f"{OPENER_PREFIX}_{lang}_{i}"
                        for i in range(len(FILLER_OPENERS.get(lang, ())))], have, (used,))
     if not keys:
         return ""
-    fresh = [k for k in keys if k != avoid] or keys
-    return rng.choice(fresh)
+    return rng.choice(_off_cooldown(keys, [k for k in recent if k]))
 
 
 def stall_queue(lang: str, rng: random.Random, have: set[str] | None = None,

@@ -41,8 +41,8 @@ from ai.wake_phrase import match_wake_phrase
 from config.filler import (
     BANK_LINE_RETRIES, BANK_PASSES, BANK_QUIET_POLL_S, BANK_QUIET_WAIT_TRIES, BANK_SYNTH_GAP_S,
     FILLER_DEFAULT_LANG, FILLER_DELAY_JITTER_S, FILLER_ENABLED, FILLER_MAX_LINE_S,
-    FILLER_MAX_SILENCE_S, FILLER_MAX_STALL_S, FILLER_MIN_GAP_S, FILLER_PLAYBACK_START_BUDGET_S,
-    FILLER_PREWARM, FILLER_STALL_GAP_JITTER_S,
+    FILLER_MAX_SILENCE_S, FILLER_MAX_STALL_S, FILLER_MIN_GAP_S, FILLER_OPENER_COOLDOWN_TURNS,
+    FILLER_PLAYBACK_START_BUDGET_S, FILLER_PREWARM, FILLER_STALL_GAP_JITTER_S,
 )
 from config.thinking import THINKING_SOUND_DELAY_S, THINKING_SOUND_TARGET_S, THINKING_SOUND_TEXT
 from config.voice import SAMPLE_RATE
@@ -156,7 +156,11 @@ class ConversationSession:
         self._filler_opened = False
         self._filler_queue: list[str] = []
         self._filler_next_at: float | None = None  # None = waiting for playback to end
-        self._filler_last_opener = ""              # so the same opener never lands back to back
+        # The openers of the last FILLER_OPENER_COOLDOWN_TURNS exchanges, oldest first, so a long
+        # line sits out a couple of turns before it can come back. One entry (the old
+        # _filler_last_opener) only ruled out back-to-back, which on the four-line ceb/en pools left
+        # A B A B available for the rest of a conversation once the used-set had emptied.
+        self._filler_recent_openers: list[str] = []
         self._filler_last_stall = ""               # the same, for stalls; see the note below
         # Every filler key already spent in THIS conversation, cleared by _begin_session. Scoped to
         # the conversation rather than the turn because the stall queue is rebuilt per turn and a
@@ -171,7 +175,7 @@ class ConversationSession:
         # twice inside one wait, which is where the ear actually notices. Heard on the robot
         # 2026-08-09 as the same stall twice in one exchange, on the small ceb/en banks that lap
         # inside a single wait. _filler_last_stall guards the seam neither set can: the very first
-        # pop after a rebuild. It deliberately survives _arm_filler, exactly like _filler_last_opener.
+        # pop after a rebuild. It deliberately survives _arm_filler, like _filler_recent_openers.
         self._filler_turn_stalls: set[str] = set()
 
         # Per-session facts, reset on every accepted wake.
@@ -657,8 +661,8 @@ class ConversationSession:
         #
         # Note this is NOT reached by a wake that lands in LISTEN_WAIT (see on_wake): saying "hey
         # Kai" again while it is already listening continues the conversation, so it keeps its
-        # history. _filler_last_opener deliberately survives, since it guards the one case a cleared
-        # set cannot — the same opener landing either side of the seam.
+        # history. _filler_recent_openers deliberately survives, since it guards the one case a
+        # cleared set cannot — the same opener landing either side of the seam.
         self._filler_used_openers.clear()
         self._filler_used_stalls.clear()
         self._gate.reset()
@@ -1084,7 +1088,7 @@ class ConversationSession:
             warm = {k for k in self._canned if k.startswith("filler_")}
             self._filler_lang = filler.pick_lang(self._voice.last_language(), self._filler_rng)
             key = filler.pick_opener(self._filler_lang, self._filler_rng,
-                                     avoid=self._filler_last_opener, have=warm,
+                                     avoid=self._filler_recent_openers, have=warm,
                                      used=self._filler_used_openers)
             if not key:
                 # Nothing warm for this language — early in a boot, or every opener was rejected by
@@ -1113,7 +1117,10 @@ class ConversationSession:
                     return True
                 return False
             self._filler_opened = True
-            self._filler_last_opener = key
+            self._filler_recent_openers.append(key)
+            # Keep the last COOLDOWN entries; a cooldown of 0 empties the list, which switches the
+            # window off entirely rather than pinning it at back-to-back.
+            del self._filler_recent_openers[:-FILLER_OPENER_COOLDOWN_TURNS or None]
             self._filler_used_openers.add(key)
             self._speak_filler(key)
             return True

@@ -53,7 +53,7 @@ module because they share one object.
 ## Acceptance criteria
 
 - [ ] A `FillerDriver` (or equivalently-named) collaborator owns: the RNG, the per-turn queue,
-      `_filler_lang`, `_filler_delay`, `_filler_opened`, `_filler_next_at`, `_filler_last_opener`,
+      `_filler_lang`, `_filler_delay`, `_filler_opened`, `_filler_next_at`, `_filler_recent_openers`,
       `_filler_last_stall`, and the three used-key sets. Its interface is roughly
       `arm(rng_seedless)`, `tick(now, elapsed, warm_keys, speaking: bool) -> str | None`,
       `reset_conversation()`.
