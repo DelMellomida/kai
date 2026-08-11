@@ -80,6 +80,15 @@ USB_MIC_NAME_HINTS = ("usb",)
 # thing" — a separate USB mic ("USB PnP Sound Device") is unaffected, and a build whose speaker is not
 # this dongle needs this list changed with it. Set to () to allow capturing from the speaker's card
 # again, i.e. the pre-2026-08-11 behaviour and the crash it carried.
+#
+# ⚠️ THIS GUARD FAILS SILENTLY IF THE DONGLE IS REPLACED, and as of 2026-08-11 that replacement is
+# expected: the C-Media adapter drives only one speaker channel and is on its way out (see
+# docs/hardware.md, which lists every constant a swap touches). The match is a case-insensitive
+# substring of the PortAudio device name, so a new adapter named anything else simply stops matching
+# and the segfault comes back with nothing in the log to explain it. Nothing breaks at the moment of
+# the swap — the guard only matters on the rare runs where the I2S mic fails its liveness probe — so
+# confirm it deliberately after swapping: look for "[mic] skipping input device" in
+# /tmp/face-servo.log, or confirm the new adapter offers no input at all.
 SPEAKER_CARD_NAME_HINTS = ("usb audio device",)
 
 # Rates to try for a NON-I2S mic, in order, before giving up on that device. The I2S mic is
@@ -697,10 +706,10 @@ TTS_LATENCY_MSEC = 200
 TTS_POST_PROCESS  = True
 TTS_POST_SOX      = "sox"   # sox binary (on PATH); swap for an absolute path if needed
 TTS_POST_CHANNELS = 2       # 2 = duplicate mono -> stereo (drive both output channels)
-# Keep this at 2 even though the speaker currently fitted sums L+R into its one working driver
-# (docs/hardware.md). The two channels are byte-identical here — measured, L-R at -99.34 dB on the dry
-# chain — so duplication costs nothing on a mono-summing speaker and stays correct the moment a
-# working stereo one is plugged in. Dropping to 1 would only hand the upmix to PulseAudio.
+# Keep this at 2 even though only one channel currently reaches a driver — the USB dongle is faulty
+# and due for replacement (docs/hardware.md). The two channels are byte-identical here — measured, L-R
+# at -99.34 dB on the dry chain — so duplication costs nothing today and is already correct the moment
+# a working adapter is plugged in. Dropping to 1 would only hand the upmix to PulseAudio.
 # sox effect chain applied after synthesis: light compression to lift perceived loudness, then
 # peak-normalize to -1 dB. Tune here without touching code (verified against sox 14.4.x).
 TTS_POST_EFFECTS  = ["compand", "0.3,1", "6:-70,-60,-20", "-5", "-90", "0.2", "gain", "-n", "-1"]
@@ -747,14 +756,13 @@ TTS_POST_HIGHPASS = ["highpass", "90"]
 # robot has already lost hands-free once to a loud room (see config/wake.py's ambient adaptation). If
 # Kai gets harder to understand at an event, set this to [] and keep the high-pass.
 #
-# The stereo-depth of 100 is REAL and, on the speaker currently fitted, partly wasted. Measured
-# 2026-08-11 on kai_tts.wav: the difference signal (L-R)/2 is -38.31 dB against a -16.14 dB sum, i.e.
-# 22 dB down but well above the -99.34 dB of the dry chain, whose channels are byte-identical. So sox
-# inserts its channel duplication BEFORE the reverb and the reverb genuinely decorrelates the two
-# tails. The speaker fitted right now sums L+R into one driver (docs/hardware.md), which partially
-# cancels exactly that component.
-# DELIBERATELY NOT CHANGED. Setting the fourth argument to 0 would preserve the whole room on a
-# mono-summing speaker — a one-character edit — but it tunes the voice to a speaker with a dead
-# driver and quietly costs the width back when a working one is plugged in. Fix the speaker first;
-# reach for this only if you decide the mono set is permanent.
+# The stereo-depth of 100 is REAL, and right now half of it is going nowhere. Measured 2026-08-11 on
+# kai_tts.wav: the difference signal (L-R)/2 is -38.31 dB against a -16.14 dB sum, i.e. 22 dB down but
+# well above the -99.34 dB of the dry chain, whose channels are byte-identical. So sox inserts its
+# channel duplication BEFORE the reverb and the reverb genuinely decorrelates the two tails — there is
+# a real stereo image here, and the faulty dongle (docs/hardware.md) is delivering one channel of it.
+# DELIBERATELY NOT CHANGED. Setting the fourth argument to 0 would collapse the room to mono, which
+# costs nothing while the output is one-channel anyway — but the cause is hardware that is being
+# replaced, and tuning the voice around it would quietly cost the width back the day it is. Judge this
+# by ear again once a working adapter is in, not before.
 TTS_POST_ROOM = ["reverb", "18", "50", "28", "100", "0", "-4"]
