@@ -272,8 +272,15 @@ FILLER_MAX_LINE_S = 10.0
 # perfectly snappy. 1.8 is still well inside "cut off mid-word reads as natural".
 #
 # The honest fix is to measure SPEECH rather than file length, which would let this go back under
-# 1.2 -- but tts.wav_duration is also what sizes the jaw-sync window, so trimming silence there is
-# a change with a second consumer and belongs in its own pass.
+# 1.2. Half of that now exists: ai/tts.wav_speech_span was added 2026-08-12 for the jaw (which was
+# the "second consumer" this note used to be waiting on -- see config/voice.py SPEAK_TRIM_SILENCE),
+# and it measures exactly the thing described here.
+#
+# DELIBERATELY NOT ADOPTED HERE, because the two caps are not asking the same question. The jaw
+# wants the speech: it should stop miming when the word stops. This cap wants the FILE: what it
+# bounds is how long the speaker is busy and Kai is deaf, and Piper's trailing pad is part of that
+# whether or not anyone can hear it. Re-derive 1.8 against the span before switching, and expect the
+# measured stalls to move by ~0.1-0.2 s each (measured on the robot's own WAVs 2026-08-12).
 FILLER_MAX_STALL_S = 1.8
 
 

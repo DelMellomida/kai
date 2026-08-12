@@ -604,6 +604,7 @@ class TestSpeak(unittest.TestCase):
              patch("ai.voice_assistant.tts.stop"), \
              patch("ai.voice_assistant.tts.synthesize", return_value="/tmp/kai_tts.wav") as mock_synth, \
              patch("ai.voice_assistant.tts.wav_duration", return_value=4.0), \
+             patch("ai.voice_assistant.tts.wav_speech_span", return_value=(0.0, 4.0)), \
              patch("ai.voice_assistant.tts.play") as mock_play, \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
             va._speak("One two three. Four five six.")
@@ -698,6 +699,70 @@ class TestSpeak(unittest.TestCase):
         self.assertIsNotNone(seen["ends_at"])
         # The two answer different questions: when the sound stops, and when the mic may reopen.
         self.assertAlmostEqual(seen["gate"] - seen["ends_at"], TTS_TAIL_MUTE_S, places=6)
+
+    def test_the_jaw_stays_shut_until_the_audio_actually_starts(self):
+        # Reported on the robot 2026-08-12: after "Hey Kai" the mouth moved and the "Yes?" arrived
+        # afterwards. tts.play() only spawns paplay — the first sample is ~0.2 s behind it — but the
+        # jaw window opened at the call, so on a line this short the mouth was most of the way
+        # through its mime before there was any sound at all.
+        from config.voice import TTS_PLAYBACK_LEAD_S
+
+        self.assertGreater(TTS_PLAYBACK_LEAD_S, 0.0, "the rest of this test would prove nothing")
+        va = make_assistant()
+        # The span is pinned to the whole file so this test is about the LEAD alone — and so it
+        # cannot read a real /tmp/kai_ack WAV when the suite happens to run on the robot.
+        with patch("ai.voice_assistant.tts.stop"), \
+             patch("ai.voice_assistant.tts.wav_duration", return_value=0.8), \
+             patch("ai.voice_assistant.tts.wav_speech_span", return_value=(0.0, 0.8)), \
+             patch("ai.voice_assistant.tts.play"), \
+             patch("ai.voice_assistant.time.monotonic", return_value=100.0), \
+             patch("ai.voice_assistant.threading.Thread", _InlineThread):
+            va.speak_wav("/tmp/kai_ack/kai_canned_ack.wav", "Yes?")
+        self.assertAlmostEqual(va._speak_start, 100.0 + TTS_PLAYBACK_LEAD_S)
+        # And the servo is told to keep the mouth closed through that window rather than being
+        # handed a negative time it might clamp to "open".
+        self.assertIsNone(va.speaking_openness(now=100.0))
+        self.assertIsNone(va.speaking_openness(now=100.0 + TTS_PLAYBACK_LEAD_S - 0.01))
+        self.assertIsNotNone(va.speaking_openness(now=100.0 + TTS_PLAYBACK_LEAD_S + 0.01))
+
+    def test_the_jaw_is_timed_to_the_speech_not_the_file(self):
+        # The other half of the same mismatch: Piper pads silence onto both ends, so the ack file is
+        # 0.82 s for a word that lasts 0.54 s. Miming across the whole file left the mouth open a
+        # quarter-second after the sound had stopped. The span here is the one measured off the
+        # robot's own /tmp/kai_ack/kai_canned_ack.wav on 2026-08-12.
+        from config.voice import TTS_PLAYBACK_LEAD_S
+
+        va = make_assistant()
+        seen = {}
+        # Read from INSIDE play(): _InlineThread runs the worker synchronously, so by the time
+        # speak_wav() returns _end_speech has already retired the audio end (see
+        # test_claiming_the_speaker_retires_the_previous_lines_jaw).
+        with patch("ai.voice_assistant.tts.stop"), \
+             patch("ai.voice_assistant.tts.wav_duration", return_value=0.82), \
+             patch("ai.voice_assistant.tts.wav_speech_span", return_value=(0.04, 0.58)), \
+             patch("ai.voice_assistant.tts.play",
+                   side_effect=lambda _p: seen.update(ends_at=va.audio_ends_at())), \
+             patch("ai.voice_assistant.time.monotonic", return_value=100.0), \
+             patch("ai.voice_assistant.threading.Thread", _InlineThread):
+            va.speak_wav("/tmp/kai_ack/kai_canned_ack.wav", "Yes?")
+        audio_starts = 100.0 + TTS_PLAYBACK_LEAD_S
+        self.assertAlmostEqual(va._speak_start, audio_starts + 0.04)      # skips the leading pad
+        self.assertAlmostEqual(va._speak_segments[-1][1], 0.58 - 0.04)    # and stops at the word
+        # The mic gate is NOT trimmed: the speaker is busy for the whole file either way.
+        self.assertAlmostEqual(seen["ends_at"], audio_starts + 0.82)
+
+    def test_an_unreadable_scan_falls_back_to_the_whole_file(self):
+        # A scan that cannot read the WAV must cost the trim and nothing else — never a jaw that
+        # fails to move, which is the one outcome worse than a mistimed one.
+        va = make_assistant()
+        with patch("ai.voice_assistant.tts.stop"), \
+             patch("ai.voice_assistant.tts.wav_duration", return_value=4.0), \
+             patch("ai.voice_assistant.tts.wav_speech_span", return_value=(0.0, 0.0)), \
+             patch("ai.voice_assistant.tts.play"), \
+             patch("ai.voice_assistant.threading.Thread", _InlineThread):
+            va.speak_wav("/tmp/line.wav", "One two three.")
+        self.assertIsNotNone(va._speak_start)
+        self.assertAlmostEqual(va._speak_segments[-1][1], 4.0)
 
     def test_a_pantomime_publishes_no_audio_end(self):
         # No sound is playing, so there is no end time — the session must fall back to its cap.
@@ -1474,6 +1539,7 @@ class TestMicMuted(unittest.TestCase):
         self.assertTrue(va._tts_active, "the gate must close before Piper is even started")
 
     def test_speak_sets_the_gate_from_the_wav_duration(self):
+        from config.voice import TTS_PLAYBACK_LEAD_S
         from config.wake import TTS_TAIL_MUTE_S
 
         va = make_assistant()
@@ -1485,7 +1551,10 @@ class TestMicMuted(unittest.TestCase):
              patch("ai.voice_assistant.time.monotonic", return_value=100.0), \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
             va._speak("One two three.")
-        self.assertAlmostEqual(va._gate_until, 100.0 + 4.0 + TTS_TAIL_MUTE_S)
+        # The lead is in here because the 4 s of audio does not begin at the play() call — the gate
+        # used to open TTS_PLAYBACK_LEAD_S early, into audio that was still coming out.
+        self.assertAlmostEqual(va._gate_until,
+                               100.0 + TTS_PLAYBACK_LEAD_S + 4.0 + TTS_TAIL_MUTE_S)
 
     def test_gate_is_released_even_when_the_worker_bails_out(self):
         va = make_assistant()
@@ -1589,7 +1658,11 @@ class TestSpeakWav(unittest.TestCase):
 
     def test_plays_the_cached_file_and_syncs_the_jaw(self):
         va = make_assistant()
+        # The span has to be faked alongside the duration: this names the ack WAV's REAL path, and
+        # on the robot that file exists — so an unpatched wav_speech_span would scan it off disk and
+        # this would assert against whatever Piper last wrote there.
         with patch("ai.voice_assistant.tts.wav_duration", return_value=0.6), \
+             patch("ai.voice_assistant.tts.wav_speech_span", return_value=(0.0, 0.6)), \
              patch("ai.voice_assistant.tts.play") as mock_play, \
              patch("ai.voice_assistant.threading.Thread", _InlineThread):
             va.speak_wav("/tmp/kai_ack/kai_canned_ack.wav", "Yes?", epoch=va.epoch)

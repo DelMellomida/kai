@@ -58,6 +58,7 @@ from config.voice import (
     ASR_NORMALIZE, ASR_NORMALIZE_MAX_GAIN, ASR_NORMALIZE_SCAN,
     RAG_CONTEXT_PLACEMENT, MAX_HISTORY_TURNS,
     IDENTITY_CAPTURE, IDENTITY_PROMPT,
+    SPEAK_TRIM_SILENCE, TTS_PLAYBACK_LEAD_S,
 )
 from config.wake import (
     CAPTURE_HARD_CAP_S, TTS_MAX_SPOKEN_CHARS, TTS_TAIL_MUTE_S,
@@ -618,9 +619,10 @@ class VoiceAssistant:
         """Drive the jaw 'speak window' and, when TTS is available, play `reply` aloud through the
         speaker. Non-blocking: synthesis + playback run on a daemon thread so no caller is held for
         the audio's length (notably the Flask verbatim say() path, which runs on the request thread).
-        _speak_start is set right before playback so the jaw and the audio start together. Any TTS
-        failure (disabled, engine/model missing, bad synth) falls back to the text-timed pantomime so
-        the mouth still moves. MUST be called OUTSIDE self._lock — it acquires the lock itself.
+        The jaw window is armed by _arm_jaw_for_wav() right before playback, which is what makes the
+        mouth and the sound line up — see there for the two offsets that takes. Any TTS failure
+        (disabled, engine/model missing, bad synth) falls back to the text-timed pantomime so the
+        mouth still moves. MUST be called OUTSIDE self._lock — it acquires the lock itself.
 
         NOTE: `reply` (with emoji) is what the UI shows; the SPOKEN text has emoji/symbols stripped
         (tts.clean_for_speech) and is then delivery-shaped (ai/delivery.shape — breaths, an occasional
@@ -673,19 +675,9 @@ class VoiceAssistant:
                     print(f"[tts] reply dropped before playback: epoch {epoch} is stale "
                           f"(now {self.epoch})", flush=True)
                     return
-                with self._lock:
-                    if duration > 0:
-                        self._speak_start, self._speak_segments = _speak_segments_for_duration(
-                            jaw_text, time.monotonic(), duration)
-                    else:                    # unknown length — best-effort text-timed window
-                        self._speak_start, self._speak_segments = _speak_segments(jaw_text, time.monotonic())
-                    # Hold the mic shut until the audio's own end plus the settle tail. Timed from
-                    # the WAV's length, not from paplay exiting: paplay returns once the file is in
-                    # the Pulse sink buffer, which is before the amp actually goes quiet.
-                    if duration > 0:
-                        self._audio_ends_at = time.monotonic() + duration
-                        self._gate_until = self._audio_ends_at + TTS_TAIL_MUTE_S
-                    if turn_t0 is not None:
+                self._arm_jaw_for_wav(wav, jaw_text, duration)
+                if turn_t0 is not None:
+                    with self._lock:
                         self._stage_ms["first_audio_ms"] = int((time.monotonic() - turn_t0) * 1000)
                 if turn_t0 is not None:
                     t = self.stage_timings()
@@ -703,6 +695,43 @@ class VoiceAssistant:
         # stretch voice_speaking can't see, since the jaw window only opens after synth returns.
         gen = self._begin_speech()
         threading.Thread(target=_worker, daemon=True, name="kai-tts").start()
+
+    def _arm_jaw_for_wav(self, wav, jaw_text: str, duration: float) -> None:
+        """Point the jaw at the SOUND in `wav`, and hold the mic shut until that sound has stopped.
+
+        Called immediately before tts.play() on every path that plays a file — the reply, the ack,
+        the canned failures, every filler line — so all of them line up the same way. MUST be called
+        OUTSIDE self._lock. `duration` is the file length the caller already read.
+
+        Two offsets, both measured on the robot 2026-08-12 and both documented in config/voice.py
+        (TTS_PLAYBACK_LEAD_S and SPEAK_TRIM_SILENCE). Both used to be zero, and their sum is why
+        "Hey Kai" was answered by a jaw that moved before the "Yes?" did:
+
+          * play() does not make sound; it spawns paplay, and the first sample is not audible for
+            another ~0.2 s while the process connects and the buffer fills. So the schedule starts
+            at now + TTS_PLAYBACK_LEAD_S rather than now. speaking_openness_at() already returns
+            None ahead of `start`, so the jaw simply stays shut through that window.
+          * The FILE is longer than the SPEECH — Piper pads silence at both ends. So the schedule
+            covers the audible span within the file, not the whole file.
+
+        The mic gate is deliberately NOT trimmed the same way: what it protects against is Kai
+        hearing itself, and the speaker is busy for the whole file (plus the lead, which is exactly
+        the reason it now sums the two — the gate used to open a fifth of a second early)."""
+        now = time.monotonic()
+        audio_starts = now + TTS_PLAYBACK_LEAD_S
+        speech_from, speech_to = 0.0, duration
+        if SPEAK_TRIM_SILENCE and duration > 0:
+            lo, hi = tts.wav_speech_span(wav)
+            if hi > lo:                  # a silent or unreadable scan falls back to the whole file
+                speech_from, speech_to = lo, hi
+        with self._lock:
+            if duration > 0:
+                self._speak_start, self._speak_segments = _speak_segments_for_duration(
+                    jaw_text, audio_starts + speech_from, speech_to - speech_from)
+                self._audio_ends_at = audio_starts + duration
+                self._gate_until = self._audio_ends_at + TTS_TAIL_MUTE_S
+            else:                        # unknown length — best-effort text-timed window
+                self._speak_start, self._speak_segments = _speak_segments(jaw_text, audio_starts)
 
     def _begin_speech(self) -> int:
         """Claim the speaker for a new utterance and return that utterance's generation token.
@@ -795,14 +824,7 @@ class VoiceAssistant:
                 duration = tts.wav_duration(wav)
                 if not self._epoch_ok(epoch):
                     return
-                with self._lock:
-                    if duration > 0:
-                        self._speak_start, self._speak_segments = _speak_segments_for_duration(
-                            jaw_text, time.monotonic(), duration)
-                        self._audio_ends_at = time.monotonic() + duration
-                        self._gate_until = self._audio_ends_at + TTS_TAIL_MUTE_S
-                    else:
-                        self._speak_start, self._speak_segments = _speak_segments(jaw_text, time.monotonic())
+                self._arm_jaw_for_wav(wav, jaw_text, duration)
                 tts.play(wav)
             finally:
                 self._end_speech(gen)

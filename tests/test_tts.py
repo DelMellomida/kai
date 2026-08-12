@@ -1,5 +1,8 @@
+import struct
 import subprocess
+import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -487,6 +490,71 @@ class TestPrewarmCanned(_ResetProcState):
              patch("builtins.print"):
             out = tts.prewarm_canned({"ack": "Yes?", "err": "Oops."}, "/tmp/kai_ack")
         self.assertEqual(set(out), {"ack"})
+
+
+class TestWavSpeechSpan(unittest.TestCase):
+    """The jaw is timed to the SOUND in a WAV, not the file — Piper pads silence onto both ends,
+    0.29 s of the 0.82 s ack WAV on the robot. See ai/tts.wav_speech_span."""
+
+    def _write(self, path, blocks, rate=22050, channels=1):
+        """Write a WAV from (seconds, amplitude) blocks, so a test can say '0.2 s of silence, then
+        0.5 s of tone' and read the span straight back out."""
+        frames = bytearray()
+        for secs, amp in blocks:
+            for i in range(int(rate * secs)):
+                # Alternate sign every sample: a DC block would have an RMS of `amp` too, but a
+                # square wave is closer to what the scan actually meets.
+                s = amp if i % 2 else -amp
+                frames += struct.pack("<h", s) * channels
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(bytes(frames))
+        return path
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._dir.name)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_trims_the_silence_piper_pads_onto_both_ends(self):
+        wav = self._write(self.tmp / "ack.wav",
+                          [(0.20, 0), (0.50, 8000), (0.30, 0)])
+        start, end = tts.wav_speech_span(wav)
+        self.assertAlmostEqual(start, 0.20, places=1)
+        self.assertAlmostEqual(end, 0.70, places=1)
+        self.assertAlmostEqual(tts.wav_duration(wav), 1.00, places=2)   # the file is longer
+
+    def test_internal_pauses_stay_inside_the_span(self):
+        # A gap between two sentences is not the end of the speech. Only the outer edges are trimmed
+        # — the per-sentence pauses are the envelope's job, not this one's.
+        wav = self._write(self.tmp / "two.wav",
+                          [(0.10, 0), (0.30, 8000), (0.40, 0), (0.30, 8000), (0.10, 0)])
+        start, end = tts.wav_speech_span(wav)
+        self.assertAlmostEqual(start, 0.10, places=1)
+        self.assertAlmostEqual(end, 1.10, places=1)
+
+    def test_stereo_is_scanned_on_whole_frames(self):
+        # The post-processing chain writes 2ch (TTS_POST_CHANNELS); a scan stepping by samples
+        # rather than frames would read half-frames and mistime every reply that goes through it.
+        wav = self._write(self.tmp / "stereo.wav",
+                          [(0.20, 0), (0.50, 8000), (0.30, 0)], channels=2)
+        start, end = tts.wav_speech_span(wav)
+        self.assertAlmostEqual(start, 0.20, places=1)
+        self.assertAlmostEqual(end, 0.70, places=1)
+
+    def test_a_silent_wav_reports_the_whole_file(self):
+        # Falling back to the file is what keeps a failed scan from freezing the jaw shut.
+        wav = self._write(self.tmp / "quiet.wav", [(0.50, 0)])
+        self.assertEqual(tts.wav_speech_span(wav), (0.0, 0.5))
+
+    def test_an_unreadable_wav_reports_an_empty_span(self):
+        # The caller reads it as "no trim" and uses the file length. Silent by design: wav_duration
+        # has already warned about this same file.
+        self.assertEqual(tts.wav_speech_span(self.tmp / "nope.wav"), (0.0, 0.0))
 
 
 class TestIsPlaying(_ResetProcState):

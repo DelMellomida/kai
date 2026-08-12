@@ -7,8 +7,14 @@ face_track.py reads the result every frame and maps it onto the jaw servo.
 Entirely pure — text and timestamps in, a schedule out — which is why it is its own module. There
 are two ways to build the schedule and the difference matters: _speak_segments times it from the
 WORDS (used when synthesis is off or failed, so the mouth still moves), while
-_speak_segments_for_duration stretches it to the real synthesized audio length so the jaw stops the
-instant the sound does.
+_speak_segments_for_duration stretches it to a real audio length so the jaw stops the instant the
+sound does.
+
+Neither knows WHEN that audio starts, and both take `now` from their caller for exactly that
+reason: ai/voice_assistant._arm_jaw_for_wav passes a start in the FUTURE, because playback does not
+begin at the instant it is asked for, and a duration shorter than the WAV, because Piper pads
+silence at both ends. speaking_openness_at() returning None ahead of `start` is what lets the first
+of those work.
 
 The SPEAK_* envelope constants live in config/voice.py.
 """
