@@ -161,9 +161,11 @@ Worth reading before scheduling — several of these are cheaper or safer in a p
 - **A3 ‖ A1.** Independent, but they share one line of work: both want `_stage_ms` fields that are
   measured and never projected onto `/params` (`llm_load_ms` for A1, the token counts for A3). If
   both are scheduled, do that projection once.
-- **R11 → R9, R10.** R9 changes `PDAxis.update`'s rounding and R10 edits the loop's `send()` call.
-  R11's harness is what would pin either change to observed behaviour rather than to the behaviour
-  that replaced it. Landing R11 first costs nothing and gives both a regression test to change.
+- **R11 → R10.** R10 edits the loop's `send()` call, and R11's harness is what would pin that change
+  to observed behaviour rather than to the behaviour that replaced it. Landing R11 first costs
+  nothing and gives R10 a regression test to change. The same argument applied to **R9**, which
+  landed on 2026-08-09 without it — R9's own deferred criterion is the mirrored sweep, on hardware,
+  which is exactly the check R11 would have made cheap.
 - **R11 ‖ S8.** Same shape, same reason, no shared code: S8 builds the camera supervisor's harness,
   R11 the control loop's. S8 stays the prerequisite for R8; R11 does not feed a watchdog.
 
