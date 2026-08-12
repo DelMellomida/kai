@@ -38,7 +38,7 @@ from config.voice import (
     I2S_CAPTURE_RATE, I2S_MIC_NAME_HINTS, I2S_PROBE_RETRY_DELAY_S, I2S_PROBE_SILENT_RETRIES,
     I2S_PULSE_SOURCE, I2S_ROUTE_CARD, I2S_ROUTE_CONTROLS, I2S_SUSPEND_PULSE, I2S_TAKE_CHANNEL,
     LIVE_PROBE_DURATION_S, LIVE_PROBE_RMS_THRESHOLD, LIVE_PROBE_TIMEOUT_S,
-    PULSE_SUSPEND_ALL_SOURCES, SAMPLE_RATE, USB_MIC_NAME_HINTS,
+    PULSE_SUSPEND_ALL_SOURCES, SAMPLE_RATE, SPEAKER_CARD_NAME_HINTS, USB_MIC_NAME_HINTS,
 )
 from config.wake import MIXER_TIMEOUT_S
 
@@ -62,6 +62,32 @@ def _classify_device(name: str) -> str:
     if any(hint.lower() in lowered for hint in USB_MIC_NAME_HINTS):
         return "usb"
     return "other"
+
+
+def _is_speaker_card(name: str) -> bool:
+    """True if this input device sits on the same sound card as the speaker.
+
+    Capturing there is not merely a bad choice of mic — it is raw ALSA capture on a card that
+    tts.play() reconfigures with `pactl set-card-profile` before the first reply, and the process
+    segfaulted on the robot doing exactly that (2026-08-11, at the startup greeting). See
+    SPEAKER_CARD_NAME_HINTS in config/voice.py for the log excerpt and the trade."""
+    lowered = (name or "").lower()
+    return any(hint.lower() in lowered for hint in SPEAKER_CARD_NAME_HINTS if hint)
+
+
+# One log line per device name, not one per resolve: resolve_input_device() runs again on every
+# /audio/reresolve, and the reason a mic was skipped is a startup fact, not a per-attempt one.
+_speaker_card_logged: set[str] = set()
+
+
+def _log_speaker_card_skip(idx: int, name: str) -> None:
+    if name in _speaker_card_logged:
+        return
+    _speaker_card_logged.add(name)
+    print(f"[mic] skipping input device {idx} ({name!r}) — it is on the speaker's own card, and "
+          f"capturing it raw while playback reconfigures that card segfaulted the process at the "
+          f"startup greeting (see SPEAKER_CARD_NAME_HINTS in config/voice.py). Falling through to "
+          f"the pulse-mediated default; if nothing else is live, this run has no mic.", flush=True)
 
 
 def _capture_rates_for(kind: str, advertised: int) -> tuple[int, ...]:
@@ -100,7 +126,10 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
     USB, then everything else — with the system default heading the 'other' bucket. Keeps one
     representative per underlying ALSA card (avoids probing 20+ duplicate subdevice entries some
     cards expose). When no I2S/USB device is present this collapses to 'default first, then cards
-    in order' — the historical behavior."""
+    in order' — the historical behavior.
+
+    Devices on the speaker's own card are dropped entirely rather than ranked last: they are not a
+    worse mic, they are the one choice that can take the process down (_is_speaker_card)."""
     buckets: dict[str, list[int]] = {"i2s": [], "usb": [], "other": []}
     seen: set[int] = set()
 
@@ -108,14 +137,23 @@ def _candidate_input_devices(devices: list[dict]) -> list[int]:
         default_idx = sd.default.device[0]
     except Exception:
         default_idx = None
-    # Seed 'other' with the system default so it leads the non-preferred devices.
-    if isinstance(default_idx, int) and default_idx >= 0:
+    # Seed 'other' with the system default so it leads the non-preferred devices. Checked against
+    # the speaker's card too, because the default can point straight AT a hw device — the named
+    # "default"/"pulse" entries do not match the hints and so are unaffected, which is the point:
+    # going through pulse is the safe way to touch that card.
+    default_name = ""
+    if isinstance(default_idx, int) and 0 <= default_idx < len(devices):
+        default_name = devices[default_idx].get("name", "") or ""
+    if isinstance(default_idx, int) and default_idx >= 0 and not _is_speaker_card(default_name):
         buckets["other"].append(default_idx)
         seen.add(default_idx)
 
     seen_cards: set[str] = set()
     for idx, dev in enumerate(devices):
         if dev.get("max_input_channels", 0) <= 0 or idx in seen:
+            continue
+        if _is_speaker_card(dev.get("name", "")):
+            _log_speaker_card_skip(idx, dev.get("name", ""))
             continue
         m = _HW_CARD_RE.search(dev.get("name", ""))
         if m:

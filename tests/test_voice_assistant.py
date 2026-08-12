@@ -626,6 +626,87 @@ class TestSpeak(unittest.TestCase):
         self.assertIsNotNone(va._speak_start)          # pantomime window still set so the jaw moves
         self.assertEqual(len(va._speak_segments), 1)
 
+    def test_claiming_the_speaker_retires_the_previous_lines_jaw(self):
+        # The filler-cut-by-reply bug: _begin_speech kills the outgoing audio, and the jaw is a
+        # schedule that nothing else clears — so a filler cut mid-word went on miming the rest of
+        # its sentence in silence, all through the Piper run before the reply had a window.
+        # Observed from INSIDE play(), because _InlineThread runs the worker synchronously — by the
+        # time speak_wav() returns, playback has "finished" and _end_speech has tidied up. Mid-play
+        # is the state that matters here anyway: it is when the reply actually arrives.
+        va = make_assistant()
+        seen = {}
+
+        def _reply_arrives_mid_filler(_path):
+            seen["jaw_before"] = va._speak_start
+            seen["end_before"] = va.audio_ends_at()
+            with patch("ai.voice_assistant.tts.stop"):
+                va._begin_speech()                     # the reply takes the speaker
+            seen["jaw_after"] = va._speak_start
+            seen["segs_after"] = va._speak_segments
+            seen["end_after"] = va.audio_ends_at()
+
+        with patch("ai.voice_assistant.tts.stop"), \
+             patch("ai.voice_assistant.tts.wav_duration", return_value=9.0), \
+             patch("ai.voice_assistant.tts.play", side_effect=_reply_arrives_mid_filler), \
+             patch("ai.voice_assistant.threading.Thread", _InlineThread):
+            va.speak_wav("/tmp/filler.wav", "Hmm, let me think about that one.")
+
+        self.assertIsNotNone(seen["jaw_before"])       # the filler was miming
+        self.assertIsNotNone(seen["end_before"])
+        self.assertIsNone(seen["jaw_after"], "the cut filler must stop miming")
+        self.assertEqual(seen["segs_after"], ())
+        self.assertIsNone(seen["end_after"],
+                          "a stale end time would make the session cut the new line instantly")
+
+    def test_stop_speech_cuts_the_audio_and_the_jaw_together(self):
+        va = make_assistant()
+        seen = {}
+
+        def _interrupted(_path):
+            with patch("ai.voice_assistant.tts.stop") as mock_stop:
+                va.stop_speech()
+            seen["stopped"] = mock_stop.call_count
+            seen["jaw"] = va._speak_start
+            seen["end"] = va.audio_ends_at()
+
+        with patch("ai.voice_assistant.tts.stop"), \
+             patch("ai.voice_assistant.tts.wav_duration", return_value=6.0), \
+             patch("ai.voice_assistant.tts.play", side_effect=_interrupted), \
+             patch("ai.voice_assistant.threading.Thread", _InlineThread):
+            va.speak_wav("/tmp/line.wav", "A sentence that is going to be interrupted.")
+
+        self.assertEqual(seen["stopped"], 1)           # the audio was killed…
+        self.assertIsNone(seen["jaw"])                 # …and the mouth stopped with it
+        self.assertIsNone(seen["end"])
+
+    def test_audio_ends_at_is_the_wav_end_and_gate_is_that_plus_the_tail(self):
+        from config.wake import TTS_TAIL_MUTE_S
+        va = make_assistant()
+        seen = {}
+
+        def _capture(_path):
+            seen["ends_at"] = va.audio_ends_at()
+            seen["gate"] = va._gate_until
+
+        with patch("ai.voice_assistant.tts.enabled", return_value=True), \
+             patch("ai.voice_assistant.tts.stop"), \
+             patch("ai.voice_assistant.tts.synthesize", return_value="/tmp/kai_tts.wav"), \
+             patch("ai.voice_assistant.tts.wav_duration", return_value=5.0), \
+             patch("ai.voice_assistant.tts.play", side_effect=_capture), \
+             patch("ai.voice_assistant.threading.Thread", _InlineThread):
+            va._speak("One two three.")
+        self.assertIsNotNone(seen["ends_at"])
+        # The two answer different questions: when the sound stops, and when the mic may reopen.
+        self.assertAlmostEqual(seen["gate"] - seen["ends_at"], TTS_TAIL_MUTE_S, places=6)
+
+    def test_a_pantomime_publishes_no_audio_end(self):
+        # No sound is playing, so there is no end time — the session must fall back to its cap.
+        va = make_assistant()
+        with patch("ai.voice_assistant.tts.enabled", return_value=False):
+            va._speak("Hello there.")
+        self.assertIsNotNone(va._speak_start)   # the jaw still moves
+        self.assertIsNone(va.audio_ends_at())
+
     def test_synthesizes_emoji_stripped_text(self):
         # The UI keeps emoji; the spoken text must not (real clean_for_speech runs — not mocked).
         va = make_assistant()

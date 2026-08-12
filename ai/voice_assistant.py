@@ -117,6 +117,13 @@ class VoiceAssistant:
         self._speech_gen = 0
         self._last_language = ""       # last Whisper language label; read by the filler bank
         self._gate_until = 0.0         # monotonic deadline covering the sink drain + amp settle
+        # Monotonic time the audio now playing is expected to END, or None when nothing is playing
+        # or its length is unknown (a pantomime, or a WAV whose header wouldn't read). Published so
+        # ai/session.py can size STATE_SPEAKING's deadline to the reply actually being spoken —
+        # without it the session only has SESSION_SPEAK_MAX_UNKNOWN_S, armed before Piper even
+        # starts, which cut every long reply off mid-sentence. Distinct from _gate_until, which is
+        # this plus the settle tail and answers a different question (may the mic listen yet).
+        self._audio_ends_at: float | None = None
         self._capture_device: int | None = None
         self._capture_rate = SAMPLE_RATE
         self._capture_channels = CHANNELS
@@ -676,7 +683,8 @@ class VoiceAssistant:
                     # the WAV's length, not from paplay exiting: paplay returns once the file is in
                     # the Pulse sink buffer, which is before the amp actually goes quiet.
                     if duration > 0:
-                        self._gate_until = time.monotonic() + duration + TTS_TAIL_MUTE_S
+                        self._audio_ends_at = time.monotonic() + duration
+                        self._gate_until = self._audio_ends_at + TTS_TAIL_MUTE_S
                     if turn_t0 is not None:
                         self._stage_ms["first_audio_ms"] = int((time.monotonic() - turn_t0) * 1000)
                 if turn_t0 is not None:
@@ -711,10 +719,24 @@ class VoiceAssistant:
 
         2. Hand back a token so only the NEWEST utterance may clear _tts_active. A worker that
            finishes late must not report silence on behalf of a line that is still going.
+
+        3. Retire the outgoing line's JAW schedule and its expected audio end, both of which
+           describe audio that (1) is about to kill. Nothing else clears them — the schedule is a
+           plain (start, segments) pair that face_track.py reads every frame, and the only reset in
+           the class is start_recording()'s, which covers push-to-talk and nothing else. So a
+           filler cut mid-word by an arriving reply went on miming the rest of its sentence in
+           silence, for up to FILLER_MAX_LINE_S, right through the 0.5-1.5 s Piper run before the
+           reply had a window of its own. Clearing here rather than at each caller is what keeps
+           the fifth speech path from re-introducing it.
         """
         with self._lock:
             self._speech_gen += 1
             self._tts_active = True
+            self._speak_start, self._speak_segments = None, ()
+            # Load-bearing for the session's deadline: _enter_speaking arms it from on_done, which
+            # fires BEFORE this line's worker knows a duration. Leaving the previous line's (now
+            # past) end time in place would make the session cut this one the instant it started.
+            self._audio_ends_at = None
             gen = self._speech_gen
         # Outside the lock: stop() waits on a process, and the worker it cuts takes _lock in its
         # finally. Holding _lock across that is a deadlock.
@@ -726,6 +748,37 @@ class VoiceAssistant:
         with self._lock:
             if gen == self._speech_gen:
                 self._tts_active = False
+                # The jaw schedule is deliberately NOT cleared here: it ran exactly as long as the
+                # audio did, so it has already expired on its own, and speaking_openness_at()
+                # returns None past its end. Only the end TIME is retired, so a stale one can never
+                # be read as this reply's.
+                self._audio_ends_at = None
+
+    def audio_ends_at(self) -> float | None:
+        """Monotonic time the audio now playing should finish, or None if that isn't known.
+
+        None covers three real cases and they all mean the same thing to a caller: nothing is
+        playing, the WAV's header wouldn't read, or this is a silent text-timed pantomime. It is
+        also None for the whole synthesis window, since no length exists until Piper has run.
+
+        ai/session.py's STATE_SPEAKING deadline is the consumer — see _speaking_deadline() there
+        for why a fixed cap was not good enough."""
+        with self._lock:
+            return self._audio_ends_at
+
+    def stop_speech(self) -> None:
+        """Cut Kai off mid-word: kill the audio AND retire the jaw.
+
+        tts.stop() alone only kills the subprocess. The jaw runs off a schedule that no longer has
+        anything to do with whether sound is coming out, so every site that cuts audio has to
+        retire that too or the mouth keeps mouthing a sentence nobody can hear. Paired here so the
+        two cannot drift apart; ai/session.py calls this everywhere it used to call tts.stop()."""
+        with self._lock:
+            self._speak_start, self._speak_segments = None, ()
+            self._audio_ends_at = None
+        # Outside the lock, for the reason _begin_speech documents: stop() waits on a process whose
+        # worker takes _lock in its finally.
+        tts.stop()
 
     def speak_wav(self, wav: Path, jaw_text: str, epoch: int | None = None) -> None:
         """Speak an already-synthesized WAV (see tts.prewarm_canned) with the jaw synced to it.
@@ -746,7 +799,8 @@ class VoiceAssistant:
                     if duration > 0:
                         self._speak_start, self._speak_segments = _speak_segments_for_duration(
                             jaw_text, time.monotonic(), duration)
-                        self._gate_until = time.monotonic() + duration + TTS_TAIL_MUTE_S
+                        self._audio_ends_at = time.monotonic() + duration
+                        self._gate_until = self._audio_ends_at + TTS_TAIL_MUTE_S
                     else:
                         self._speak_start, self._speak_segments = _speak_segments(jaw_text, time.monotonic())
                 tts.play(wav)

@@ -1,5 +1,8 @@
 import json
+import os
 import random
+import shutil
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -25,6 +28,7 @@ from config.wake import (
     GREETING_TEXT,
     MAX_UTTERANCE_S, MIN_UTTERANCE_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
     SESSION_MAX_NO_SPEECH_STREAK, SESSION_NO_FACE_S, SESSION_NO_SPEECH_S,
+    SESSION_SPEAK_GRACE_S, SESSION_SPEAK_MAX_UNKNOWN_S,
     SESSION_START_ATTEMPTS, SESSION_START_BACKOFF_S, WAKE_ACK_MAX_S,
     VAD_HANGOVER_S, VAD_RMS_FLOOR, VAD_RMS_FLOOR_HOLD, WAKE_REFRACTORY_S, WAKE_SCAN_HANGOVER_S,
     WAKE_WHISPER_CHECK_MAX_S, WAKE_WHISPER_COOLDOWN_S,
@@ -120,6 +124,8 @@ class FakeVoice:
         self.stt_ready = True               # the turn model is loaded
         self.scan_ready = True              # the tiny wake-scan model is pre-warmed
         self.speaking = False
+        self.audio_end = None               # monotonic end of the audio playing, None = unknown
+        self.speech_cuts = 0                # times stop_speech() cut a line short
         self.gate_open = True               # mic_muted() returns `not gate_open`
         self.turns = []
         self.spoken = []
@@ -167,6 +173,19 @@ class FakeVoice:
     # speech
     def speech_in_flight(self):
         return self.speaking
+
+    def audio_ends_at(self):
+        # None = "length not known", which is the real assistant's answer for the whole synthesis
+        # window and for a silent pantomime. Tests that exercise the duration-sized speak deadline
+        # set this to an absolute time on the fake clock.
+        return getattr(self, "audio_end", None)
+
+    def stop_speech(self):
+        # Deliberately does NOT clear `speaking`: the real assistant releases _tts_active from the
+        # cut worker's finally, under a generation check, so that a cut cannot report silence on
+        # behalf of the line that replaced it.
+        self.speech_cuts += 1
+        self.audio_end = None
 
     def last_language(self):
         # Whisper's label for the previous utterance, which the filler bank reads to pick a
@@ -272,6 +291,16 @@ class SessionCase(unittest.TestCase):
         # _prewarm_bank a session that never looks quiet. TestGreeting turns it on and drives the
         # flag itself.
         p = patch("ai.session.GREETING_ENABLED", False)
+        p.start()
+        self.addCleanup(p.stop)
+        # The cross-process greeting latch is a FILE (see GREETING_REPEAT_SUPPRESS_S). Pointed at a
+        # fresh temp path for every test, because the real one lives in /tmp and is shared with the
+        # robot: a test that wrote it would suppress the greeting on the next boot, and a test that
+        # read it would pass or fail depending on how recently Kai had been restarted.
+        self._greet_stamp_dir = tempfile.mkdtemp(prefix="kai-greet-stamp-")
+        self.greet_stamp = os.path.join(self._greet_stamp_dir, "kai_greeted.stamp")
+        self.addCleanup(shutil.rmtree, self._greet_stamp_dir, True)
+        p = patch("ai.session.GREETING_STAMP_PATH", self.greet_stamp)
         p.start()
         self.addCleanup(p.stop)
 
@@ -528,7 +557,48 @@ class TestAckAndCooldown(SessionCase):
         self.voice.speaking = True
         s.tick(T0 + WAKE_ACK_MAX_S + 0.1)
         self.assertEqual(s.state, STATE_COOLDOWN)
-        self.mock_stop.assert_called()
+        # The jaw has to be cut with the audio, so stop_speech() rather than a bare tts.stop().
+        self.assertEqual(self.voice.speech_cuts, 1)
+
+    def test_a_long_reply_is_not_cut_off_by_the_unknown_duration_backstop(self):
+        # The regression this suite existed without: SESSION_SPEAK_MAX_UNKNOWN_S (20 s) is armed
+        # from on_done, BEFORE Piper starts, and was the only deadline a healthy reply ever got —
+        # while TTS_MAX_SPOKEN_CHARS allows ~31 s of speech. Every long answer was guillotined
+        # mid-sentence by the guard against a WEDGED paplay.
+        s = self.make()
+        s._set_state(STATE_SPEAKING, T0)
+        s._speak_deadline = T0 + SESSION_SPEAK_MAX_UNKNOWN_S
+        self.voice.speaking = True
+        self.voice.audio_end = T0 + 31.0        # a full-length reply, as the assistant measured it
+        for i in range(1, 31):
+            s.tick(T0 + i)
+            self.assertEqual(s.state, STATE_SPEAKING, f"cut off at {i}s into a 31s reply")
+        self.assertEqual(self.voice.speech_cuts, 0)
+
+    def test_a_reply_past_its_own_measured_end_is_still_cut(self):
+        # The backstop has to survive: a paplay that wedges overruns the end time it published.
+        s = self.make()
+        s._set_state(STATE_SPEAKING, T0)
+        s._speak_deadline = T0 + SESSION_SPEAK_MAX_UNKNOWN_S
+        self.voice.speaking = True
+        self.voice.audio_end = T0 + 4.0
+        s.tick(T0 + 4.0 + SESSION_SPEAK_GRACE_S - 0.1)
+        self.assertEqual(s.state, STATE_SPEAKING)   # still inside the allowed overrun
+        s.tick(T0 + 4.0 + SESSION_SPEAK_GRACE_S + 0.1)
+        self.assertEqual(s.state, STATE_COOLDOWN)
+        self.assertEqual(self.voice.speech_cuts, 1)
+
+    def test_an_unmeasurable_reply_falls_back_to_the_armed_cap(self):
+        # A silent pantomime, or a WAV whose header wouldn't read, publishes no end time.
+        s = self.make()
+        s._set_state(STATE_SPEAKING, T0)
+        s._speak_deadline = T0 + SESSION_SPEAK_MAX_UNKNOWN_S
+        self.voice.speaking = True
+        self.voice.audio_end = None
+        s.tick(T0 + SESSION_SPEAK_MAX_UNKNOWN_S - 0.1)
+        self.assertEqual(s.state, STATE_SPEAKING)
+        s.tick(T0 + SESSION_SPEAK_MAX_UNKNOWN_S + 0.1)
+        self.assertEqual(s.state, STATE_COOLDOWN)
 
     def test_cooldown_holds_while_the_amp_settles(self):
         # paplay exits once the WAV is in the sink buffer, before the amp is actually quiet.
@@ -934,7 +1004,8 @@ class TestPushToTalk(SessionCase):
         s = self.make()
         s._set_state(STATE_SPEAKING, T0)
         self.assertEqual(s.request_ptt_start(), {"status": "ok"})
-        self.mock_stop.assert_called()
+        # Audio AND jaw — a reply interrupted by the button must not go on mouthing itself.
+        self.assertEqual(self.voice.speech_cuts, 1)
         self.assertEqual(s.state, STATE_LISTEN_SPEECH)
 
     def test_start_takes_over_a_hands_free_session(self):
@@ -1352,6 +1423,88 @@ class TestGreeting(SessionCase):
             s._warm_all()
         self.assertEqual(self.voice.spoken, [GREETING_TEXT])
         self.assertEqual(self.mock_prewarm_canned.call_args_list, [])
+
+
+class TestGreetingAcrossProcesses(SessionCase):
+    """The second way to greet twice: a DIFFERENT process starting right after this one.
+
+    The in-memory latch cannot see that. Measured on the robot 2026-08-11 — a segfault at the
+    greeting, an automatic relaunch, and the whole line spoken again 57 s later. See
+    GREETING_REPEAT_SUPPRESS_S in config/wake.py.
+    """
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("GREETING_ENABLED", True), ("GREETING_QUIET_WAIT_S", 0.0)):
+            p = patch(f"ai.session.{name}", value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def stamp(self, age_s):
+        """Write the stamp as though a previous process greeted `age_s` seconds ago."""
+        import time as _time
+        with open(self.greet_stamp, "w") as fh:
+            fh.write("previous process\n")
+        when = _time.time() - age_s
+        os.utime(self.greet_stamp, (when, when))
+
+    def test_a_relaunch_inside_the_window_stays_quiet(self):
+        self.stamp(10.0)
+        self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [])
+
+    def test_a_relaunch_after_the_window_greets_normally(self):
+        # Restarting to hear a change is normal, and must not be answered with silence.
+        self.stamp(sess_mod.GREETING_REPEAT_SUPPRESS_S + 5.0)
+        self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_a_first_ever_boot_greets(self):
+        # No stamp at all: /tmp cleared by a reboot, or a robot that has never greeted.
+        self.assertFalse(os.path.exists(self.greet_stamp))
+        self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_the_stamp_is_written_before_the_audio_starts(self):
+        # THE case this exists for: the crashing run died partway through its own greeting. A stamp
+        # written only after the audio finished would never have been written by that run at all,
+        # and the relaunch would have greeted anyway.
+        seen = []
+        s = self.make()
+        self.voice.speak_text = lambda text, epoch=None: seen.append(
+            os.path.exists(self.greet_stamp))
+        s._speak_greeting()
+        self.assertEqual(seen, [True])
+
+    def test_a_stamp_dated_in_the_future_still_greets(self):
+        # This board has no RTC battery, so the clock steps when NTP lands. An unreadable age must
+        # err toward greeting: a missing greeting is the failure this feature must not cause.
+        self.stamp(-3600.0)
+        self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_zero_suppression_restores_greeting_on_every_start(self):
+        self.stamp(1.0)
+        with patch("ai.session.GREETING_REPEAT_SUPPRESS_S", 0.0):
+            self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_an_unwritable_stamp_never_costs_the_greeting(self):
+        # Best-effort in the one direction that matters: no stamp means a possible duplicate, and a
+        # duplicate greeting is far cheaper than a silent boot.
+        with patch("ai.session.GREETING_STAMP_PATH", os.path.join(self.greet_stamp, "nope", "x")):
+            self.make()._speak_greeting()
+        self.assertEqual(self.voice.spoken, [GREETING_TEXT])
+
+    def test_a_suppressed_greeting_still_leaves_a_working_session(self):
+        # The stamp gates the greeting and nothing else: the warm thread goes on to the bank, and a
+        # wake arriving straight after still gets its cached "Yes?".
+        self.stamp(1.0)
+        s = self.make()
+        s._warm_all()
+        self.assertEqual(self.voice.spoken, [])
+        self.wake(s, T0)
+        self.assertEqual([wav for wav, _ in self.voice.spoken_wavs], ["/tmp/ack.wav"])
 
 
 class TestWhisperTierScan(SessionCase):

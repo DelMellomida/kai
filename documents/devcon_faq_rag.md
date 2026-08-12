@@ -49,6 +49,14 @@ synonyms: [website, contact, links, social media, find you]
 A: DEVCON is at devcon.ph, with chapters listed at devcon.ph/chapters and its community platform at devcon.plus.
 
 ---
+id: chapters-count
+section: Chapters
+synonyms: [how many chapters, number of chapters, how many active, chapter count, how many branches, ilan ang chapters]
+---
+**Q: How many chapters does DEVCON have?**
+A: DEVCON has 9 active chapters — Metro Manila, Laguna, Legazpi, Pampanga, Cebu, Iloilo, Davao, Bukidnon, and Iligan — out of 12 in total. Bacolod, Bohol, and Cagayan de Oro (CDO) are currently inactive but retain volunteer-led communities.
+
+---
 id: chapters-locations
 section: Chapters
 synonyms: [where are chapters, cities, branches, active inactive]
@@ -115,10 +123,10 @@ A: Kai is built on NVIDIA Ampere architecture with Tensor Cores, using the CUDA 
 ---
 id: kai-stack
 section: Kai (robot)
-synonyms: [Kai tech stack, tools behind Kai, NMBLR.AI]
+synonyms: [Kai tech stack, tools behind Kai, NMBLR.AI, what software runs Kai, what model do you use, Arduino, Gemma, Whisper, Piper, Ollama, MediaPipe, open source]
 ---
 **Q: What's the tech stack behind Kai?**
-A: Kai's stack includes Claude Code, Micro:bit, Qwen, Google AI Suite, and NVIDIA. The Jetson Orin Nano was lent by the NMBLR.AI team.
+A: Kai runs on an NVIDIA Jetson Orin Nano lent by the NMBLR.AI team, and its code was written with Claude Code. MediaPipe tracks the face, Whisper turns speech into text, Gemma 2 answers through Ollama, and Piper speaks the reply. An Arduino drives the neck and jaw servos, and a small local search index lets Kai answer from its own documents. All of it runs on the robot itself — nothing goes to the cloud.
 
 ---
 id: internship-what
@@ -316,10 +324,10 @@ A: DEVCON's 2026 goal is to empower 10,000 youth through DEVCON Kids, on the vie
 ---
 id: ambition-community-size
 section: DEVCON's Ambition
-synonyms: [how big community, 19000 geeks, 13 chapters, 120 events, growth target]
+synonyms: [how big community, 19000 geeks, 9 chapters, 120 events, growth target]
 ---
 **Q: How big does DEVCON want its AI-ready community to get?**
-A: DEVCON is already at 13 active locations, roughly 19,000 geeks, and 120+ free events a year, within a wider 60,000+ nationwide network. Its ambition emphasizes deeper reach into places a single Manila event could never touch, not just bigger numbers.
+A: DEVCON is already at 9 active chapters, roughly 19,000 geeks, and 120+ free events a year, within a wider 60,000+ nationwide network. Its ambition emphasizes deeper reach into places a single Manila event could never touch, not just bigger numbers.
 
 ---
 id: ambition-partners

@@ -44,6 +44,56 @@ Deployed and exercised on the robot — five
 opener each turn drew is unverified**: nothing about the filler is published on `/params`, so that
 needs `/tmp/face-servo.log`, which needs a shell.
 
+## 2026-08-11 — The startup greeting was spoken twice, a minute apart, with the jaw frozen partway through the first one
+
+Not a bug in the greeting. `face_track` **segfaulted at the first playback** and
+`scripts/autostart.sh` did its job — so the room heard the whole line again from the replacement
+process. Two fixes: the crash, and the fact that a relaunch is audibly indistinguishable from a boot.
+Suite green: 1258 passed, 2685 subtests (was 1244). Both verified on the robot.
+
+- **Capture had landed on the same sound card as the speaker.** From `/tmp/face-servo.log`: across 22
+  runs the I2S liveness probe timed out twice (`LIVE_PROBE_TIMEOUT_S = 3.0`), and both times selection
+  fell through to `[mic] resolved device=0 rate=48000 ch=1 i2s=False` — input device 0 is
+  `USB Audio Device: - (hw:0,0)`, the C-Media dongle, which is also the only output sink
+  (`alsa_output.usb-C-Media…analog-stereo`). One of those two runs died `rc=139` (SIGSEGV) **32 s in,
+  exactly as the greeting's first audio began** — which is when `tts.play()` runs its
+  once-per-process `pactl set-card-profile` against that card, re-opening its ALSA devices underneath
+  a live raw PortAudio capture stream. A milder form of the same collision is in the log as `could not
+  set output card profile (… exit 1)` followed by `playback failed (Stream error: No such entity)`. So
+  `SPEAKER_CARD_NAME_HINTS` (`config/voice.py`) drops such devices from `_candidate_input_devices()`
+  entirely rather than ranking them last: they are not a worse mic, they are the one choice that can
+  take the process down. **The trade is stated, not hidden** — when the I2S mic fails to probe, that
+  run gets the pulse-mediated system default (`MicChoice(None, …)`; pulse coordinates access to the
+  card, so it is safe where a raw open is not), and if nothing usable is left Kai is deaf for that run
+  and logs why. `/audio/reresolve` retries it without a restart. Verified on the robot: device 0 is
+  gone from the candidate list, the INMP441 still wins with `resolved device=5 … i2s=True`, and the
+  named `default`/`pulse` entries are deliberately still there — they do not match the hints, which is
+  the point.
+- **`_greeted` could not see a relaunch, because it is a per-instance latch.** It correctly stops
+  `reresolve_mic()` re-greeting inside one process, but the second greeting came from a *different*
+  process 57 s later. The fact is now also written to `GREETING_STAMP_PATH`
+  (`/tmp/kai_ack/kai_greeted.stamp`), and a process starting within `GREETING_REPEAT_SUPPRESS_S`
+  (90.0) of the last greeting stays quiet and says so: `greeting suppressed — a Kai process greeted
+  39s ago … this is what a crash-and-relaunch looks like from here`. **The stamp is written before the
+  audio starts, not after** — the run this exists for died partway through its own greeting, and a
+  stamp written on completion would never have been written by that run at all. 90 s is sized against
+  the relaunch cost (5 s supervisor backoff + up to 15 s waiting for the capture device to be released
+  + ~30 s of startup ≈ 50 s at the fastest), not against taste; it also covers double-tapping
+  `/restart`. It lives under `ACK_WAV_DIR` because it wants that directory's lifetime: **/tmp is
+  cleared on reboot, so a genuine cold boot always greets.** Verified live — two restarts 45 s apart
+  gave one 9.4 s greeting and one suppression line.
+
+Measured while looking, and unchanged by this entry: the greeting is **9.0–9.3 s of audio** (141
+chars, three sentences, ~1.05 s of it the `tts_sentence_silence` pauses) and starts **~31 s after
+launch**, because `_warm_all()` puts the four canned lines first — including up to four Piper passes
+fitting the `thinking` line to `THINKING_SOUND_TARGET_S` — and only then synthesises the greeting
+live, on the most contended 30 s the Jetson has. The comment on `GREETING_TEXT` still claims the
+middle clause costs "roughly three extra seconds"; that estimate predates the current line.
+
+Still true, and worth knowing: `tts.play()` retries a failed `paplay` **from the start of the WAV**,
+guarded only on "has a newer utterance superseded me". It was innocent here — the log shows a real
+crash, not a retry — but a `paplay` that fails *partway* through still replays the whole line.
+
 ## 2026-08-11 — One corrupted byte on the servo wire could slam the head into its stop
 
 Suite green: 1254 passed, 2710 subtests (was 1249, 2710). Implements
@@ -200,6 +250,42 @@ What is still unproven: the measurement above is off-robot, and the *reason* for
 headroom for the 15 Hz control thread — is a Jetson claim. `[control] N Hz` with `--no-camera`
 should now read at or above its old value, and that number is worth capturing before and after on
 the next deploy. R2's two on-hardware criteria stay open until it is.
+
+## 2026-08-11 — Kai was telling people it runs on Micro:bit, Qwen and Google AI Suite
+
+Suite green: 1237 passed, 2680 subtests (unchanged). Retrieval was working correctly the whole
+time — the document it retrieved was wrong.
+
+- **The `kai-stack` entry in `documents/devcon_faq_rag.md` listed three things this repo has never
+  used.** Asked what powers it, Kai read back "Claude Code, Micro:bit, Qwen, Google AI Suite, and
+  NVIDIA" — verbatim from the chunk, which wins that question comfortably on `SECTION_BOOST`'s
+  +0.08 for `"Kai (robot)"`. The LLM is `gemma2:2b` (`config/voice.py`), the microcontroller is an
+  Arduino on `/dev/ttyUSB0` (`config/servo.py`, `servo/servo.py`), and there is no cloud AI call
+  anywhere in the tree — STT is faster-whisper, embeddings are `BAAI/bge-small-en-v1.5` through
+  fastembed's local ONNX runtime, TTS is Piper. The entry also contradicted its own neighbour
+  `kai-hardware`, two lines up, which correctly says "no cloud round trips". It now names the real
+  stack, and stays speakable: "Gemma 2", not `gemma2:2b`.
+- **The accuracy harness had been scoring the false fact as a pass.** `scripts/rag_accuracy.py`
+  asked "what tools were used to build you?" and looked for the needle `"Micro:bit"` — which the
+  document did contain, so the case went green every run. The harness only checks that a document
+  reached the model, never that the document was true; that is a real limit of it, not a bug, and
+  the mitigation is to point needles at facts a reader can diff against the code. Needle is now
+  `"Arduino"`, and deliberately not `"Claude Code"` — the Jumpstart internship entry names Claude
+  Code too, so a substring test on it would pass while retrieving the wrong entry.
+- **Wording was measured, not just written.** The first draft opened "Kai was built with Claude
+  Code" and cost a case: "who made you?" started retrieving the stack entry instead of `kai-origin`
+  ("Cohort 4"), 29/31 -> 28/31. Rephrased to "its code was written with Claude Code" and the origin
+  entry keeps the question. Final: **29/31 answer-in-context, unchanged from before the edit**, and
+  `scripts/rag_eval` is identical — on-topic 0.552–0.770 8/8, off-topic 0.520–0.637 with 4/8
+  rejected at `SIMILARITY_THRESHOLD` 0.55, overlap 0.085. The numbers recorded against that
+  constant in `config/rag.py` still hold.
+
+`documents/.rag_index.json` was rebuilt (`python3 -m ai.index_documents`, 51 chunks) — the edit does
+nothing until it is, and `_warn_if_stale()` is what says so at startup if someone forgets. One claim
+in the neighbouring `kai-hardware` entry is still unverified and was left alone: it says Kai uses
+"TensorRT for near-zero-latency neural network execution", but TensorRT appears only in
+`requirements.lock.txt` (it ships with JetPack) and in `docs/plan/wip/tensorrt-plan.md`, which is a
+plan, not a build. Nothing in the tree runs it.
 
 ## 2026-08-11 — Kai never took a breath, and spoke in no room at all
 

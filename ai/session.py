@@ -24,6 +24,7 @@ Two design choices carry most of the weight:
 
 from __future__ import annotations
 
+import os
 import random
 import threading
 import time
@@ -50,7 +51,7 @@ from config.wake import (
     ACK_PRESYNTH, ACK_WAV_DIR, CANNED_ERROR, CANNED_NO_SPEECH,
     DEBUG_CAPTURE_DIR, DEBUG_CAPTURE_ENABLED,
     DEBUG_CAPTURE_KINDS, DEBUG_CAPTURE_MAX_FILES, DEBUG_CAPTURE_MAX_MB, GREETING_ENABLED,
-    GREETING_TEXT, HANDS_FREE_ENABLED,
+    GREETING_REPEAT_SUPPRESS_S, GREETING_STAMP_PATH, GREETING_TEXT, HANDS_FREE_ENABLED,
     MAX_UTTERANCE_S, MIC_LEGACY_CAPTURE,
     MIN_UTTERANCE_S, SESSION_BUSY_MAX_S, SESSION_MAX_ERROR_STREAK,
     SESSION_MAX_NO_SPEECH_STREAK, SESSION_NO_FACE_S, SESSION_NO_SPEECH_S,
@@ -110,6 +111,41 @@ GREETING_POLL_S = 0.25
 # NO_FACE_LOG_INTERVAL_S exists to prevent (see config/tracking.py: NO FACE was 58% of a 1.5-hour
 # log). Implementation cadence, not a knob.
 PRESENCE_ERROR_LOG_S = 60.0
+
+
+def _greeting_age(now: float | None = None) -> float | None:
+    """Seconds since ANY Kai process last spoke the greeting, or None if that isn't known.
+
+    Wall clock (the stamp's mtime), deliberately not monotonic: the whole point is that a different
+    process wrote it, and monotonic clocks are not comparable across processes.
+
+    A stamp dated in the FUTURE reads as unknown rather than as recent. That happens for real on this
+    board — no RTC battery, so the clock steps when NTP lands — and unknown is the safe direction:
+    the failure this feature must never cause is a robot that stops greeting."""
+    try:
+        mtime = os.stat(GREETING_STAMP_PATH).st_mtime
+    except OSError:
+        return None            # never greeted, /tmp cleared by a reboot, or the path is unreadable
+    age = (time.time() if now is None else now) - mtime
+    return age if age >= 0.0 else None
+
+
+def _mark_greeting_spoken() -> None:
+    """Record that the greeting is being spoken NOW, for the next process to read.
+
+    Written BEFORE the audio starts, not after: the case this exists for is a process that dies
+    partway through the greeting, and one that stamped only on completion would never stamp at all —
+    which is precisely the run whose relaunch must stay quiet.
+
+    Best-effort. A stamp that cannot be written costs a duplicated greeting, so it must never cost
+    the greeting itself."""
+    try:
+        os.makedirs(os.path.dirname(GREETING_STAMP_PATH) or ".", exist_ok=True)
+        with open(GREETING_STAMP_PATH, "w") as fh:
+            fh.write(f"{time.time():.0f}\n")   # mtime is what's read; the text is for a human
+    except OSError as exc:
+        print(f"[session] WARNING: could not write the greeting stamp "
+              f"({GREETING_STAMP_PATH}: {exc}) — a crash-relaunch may greet twice", flush=True)
 
 
 class ConversationSession:
@@ -405,6 +441,18 @@ class ConversationSession:
             if self._greeted:
                 return
             self._greeted = True
+        # Two latches, because there are two ways to greet twice. The one above is this process
+        # re-entering start() (reresolve_mic). This one is a DIFFERENT process starting shortly after
+        # ours — a crash-relaunch, or an operator double-tapping /restart — which the in-memory latch
+        # cannot see. See GREETING_REPEAT_SUPPRESS_S in config/wake.py for the measurement.
+        age = _greeting_age()
+        if GREETING_REPEAT_SUPPRESS_S > 0.0 and age is not None and age < GREETING_REPEAT_SUPPRESS_S:
+            print(f"[session] greeting suppressed — a Kai process greeted {age:.0f}s ago, inside the "
+                  f"{GREETING_REPEAT_SUPPRESS_S:.0f}s window (GREETING_REPEAT_SUPPRESS_S). If this "
+                  f"was not a restart you asked for, look above for a non-zero exit: this is what a "
+                  f"crash-and-relaunch looks like from here.", flush=True)
+            return
+        _mark_greeting_spoken()
         print(f"[session] greeting: {GREETING_TEXT}", flush=True)
         self._voice.speak_text(GREETING_TEXT)
         deadline = time.monotonic() + GREETING_QUIET_WAIT_S
@@ -845,7 +893,7 @@ class ConversationSession:
             if self._state in (STATE_ACK, STATE_BUSY):
                 return {"error": f"busy: {self._state}"}
             if self._state == STATE_SPEAKING:
-                tts.stop()
+                self._cut_speech()
             self._epoch = self._voice.bump_epoch()
             self._scan_token += 1   # a scan result landing mid-PTT must be dropped, not acted on
             self._manual_end = True
@@ -991,11 +1039,50 @@ class ConversationSession:
     def _enter_speaking(self, now: float, canned: bool = False) -> None:
         """Caller holds the lock. Sets a hard deadline so a wedged paplay cannot deafen Kai for good
         — a failure that would otherwise be invisible, precisely because the mute gate is keyed on
-        playback."""
+        playback.
+
+        This is the FALLBACK deadline only. It has to be, because nothing here can know how long the
+        reply takes to say: on_done fires from the turn worker the moment the reply text exists, and
+        _speak() hands synthesis to a thread, so at this point Piper has not started. Once the WAV
+        exists the assistant publishes its real end time and _speaking_deadline() prefers that."""
         self._set_state(STATE_SPEAKING, now)
         self._speak_deadline = now + SESSION_SPEAK_MAX_UNKNOWN_S
         if canned:
             self._speak_deadline = now + WAKE_ACK_MAX_S + SESSION_SPEAK_GRACE_S
+
+    def _speaking_deadline(self) -> float:
+        """Caller holds the lock. When STATE_SPEAKING gives up and cuts the audio.
+
+        The WAV's own end plus SESSION_SPEAK_GRACE_S once the assistant knows it, else the fallback
+        _enter_speaking armed. That is what SESSION_SPEAK_GRACE_S ("allowed overrun past the WAV's
+        own duration") was always written for, and until now it reached only the canned branch.
+
+        Why this matters rather than being tidiness: SESSION_SPEAK_MAX_UNKNOWN_S is 20 s and was the
+        ONLY deadline a healthy reply ever got, while TTS_MAX_SPOKEN_CHARS lets a reply run to 500
+        characters — around 90 words, or ~31 s at SPEAK_SEC_PER_WORD. The clock also starts before
+        synthesis, so Piper's run came out of the same 20 s. Every long reply was therefore cut off
+        mid-sentence by the guard against a WEDGED paplay, with the jaw (sized to the real audio)
+        carrying on over the silence. The backstop still works: a paplay that wedges publishes no
+        end time, or overruns the one it published, and both land back on a deadline.
+
+        Guarded because a stubbed assistant in the tests need not publish an end time at all, and a
+        missing one must only ever mean "fall back to the armed cap"."""
+        try:
+            ends_at = self._voice.audio_ends_at()
+        except (AttributeError, TypeError):
+            ends_at = None
+        if ends_at is None:
+            return self._speak_deadline
+        return ends_at + SESSION_SPEAK_GRACE_S
+
+    def _cut_speech(self) -> None:
+        """Stop Kai talking, jaw included. See VoiceAssistant.stop_speech — a bare tts.stop() leaves
+        the mouth miming audio that has already been killed. Guarded so a stub without the method
+        still cuts the audio."""
+        try:
+            self._voice.stop_speech()
+        except (AttributeError, TypeError):
+            tts.stop()
 
     # ── filler ──────────────────────────────────────────────────────────────
 
@@ -1238,18 +1325,18 @@ class ConversationSession:
                 if not self._voice.speech_in_flight():
                     self._set_state(STATE_COOLDOWN, now)
                 elif elapsed >= WAKE_ACK_MAX_S:
-                    tts.stop()
+                    self._cut_speech()
                     self._log("ack timed out")
                     self._set_state(STATE_COOLDOWN, now)
 
             elif state == STATE_SPEAKING:
                 if not self._voice.speech_in_flight():
                     self._set_state(STATE_COOLDOWN, now)
-                elif now >= self._speak_deadline:
+                elif now >= self._speaking_deadline():
                     # Backstop only — the normal exit is above. A wedged paplay would otherwise keep
                     # the mic muted forever, i.e. deafen Kai for good, and invisibly, because the
                     # mute gate is keyed on playback.
-                    tts.stop()
+                    self._cut_speech()
                     self._log("speak timed out")
                     self._set_state(STATE_COOLDOWN, now)
 
@@ -1328,7 +1415,7 @@ class ConversationSession:
         # that just ended.
         self._scan_token += 1
         self._scan_ready_at = now + WAKE_WHISPER_COOLDOWN_S
-        tts.stop()
+        self._cut_speech()
         self._mic.harvest_utterance()   # disarm and drop whatever was buffered
         self._gate.reset()
         self._mic.reset_dsp()
