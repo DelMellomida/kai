@@ -30,9 +30,10 @@ is why the table below cites its Resolution section rather than its checklist.
 > behind `origin/main`, so `git log` on a fresh checkout agreed with the wrong version. If you are
 > about to pick up a ticket, `git fetch` and check the ticket's own file before trusting this page.
 
-**ID prefixes:** `R` = robotics engineering lens, `S` = software engineering lens. `S11` was a
-grouped "minor correctness and hygiene" finding and is split into `S11a`–`S11d` for tracking; the
-four share no code and can land in any order.
+**ID prefixes:** `R` = robotics engineering lens, `S` = software engineering lens, `A` = AI
+engineering lens (added 2026-08-12, when that third lens was first run — see §Review context).
+`S11` was a grouped "minor correctness and hygiene" finding and is split into `S11a`–`S11d` for
+tracking; the four share no code and can land in any order.
 
 **Not everything here came from the review.** `S12`–`S14` are feature specifications raised on
 2026-08-10 from a separate question — what would make Kai's *conversation* land, given the camera is
@@ -44,8 +45,8 @@ absent. Do not read them as review findings.
 
 ## Tier 1 — high impact, small effort
 
-Do these first. All nine are small, self-contained, and individually revertible. **Five have landed;
-four remain open.**
+Do these first. All eleven are small, self-contained, and individually revertible. **Five have landed;
+six remain open** — the two additions are `A4` and `A3`, raised by the 2026-08-12 AI lens.
 
 | ID | Ticket | Summary |
 |---|---|---|
@@ -54,10 +55,12 @@ four remain open.**
 | **R7** ✅ | [TTS subprocesses outlive the process](R7-tts-subprocesses-outlive-process.md) | **Landed 2026-08-09**, PR #6, `fix/tts-outlives-shutdown`. `tts.stop()` is now the first statement of `run()`'s `finally`. **Two on-hardware checks deferred.** |
 | **S9** ✅ | [Fail-open blanket excepts swallow bugs silently](S9-blanket-excepts-swallow-bugs.md) | **Landed 2026-08-09**, PR #7, `fix/rag-silent-failures`. Rate-limited `_note_error()` in `ai/rag.py`; the fail-open return values are bit-identical. All criteria met. |
 | **S1** ✅ | [The session RLock is held across disk I/O on two paths](S1-session-lock-held-across-disk-io.md) | **Landed 2026-08-09**, PR #8, `fix/session-lock-disk-io`. `tick()` hands both capture timeouts back to the caller to finish off the lock. All criteria met. |
+| **A4** | [Only DEVCON facts are grounded](A4-only-devcon-facts-are-grounded.md) | The persona's grounding rule covers DEVCON and nothing else, so the date, the weather and the venue are answered confidently by a 2B model with no clock and no network. |
 | **S8** | [`app/camera_supervisor.py` has no tests](S8-camera-supervisor-untested.md) | The only substantial untested module — and the one deciding whether the robot believes it has a camera. |
 | **R4** | [Firmware clamps to 0–180 while the host clamps to 10–170](R4-firmware-servo-limits-mismatch.md) | A corrupted serial line drives the pan servo into its mechanical stop; `toInt()` turns garbage into 0°. |
 | **S2** | [`/params` rebuilds the whole snapshot at 20 Hz, per client](S2-params-sse-snapshot-per-client.md) | Per-tab work on the same `RLock` the 30 Hz audio worker needs; the data can't change faster than the 25 Hz publishers. |
 | **R2** | [200 Hz idle spin in the main loop](R2-idle-spin-loop-gil-contention.md) | The no-frame path burns the GIL 200×/s — the documented bottleneck for the control thread's cadence. |
+| **A3** | [The prompt is never checked against `OLLAMA_NUM_CTX`](A3-prompt-never-checked-against-num-ctx.md) | `llm_prompt_tokens` is measured, logged and then dropped; a long RAG conversation overflows 2048 and Ollama silently evicts the history it claims to be sending. |
 
 **Three acceptance criteria across the landed five are deferred, all needing the robot**, and none
 of them has been run:
@@ -77,13 +80,16 @@ the robot in front of them can close these in about ten minutes — see [operati
 |---|---|---|
 | **R1** | [Serial reconnect blocks the servo control thread for seconds](R1-serial-reconnect-blocks-control-thread.md) | Up to ~3.5 s of `sleep` + `sudo` under the serial lock, on the 15 Hz control thread — firing exactly when the robot is already misbehaving. |
 | **R3** | [Firmware serial read can block the loop for a full second](R3-firmware-blocking-serial-read.md) | `readStringUntil`'s 1000 ms timeout re-creates the freeze-then-lurch the non-blocking LED ack was built to remove. |
+| **A1** | [Ollama re-decides the model's placement on every turn](A1-per-turn-model-reload-defeats-kv-prefix.md) | `MODEL RELOADED: ~200-360ms` precedes every `[llm] turn:` line, so the three separate decisions taken to preserve a KV prefix between turns cannot be paying off. |
 | **R6** | [Startup thundering herd](R6-startup-warm-thundering-herd.md) | Six concurrent warm-ups defeat the reason `ensure_llm_warm` runs at startup: Ollama pins its GPU/CPU split from free memory at that instant. |
+| **A2** | [Nothing measures what Kai actually says](A2-no-evaluation-of-generated-replies.md) | Two harnesses measure retrieval and stop at `retrieve_context()`; grounding, length, language and refusal in the *reply* are judged by trying a few turns and writing the impression into a comment. |
 | **S3** | [RAG retrieval is a Python loop over float64 vectors, from a JSON index](S3-rag-retrieval-python-loop-float64.md) | Per-chunk `cosine_similarity` with repeated norms, doubled memory, and embeddings parsed from decimal text at every startup. |
 | **S4** | [TTS is module-global state with fixed shared output paths](S4-tts-global-state-shared-wav-paths.md) | Two filenames shared by every reply; the mitigation surface across three modules now exceeds the fix. Prerequisite for R5. |
 | **S7** | [Flask dev server, unauthenticated, on 0.0.0.0](S7-unauthenticated-dev-server-dashboard.md) | Anyone on the venue network can silence, blind, restart or puppet the robot; unbounded streaming threads on a dev server. |
 | **R8** | [No liveness watchdog on the inference loop itself](R8-no-main-loop-watchdog.md) | Every other subsystem is watched. A wedged MediaPipe leaves a convincingly-alive, half-working robot with nothing reporting it. |
 | **S13** | [A conversation is forgotten the instant the session ends](S13-no-continuity-across-the-wake-gap.md) | 25 s of thinking discards the sticky RAG topic, so the same follow-up that resolved a moment ago degrades to "I'm not sure". |
 | **S14** | [Kai only ever speaks when spoken to, and its sessions die silently](S14-kai-has-no-conversational-initiative.md) | The persona offers "gusto mo marinig?" but the state machine cannot act on an unanswered question; `no_speech` ends the conversation without a word. |
+| **R11** | [The control thread's loop body has no test](R11-control-loop-body-untested.md) | The sweep maths is swept exhaustively; the hold branch, the anchor return and the slew clamp's feedback into the PD — each added to fix an observed fault — are not exercised at all. |
 
 ## Tier 3 — high impact, large effort
 
@@ -138,10 +144,33 @@ Worth reading before scheduling — several of these are cheaper or safer in a p
   extraction plan rather than growing the class twice.
 - **S10 ↔ S11c.** The rebuild rehearsal is the moment the ambiguous `autostart.sh.new` becomes a real
   trap. Resolve S11c before the rehearsal, or resolve it during.
+- **A1 → R6.** Both are about Ollama's placement decision. R6 spends effort making the *startup*
+  decision reliable, on the premise that `keep_alive = -1` then pins it for the run. A1 is the
+  measurement showing placement is reported as re-decided on every turn. Take A1 first: if the
+  premise does not hold, R6 needs restating before it is worth doing.
+- **A1 → S12's open acceptance criteria.** `IDENTITY_PROMPT`'s comment explicitly defers its "one
+  prefix invalidation" claim until the per-turn reload is understood. A1 is what makes that claim
+  measurable, and S12's Resolution is where the answer belongs.
+- **A2 → A4, S12, S13, S14, S11d.** All five change what Kai says, and each currently has to fall
+  back on a manual demo for its acceptance. A2 is the harness that gives them a before/after number.
+  It is also the cheapest way to answer R5's last criterion — whether the filler bank becomes dead
+  code — since that is a question about what a listener hears.
+- **A3 → S13, S14.** Both add prompt state. A3 says the prompt already crowds `OLLAMA_NUM_CTX` on a
+  RAG turn and the eviction is silent, and `docs/memory-budget.md` fixes the ceiling at 2048. Publish
+  the number first, or the two tickets spend a budget nobody is counting.
+- **A3 ‖ A1.** Independent, but they share one line of work: both want `_stage_ms` fields that are
+  measured and never projected onto `/params` (`llm_load_ms` for A1, the token counts for A3). If
+  both are scheduled, do that projection once.
+- **R11 → R9, R10.** R9 changes `PDAxis.update`'s rounding and R10 edits the loop's `send()` call.
+  R11's harness is what would pin either change to observed behaviour rather than to the behaviour
+  that replaced it. Landing R11 first costs nothing and gives both a regression test to change.
+- **R11 ‖ S8.** Same shape, same reason, no shared code: S8 builds the camera supervisor's harness,
+  R11 the control loop's. S8 stays the prerequisite for R8; R11 does not feed a watchdog.
 
 ## Review context
 
-Health ratings from the review, for reference when judging whether a change helped:
+Health ratings from the 2026-08-10 two-lens review, for reference when judging whether a change
+helped:
 
 | Dimension | Rating |
 |---|---|
@@ -149,7 +178,22 @@ Health ratings from the review, for reference when judging whether a change help
 | Performance | 5 / 10 |
 | Stability | 8 / 10 |
 
-Two framing notes carried over from the review's conclusion:
+**A third lens was run on 2026-08-12** — AI engineering, alongside a re-run of the other two. Its
+ratings sit beside the ones above, not in place of them; the two sets measure different things and
+both are worth keeping.
+
+| Lens (2026-08-12) | Overall | Subscores |
+|---|---|---|
+| Robotics | 7 / 10 | real-time integrity 6 · control quality 8 · hardware failure handling 7 · physical safety margins 6 |
+| AI | 7 / 10 | latency & memory budget 6 · prompt & context engineering 8 · retrieval quality 8 · evaluation & iteration 5 |
+| Software | 7 / 10 | structure & coupling 7 · correctness & concurrency 8 · test effectiveness 7 · operability 7 |
+
+That review agreed with all three 2026-08-10 numbers and added five tickets: `A1`–`A4` and `R11`.
+Its own framing note is that the AI subsystem is the one place where this codebase's
+comment-as-measurement discipline stops short of the thing being changed — retrieval is measured
+carefully and the generated reply is not measured at all, which is `A2`.
+
+Two framing notes carried over from the first review's conclusion:
 
 1. Most of what these tickets describe is **policy**, not defect — blocking calls on real-time
    paths, serialised latency, shared globals. The defect density is genuinely low, and the
