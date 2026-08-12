@@ -20,6 +20,57 @@ Conventions:
 
 ---
 
+## 2026-08-12 — The jaw moved before the "Yes?" came out
+
+Reported on the robot: say "Hey Kai", and the mouth moves first with the acknowledgement arriving
+afterwards. Two independent errors, both at the start of the file and both pushing the same way, so
+they added. Neither was visible on a long reply — on an 0.82 s word they are the whole illusion.
+Suite: 1268 passed, 2685 subtests (was 1260), plus the one pre-existing failure this box always has
+(`test_audio.py::TestImportPvporcupine` shells out to `cat /proc/cpuinfo`, so it can only pass on
+Linux — verified against a stashed tree). On the Jetson: 1268 passed and a different pre-existing
+failure, `TestAmbientAdaptation::test_without_adaptation_the_same_room_never_closes_the_utterance`,
+likewise confirmed to fail without this change.
+
+- **Playback does not start when it is asked to.** `ai/voice_assistant._speak` and `speak_wav` both
+  opened the jaw window at `time.monotonic()` immediately before calling `tts.play()` — but that
+  call only spawns `paplay`, and the first sample is not audible until the process has connected to
+  PulseAudio and the stream buffer has filled. Measured with `pactl list sink-inputs` sampled
+  through a 5 s playback using the same flags `ai/tts.py` passes: Buffer Latency 57–120 ms plus Sink
+  Latency 63–98 ms, i.e. ~190–210 ms of pipeline before anything is heard, plus paplay's own spawn
+  (~30 ms warm, ~210 ms on a process's first playback, which also pays `apply_output_profile()`).
+  The schedule now starts at `now + TTS_PLAYBACK_LEAD_S` (0.22), and `speaking_openness_at()`
+  already returned `None` ahead of `start`, so the jaw simply stays shut through that window.
+- **The file is longer than the speech.** Piper pads silence onto both ends of every WAV it writes.
+  The ack the robot is actually playing is 0.824 s, of which 0.040 s is leading pad and 0.244 s is
+  trailing pad with `TTS_POST_ROOM`'s reverb decaying into it — so barely two thirds of that file is
+  the word "Yes?", and `_speak_segments_for_duration` was miming across all of it, holding the mouth
+  open a quarter-second after the sound stopped. New `tts.wav_speech_span()` finds the audible span
+  and the jaw is timed to that instead. Threshold swept 50–3000 over the robot's own WAVs rather
+  than picked: there is a plateau at 300–1000 (the ack's span lands within 20 ms across it),
+  `SPEAK_SILENCE_PEAK` is 600. The scan costs 1.3 ms on the ack, 1.6 ms on an 8 s line. It is a scan
+  rather than a constant because the pad is not fixed — the canned lines are re-synthesized at every
+  startup, and the restart that deployed this wrote an ack of the same 0.824 s with the speech at
+  0.080–0.620 instead of 0.040–0.580.
+
+Verified on the robot by sampling the `jaw` servo angle from `/params` against the `paplay` process
+while firing a bare `POST /voice/wake`: the jaw holds at its closed 90° for the first 0.31 s of
+playback, opens at +0.36, peaks at 170° at +0.56, and is shut again by +0.97 — against a predicted
+0.30–0.84 plus the servo's own slew. It used to start opening at +0.00. Note for anyone repeating
+this: `/params`' `voice_speaking` cannot see it, because `session._project_status` hard-overrides
+that field to `True` for the whole of `STATE_ACK` — it reports session state, not the jaw envelope.
+
+Both offsets are applied in one place, `_arm_jaw_for_wav`, so the reply, the ack, the canned
+failures and every filler line line up the same way. The mic gate moved with the first fix but not
+the second, and that asymmetry is deliberate: it protects against Kai hearing itself, so it wants
+the whole file plus the lead — it had been opening ~0.22 s early, into audio still coming out. The
+fallbacks are intact and both fail toward today's behaviour: a WAV that cannot be scanned, or is
+silent throughout, mimes the whole file rather than not moving the jaw at all. `SPEAK_TRIM_SILENCE`
+and `TTS_PLAYBACK_LEAD_S = 0.0` restore the old timing exactly.
+
+`FILLER_MAX_STALL_S` deliberately still measures the file: `config/filler.py` had been carrying a
+note that measuring speech instead "belongs in its own pass", and this is that pass — but what that
+cap bounds is how long the speaker is busy and Kai is deaf, which includes the pad.
+
 ## 2026-08-11 — A long filler line now sits out two exchanges before it can come back
 
 The once-per-conversation rule (`_filler_used_openers`) only covers the FIRST lap through a

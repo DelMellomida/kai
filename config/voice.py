@@ -429,6 +429,61 @@ SPEAK_AMP            = 1.00   # how far the mouth opens (1.0 = fully open) while
 SPEAK_OPEN_S         = 0.22   # ramp-open time at the start of a sentence (smooth, not a snap)
 SPEAK_CLOSE_S        = 0.22   # ramp-close time at the end of a sentence
 
+# ── Lining the jaw up with the SOUND ─────────────────────────────────────────────
+# The two constants below exist because the jaw window used to be timed from the wrong two
+# instants, and on a short line that is the whole illusion. Reported on the robot 2026-08-12:
+# after "Hey Kai" the mouth moved and the "Yes?" arrived afterwards.
+#
+# Both errors are at the START of the file and both push the same way, so they add:
+
+# (1) PLAYBACK DOES NOT START WHEN WE ASK IT TO. ai/voice_assistant.py opened the jaw window at the
+# instant it called tts.play(), but that only spawns paplay — the first sample is not audible until
+# the process has connected to PulseAudio and the stream buffer has filled. Measured on the robot
+# 2026-08-12, `pactl list sink-inputs` sampled through a 5 s playback with the same flags ai/tts.py
+# uses: Buffer Latency 57-120 ms plus Sink Latency 63-98 ms, i.e. ~190-210 ms of pipeline the first
+# sample has to cross, and paplay's own spawn + connect on top (~30 ms warm, ~210 ms on the first
+# playback of a process, which also pays apply_output_profile()).
+#
+# TRACKS TTS_LATENCY_MSEC (200) — the buffer half of that measurement IS that setting. Re-measure
+# this if you change it; the same command is in the note there. Set 0.0 to restore the old
+# behaviour of opening the jaw at the play() call.
+TTS_PLAYBACK_LEAD_S  = 0.22
+
+# (2) THE FILE IS LONGER THAN THE SPEECH. Piper pads leading and trailing silence into every WAV
+# (config/filler.py's FILLER_MAX_STALL_S note has been carrying this measurement for a while, and
+# calls timing the jaw off SPEECH rather than file length "the honest fix ... its own pass"). This
+# is that pass, for the jaw only — FILLER_MAX_STALL_S still measures the file, deliberately, since
+# what it bounds is how long the speaker is busy.
+#
+# Measured on the ack WAV the robot is actually playing (/tmp/kai_ack/kai_canned_ack.wav,
+# 2026-08-12): 0.824 s long, of which 0.040 s is leading silence and 0.244 s is trailing silence
+# and reverb tail. So barely two thirds of that file is the word "Yes?", and the jaw was miming
+# across all of it — holding open for a quarter-second after the sound had stopped.
+#
+# AND THE PAD IS NOT A FIXED NUMBER, which is why this is a scan and not a constant: the canned
+# lines are re-synthesized on every startup, and the very next restart wrote an ack of the same
+# 0.824 s with the speech at 0.080-0.620 instead — the same word, 40 ms further into the file.
+#
+# Set SPEAK_TRIM_SILENCE False to time the jaw to the whole file again.
+SPEAK_TRIM_SILENCE   = True
+# PEAK sample value that counts as sound, against a 16-bit full scale of 32768 — so 600 is about
+# -35 dBFS. Peak rather than RMS because the scan runs immediately before playback and max()/min()
+# over an array slice is C-speed (see ai/tts.wav_speech_span).
+#
+# Swept 50..3000 over the robot's own WAVs 2026-08-12 (the ack, the two canned failures, a stall, two
+# 8 s openers and a real reply) rather than picked. There IS a plateau and it is 300..1000: every
+# threshold in that band put the ack's speech at 0.040-0.580/0.600 s of its 0.824 s file, i.e. within
+# 20 ms. 600 sits in the middle of it. Outside the band it degrades gracefully in both directions —
+# at 50-100 TTS_POST_ROOM's reverb tail still reads as speech (the ack's end drifts out to 0.64-0.80 s,
+# so the jaw hangs open again); at 2000-3000 it starts clipping quiet word-endings (0.56, 0.54).
+#
+# The scan costs 1.3 ms on the ack and 1.6 ms on an 8 s line, measured on the Jetson the same day —
+# it is on the speech path immediately before playback, so that was worth knowing.
+SPEAK_SILENCE_PEAK   = 600
+# Scan granularity. 20 ms is finer than the jaw's own ramps (SPEAK_OPEN_S = 0.22) so the precision
+# is not the limit here, and it keeps the scan cheap on a 15 s reply.
+SPEAK_SILENCE_STEP_S = 0.020
+
 # ── Text-to-speech (Piper) ────────────────────────────────────────────────────────
 # Kai speaks its replies aloud through the USB audio dongle + PAM8403 amp (PulseAudio sink
 # TTS_SINK). ai/tts.py shells out to Piper (piper-tts, CPU/onnxruntime — no API key, no runtime
@@ -685,6 +740,14 @@ TTS_XDG_RUNTIME  = "/run/user/1000"
 # reply just to cover the drain. At 200 ms the mic can reopen ~0.5 s after Kai stops (see
 # TTS_TAIL_MUTE_S in config/wake.py), which is the difference between feeling responsive and feeling
 # broken. Raise it if playback ever crackles or underruns; set None to use Pulse's default.
+#
+# Confirmed again 2026-08-12 with the flag on and off, sampling `pactl list sink-inputs` through a
+# 5 s playback: with it, Buffer Latency 57-120 ms and paplay ran 5.46 s for a 5.00 s file (it waits
+# for the drain); without it, Buffer Latency 2000 ms and paplay returned in 5.02 s — exiting with
+# most of a two-second buffer still to play, exactly as described above.
+#
+# This is also the buffer half of TTS_PLAYBACK_LEAD_S, which is how long the jaw waits before it
+# starts miming. Re-measure that one if you change this.
 TTS_LATENCY_MSEC = 200
 
 # ── TTS loudness post-processing ────────────────────────────────────────────────

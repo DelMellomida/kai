@@ -16,15 +16,18 @@ is what the session's self-hearing gate is built on.
 
 from __future__ import annotations
 
+import array
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import wave
 from pathlib import Path
 
 from config.voice import (
+    SPEAK_SILENCE_PEAK, SPEAK_SILENCE_STEP_S,
     TTS_ENGINE, TTS_PIPER_CMD, TTS_VOICE_MODEL,
     TTS_SINK, TTS_OUTPUT_DIR, TTS_XDG_RUNTIME, TTS_LATENCY_MSEC,
     TTS_PIPER_NORMALIZE,
@@ -421,6 +424,59 @@ def wav_duration(path: Path) -> float:
     except (OSError, wave.Error) as exc:
         print(f"[tts] WARNING: could not read WAV duration ({exc})")
         return 0.0
+
+
+def wav_speech_span(path: Path) -> tuple[float, float]:
+    """(start, end) of the AUDIBLE span inside a WAV, in seconds from the start of the file.
+
+    Piper pads leading and trailing silence into everything it writes, and TTS_POST_ROOM's reverb
+    decays into the trailing pad rather than extending the file — so the file is reliably longer
+    than the speech, by 0.29 s of the 0.82 s ack WAV (measured 2026-08-12). wav_duration() is the
+    file; this is the sound inside it, and it is what the jaw should be timed to. Callers that care
+    how long the SPEAKER is busy (the filler length caps, the self-hearing gate) still want
+    wav_duration.
+
+    Returns an EMPTY span (0.0, 0.0) for a WAV that cannot be read, and the whole file for one that
+    is silent throughout; the caller treats both as "no trim" and falls back to the file length, so
+    a bad scan can only ever cost the trim. Deliberately silent about a failed read, unlike
+    wav_duration: every caller reads the duration off the same file first, so anything really wrong
+    with it has already been reported once and a second warning per playback is just noise.
+    """
+    try:
+        with wave.open(str(path), "rb") as w:
+            rate, width, channels = w.getframerate(), w.getsampwidth(), w.getnchannels()
+            frames = w.readframes(w.getnframes())
+    except (OSError, wave.Error):
+        return 0.0, 0.0
+    # 16-bit only, which is everything in this pipeline (Piper writes it and TTS_POST_SOX keeps it).
+    # Anything else falls back to "no trim" rather than being misread as silence.
+    if not rate or not channels or width != 2:
+        return 0.0, 0.0
+
+    samples = array.array("h")
+    samples.frombytes(frames[:len(frames) - len(frames) % 2])
+    if sys.byteorder == "big":
+        samples.byteswap()             # WAV is little-endian; array uses the host's order
+    per_block = max(1, int(rate * SPEAK_SILENCE_STEP_S)) * channels
+    duration = (len(samples) // channels) / rate
+    blocks = range(0, max(0, len(samples) - per_block + 1), per_block)
+
+    # PEAK, not RMS: max()/min() over an array slice runs in C, and this sits on the speech path
+    # immediately before playback — a per-sample loop in Python would add to the very latency the
+    # trim exists to hide. Piper's padding is digital silence (exactly 0), so the two measures pick
+    # the same edges; only the threshold differs. (audioop.rms would have been the obvious tool and
+    # is what this was written with first — audioop was REMOVED from the stdlib in Python 3.13, and
+    # the suite runs on 3.14 on the Windows box.)
+    def _loud(i: int) -> bool:
+        block = samples[i:i + per_block]
+        return max(max(block), -min(block)) > SPEAK_SILENCE_PEAK
+
+    first = next((i for i in blocks if _loud(i)), None)
+    if first is None:
+        return 0.0, duration           # silent throughout — mime the whole file
+    last = next((i for i in reversed(blocks) if _loud(i)), first)
+    return (first / (rate * channels),
+            min(duration, (last + per_block) / (rate * channels)))
 
 
 def play(path: Path) -> None:
