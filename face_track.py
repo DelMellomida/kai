@@ -32,7 +32,7 @@ from vision            import presence
 from servo.servo        import ServoSerial
 from ai.voice_assistant import VoiceAssistant
 from ai.session        import ConversationSession
-from ai import rag
+from ai import rag, tts
 import settings
 
 
@@ -41,7 +41,7 @@ class _NullServo:
     last_pan = 90; last_tilt = 90; last_jaw = 90
     def send(self, pan, tilt, jaw=None): return False
     def send_jaw(self, angle): return False
-    def send_gesture(self, name): pass
+    def send_gesture(self, name): return False
     def center(self): pass
     def close(self): pass
 
@@ -49,7 +49,7 @@ class _NullServo:
 # ── Tuning ────────────────────────────────────────────────────────────────────
 # Tunable knobs live in config/tracking.py; re-imported here so the names stay module-level.
 from config.tracking import (
-    INFERENCE_FPS, NO_FRAME_SLEEP, EMA_ALPHA, PAN_SCALE, TILT_SCALE, MIN_FACE_AREA,
+    INFERENCE_FPS, NO_FRAME_WAIT, EMA_ALPHA, PAN_SCALE, TILT_SCALE, MIN_FACE_AREA,
     JAW_CLOSED, JAW_OPEN, JAW_EMA_ALPHA, JAW_DEADBAND, EMA_RESET_FRAMES,
     WEB_PUBLISH_INTERVAL, FACE_MIN_DETECTION_CONF, FACE_MIN_TRACKING_CONF,
     WEB_PORT, UPLOAD_DIR, SERVO_ABSENCE_FRAMES, NO_FACE_LOG_INTERVAL_S,
@@ -270,7 +270,7 @@ def _publish_status(cam_thread, servo, last_status_t: float) -> float:
 def _register_settings_callbacks() -> None:
     """Subscribe the knobs that cannot simply be read at the point of use.
 
-    Everything else (camera_mode, servo_tracking, jaw_enabled, and all three TTS values) is PULLED via
+    Everything else (camera_mode, servo_tracking, jaw_enabled, and all six TTS values) is PULLED via
     settings.get() where it is used, which needs no wiring at all. The ones here either live inside an
     object that holds its own copy, or need a side effect beyond storing a number.
     """
@@ -282,6 +282,12 @@ def _register_settings_callbacks() -> None:
     # other reply used the new one.
     settings.on_change("tts_volume",       lambda v: _session.reprewarm_canned(), debounce=1.5)
     settings.on_change("tts_length_scale", lambda v: _session.reprewarm_canned(), debounce=1.5)
+    # The prosody parameters are the same case: the filler bank, the wake ack and the greeting are all
+    # pre-synthesised, so without these a sentence-pause or noise change would apply to live replies
+    # only and the cached lines would audibly disagree with them mid-conversation.
+    settings.on_change("tts_sentence_silence", lambda v: _session.reprewarm_canned(), debounce=1.5)
+    settings.on_change("tts_noise_scale",  lambda v: _session.reprewarm_canned(), debounce=1.5)
+    settings.on_change("tts_noise_w",      lambda v: _session.reprewarm_canned(), debounce=1.5)
 
     # Apply the persisted values ONCE at startup. Callbacks only fire on change, and the gate and the
     # wake detector were constructed from the config defaults before settings.load() ran — so a value
@@ -417,7 +423,11 @@ def run(args: argparse.Namespace) -> None:
             # frozen LIVE badge.
             last_status_t = _publish_status(cam_thread, servo, last_status_t)
             if frame is None:
-                time.sleep(NO_FRAME_SLEEP)   # avoid busy-spin when consuming faster than camera
+                # Block for the next frame instead of polling for it. Wakes immediately when one is
+                # stored, and otherwise after NO_FRAME_WAIT — which is what keeps the jaw animating
+                # and _publish_status honest on a robot with no camera at all. See config/tracking.py
+                # for why the bound is the publish interval and not the jaw interval.
+                cam_thread.wait_for_frame(NO_FRAME_WAIT)
                 continue
 
             live_rotate = args.rotate and cam_thread.source_name != "video_file"
@@ -519,6 +529,16 @@ def run(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        # FIRST, before anything else is torn down. tts.stop() kills both the Piper synth and the
+        # paplay playback; those are child PROCESSES, not threads, so the interpreter exiting does
+        # not take them with it — they get re-parented and keep playing. scripts/autostart.sh brings
+        # the replacement up within seconds, so without this the new process starts talking over
+        # audio the old one left in the air, with its own mute gate wide open because it knows
+        # nothing about that sound. Doing it first also means the 1-2 s of teardown below happens in
+        # silence rather than under a half-spoken reply.
+        # NOTE: lifecycle.arm_restart_deadline()'s os._exit path deliberately skips this whole
+        # block; scripts/autostart.sh's wait_for_capture_device is the backstop there.
+        tts.stop()
         stop_evt.set()
         control_thread.join(timeout=1.0)   # stop the control thread before closing the serial
         # Before cam_thread.close(), or the supervisor could hot-swap a camera into a closing thread.

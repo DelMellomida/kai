@@ -58,7 +58,15 @@ class PDAxis:
         correction   = self._kp * err + self._kd * (err - self._prev_err)
         self.current = max(0.0, min(180.0, self.current + correction))
         self._prev_err = err
-        return int(self.current)
+        # ROUND, not int(). int() truncates toward zero and every servo angle is positive, so it was
+        # a uniform downward bias of up to a degree — and not only on the wire: app/control_loop.py
+        # stores this value as last_pan_cmd and uses it as the slew reference, the hold anchor, and
+        # the value pan_pd.reset() re-syncs to. PAN_DEADBAND is 1 (see config/servo.py, which
+        # lowered it precisely so ~1 degree tracking requests are not swallowed), so a sub-degree
+        # bias sits exactly at the resolution where it stops being invisible.
+        # round() is half-to-even at an exact .5; that is immaterial here and matches the
+        # int(round(...)) already used at the send site in app/control_loop.py.
+        return int(round(self.current))
 
     def reset(self, value: float = 90.0) -> None:
         self.current   = value

@@ -1,5 +1,10 @@
 # S9 — Fail-open blanket excepts swallow bugs silently
 
+> **Status: FIXED** — `fix/rag-silent-failures`. `ai/rag.py` gained a rate-limited `_note_error()`
+> plus `rag_errors` / `rag_last_error` on `/params`; `ai/session.py`'s presence handlers log through
+> a throttled `_note_presence_error()`. Suite green (1182 passed). Every acceptance criterion is met
+> — nothing deferred.
+
 | | |
 |---|---|
 | **Tier** | 1 |
@@ -41,19 +46,31 @@ reads: a broken snapshot callable fails open forever and looks like a camera tha
 
 ## Acceptance criteria
 
-- [ ] Every blanket `except Exception` listed above logs `{type(exc).__name__}: {exc}` with enough
-      context to identify the site (module tag + which layer), and none of them re-raise.
-- [ ] Logging is rate-limited so a persistent fault cannot flood the log — the same principle
-      `CameraSupervisor._report_failure` already applies (log on change, or at most once per N
-      seconds). `[face_track] NO FACE` at 58% of a 1.5-hour log is the precedent this must not repeat.
-- [ ] `/params` gains a monotonic `rag_errors` counter (and, if cheap, `rag_last_error`) so a
-      persistent retrieval failure is visible over ssh without reading the log.
-- [ ] Fail-open behaviour is bit-identical: `retrieve_context` still returns `""`, `embed_query`
-      still returns `None`, presence still clears the absence clock. No new exception can escape.
-- [ ] A test asserts that an exception raised inside `_build_query` produces `""` **and** increments
-      the counter — i.e. that the failure is both survivable and observable.
-- [ ] The `except Exception` in `tick()` keeps its existing behaviour of clearing
+- [x] Every blanket `except Exception` listed above logs `{type(exc).__name__}: {exc}` with the
+      layer that failed (`retrieve_context`, `embed_query`, `load_index`), and none of them re-raise.
+- [x] Logging is rate-limited — per *distinct* error, once per `_ERROR_LOG_INTERVAL_S` (60 s). A new
+      failure mode logs immediately even inside the window, which is the behaviour
+      `CameraSupervisor._report_failure` has; a repeat of the same one is suppressed. Both are
+      pinned by tests.
+- [x] `/params` gains `rag_errors` (monotonic across the process) and `rag_last_error`, via
+      `rag.status()` merged in `Dashboard.params_snapshot()`.
+- [x] Fail-open behaviour is bit-identical: `retrieve_context` still returns `""`, `embed_query`
+      still returns `None`, presence still clears the absence clock. The counter is incremented
+      before the existing return in every case; no new exception can escape.
+- [x] A test asserts an exception inside `_build_query` produces `""` **and** increments the
+      counter — both halves, in separate cases, so a regression in either is attributable.
+- [x] The `except Exception` in `tick()` keeps its existing behaviour of clearing
       `_face_absent_since`; only the logging is added.
+
+**Judgement call made while fixing, not in the original ticket:** a **missing** index
+(`FileNotFoundError` from `INDEX_PATH.read_text()`) is deliberately *not* counted. A fresh checkout
+has no index, and that means "nothing indexed yet", not a fault — counting it would leave
+`rag_errors` non-zero on every healthy first boot and make the number useless as a signal. A
+*malformed* index still counts. Both cases are pinned by tests.
+
+**Scope note:** `_warn_if_stale()`'s `except Exception` was left silent. It guards a `stat()` sweep
+whose only job is to print an advisory, so a failure there costs a warning about a warning — adding
+a log line would be noise, not signal.
 
 ## Suggested approach
 

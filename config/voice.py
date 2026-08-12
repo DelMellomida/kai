@@ -455,6 +455,98 @@ TTS_PIPER_CMD    = ["python3", "-m", "piper"]
 # the last set of samples).
 TTS_VOICE_MODEL  = "voices/en_US-hfc_female-medium.onnx"
 TTS_LENGTH_SCALE = 1.0   # Piper phoneme length / speaking rate — >1 slower, <1 faster
+
+# ── Kai breathing between sentences ─────────────────────────────────────────────
+# Seconds of silence Piper inserts at each SENTENCE boundary. Until 2026-08-10 this flag was never
+# passed, and Piper's default is 0 — so Kai said four sentences in one continuous run, which is a
+# thing no person does and one of the plainest "this is a machine" cues in the whole audio path.
+#
+# MEASURED on the robot, longest interior silences in the RAW pre-sox WAV of a four-sentence reply
+# (relative gate — see the note on DELIVERY_PAUSE below for why an absolute one finds nothing):
+#
+#   setting            the three sentence boundaries
+#   0.0 (= the old     0.20, 0.17, 0.14 s     <- not a pause; just a phrase-final decay
+#        behaviour)
+#   0.3                0.49, 0.47, 0.45 s
+#   0.5                0.80, 0.74, 0.67 s
+#
+# Conversational speech pauses roughly 0.4-0.7 s between sentences, so 0.35 sits at the lower, safer
+# end of natural: enough to read as a breath, not enough to read as Kai having stalled. Raise toward
+# 0.5 if it still runs together in the room; drop to 0.0 to restore the old behaviour exactly.
+#
+# Note what this is NOT: ai/delivery.py's DELIVERY_PAUSE buys a 0.156 s breath *inside* a long
+# sentence, and was measured and shipped while the boundary a person leans on hardest got nothing.
+# The two are complementary, not alternatives.
+#
+# COSTS, both checked before this shipped:
+#   * ~0.3 s per interior boundary, so a four-sentence reply runs ~1 s longer. Kai is deaf while
+#     speaking (no echo cancellation), so this lengthens the deaf window slightly. It does NOT delay
+#     first audio — synthesis time is unchanged, measured 3.4-3.7 s per long line at every value.
+#   * NO trailing padding: measured 0.13-0.18 s of tail silence at every setting, i.e. unchanged. So
+#     a one-sentence filler stall keeps its length (1.11 -> 1.14 s, inside run-to-run noise),
+#     FILLER_MAX_STALL_S needs no re-deriving, and the jaw cannot be left miming into added silence
+#     at all — which matters because the jaw schedule is sized from wav_duration, so any silence added
+#     to the end of a WAV is silence the jaw spends mouthing nothing.
+# Dashboard-settable so it can be A/B'd mid-conversation; a change re-warms the canned lines.
+TTS_SENTENCE_SILENCE_S = 0.35
+
+# ── Piper's noise parameters: plumbed, and deliberately left at the voice's own values ──────────
+# Piper is a VITS model and generates prosody by sampling noise. Two parameters control how much it
+# varies, and neither was ever passed — so both sat at whatever the voice file shipped:
+#
+#   noise_scale   acoustic sampling: timbre and pitch contour within a line
+#   noise_w       phoneme DURATION variation — the rhythm
+#
+# Read off voices/*.onnx.json, which are checked in: en_US-hfc_female-medium (shipping),
+# en_GB-jenny_dioco and en_US-lessac all ship 0.667 / 0.8 — the stock VITS defaults — while
+# en_US-libritts_r-medium ships 0.333 / 0.333. Worth knowing before ever A/B-ing those two voices
+# again: the previous comparison (docs/plan/completed/expressive-voice-plan.md) was unknowingly
+# comparing two voices at less than half each other's variation.
+#
+# THESE DEFAULTS ARE THE SHIPPING VOICE'S OWN, so passing them changes no audio. That is not
+# timidity, it is what the measurement said. Four repeats per config of the same long line, because
+# VITS draws fresh noise every run and one sample per cell cannot tell an effect from a draw:
+#
+#   config                          p10-p90 range, 4 runs        mean      duration
+#   today (no flags)                9.4 / 9.6 / 9.5 / 9.8        9.58 st   16.16 s
+#   noise_scale 0.8, noise_w 1.1    9.0 / 9.4 / 9.4 / 9.9        9.43 st   16.80 s
+#
+# Within-config spread is +-0.4-0.9 st, so the knobs move intonation by LESS THAN THE NOISE FLOOR,
+# and the livelier setting measures marginally flatter than today. An 8-cell sweep (noise_w 0.8-1.2
+# x noise_scale 0.667/0.8) stayed inside 8.8-10.0 st, the same band. What they do change, outside the
+# noise, is timing: +0.64 s on identical text, ~4%.
+#
+# So they are here to be TRIED BY EAR (both are dashboard-settable, bounded 0-1.5 in settings.py),
+# not because a number justifies moving them. If you do: noise_w first and in small steps, and past
+# roughly 1.0-1.2 either one starts slurring consonants and wandering off pitch rather than sounding
+# expressive. Anything you conclude by ear, write it here with the date — this file is the only place
+# that record survives.
+TTS_NOISE_SCALE = 0.667
+TTS_NOISE_W     = 0.8
+
+# ── Let sentences differ in loudness ────────────────────────────────────────────
+# Piper normalises EVERY SENTENCE to full scale on its own. Measured on the robot, per-sentence peaks
+# in a four-sentence reply: -0.00, -0.00, -0.00, -0.00 dBFS — a spread of exactly 0.00 dB. No two
+# sentences Kai has ever spoken differed in peak level, which is not something a person can do.
+#
+# False passes --no-normalize and hands that job to the sox chain, which peak-normalises ONCE over the
+# whole reply (TTS_POST_EFFECTS ends in `gain -n -1`) and so preserves the relative differences.
+#
+# BE HONEST ABOUT THE SIZE OF THIS. Measured through the real chain:
+#
+#   normalize on   raw -0.00 -0.00 -0.00 -0.00  ->  after sox  -1.00 -1.00 -1.00 -1.00   (0.00 dB)
+#   normalize off  raw -11.00 -11.83 -13.16 -9.74 -> after sox  -1.00 -1.00 -1.79 -1.00   (0.79 dB)
+#
+# So 3.42 dB of natural variation arrives as 0.79 dB: the compand's upward compression eats the rest.
+# Recovering it would mean softening `compand`, and that is the setting keeping Kai audible in a loud
+# room — a venue beats 2.6 dB of sentence dynamics. Not worth it; this is a free 0 -> 0.79, no more.
+#
+# COUPLED TO THE SOX CHAIN ON PURPOSE (see ai/tts._run_piper): with normalisation off, Piper's raw
+# output is ~10 dB quieter, so the flag is only passed when TTS_POST_PROCESS is on. If sox is present
+# in config but fails at runtime, _post_process already falls back to the raw WAV with a WARNING —
+# that reply is now quiet as well as mono. `tts_volume` on the dashboard is the immediate remedy.
+TTS_PIPER_NORMALIZE = False
+
 TTS_VOLUME       = 1.0   # playback volume, applied to paplay's sink input (1.0 = PA_VOLUME_NORM).
                          # Applied at playback, NOT at synthesis: TTS_POST_EFFECTS below ends in
                          # `gain -n -1`, which normalises a synthesis-time gain straight back out
@@ -519,12 +611,28 @@ DELIVERY_ENABLED = True
 # "comma") never appears in the transcript. Not by eye, and not by ear alone.
 DELIVERY_PAUSE = ";"
 
-# Conjunctions that may earn a breath before them. English only — a Tagalog reply matches nothing
-# here and passes through unshaped, which is deliberate (see ai/delivery.py). Multi-word entries are
-# matched with flexible internal whitespace and win over the single word they start with.
+# Conjunctions that may earn a breath before them. Multi-word entries are matched with flexible
+# internal whitespace and win over the single word they start with.
+#
+# TAGALOG ADDED 2026-08-11, on the user's approval — this list used to be English-only, so a Tagalog
+# reply matched nothing and went out completely unshaped: no breaths at all, in the language the room
+# actually speaks. That was the intended degradation while nobody could vet Filipino markers.
+#
+# Deliberately connectives ONLY, no Tagalog openers. This transform inserts PUNCTUATION and adds no
+# words, so it cannot mispronounce anything — which matters here, because the voice is en_US and a
+# native speaker has judged Kai's Tagalog pronunciation bad (see docs/plan/wip/natural-audio-plan.md).
+# Adding Tagalog *words* for that voice to say (the DELIVERY_OPENERS route) was considered and
+# rejected for exactly that reason. Do not quietly add them later.
+#
+# "at" and "o" are left out on purpose: both are far too common and too short, and a breath before
+# every "at" is a stutter rather than a rhythm. "kasi" and "kaya" are the two likeliest to misfire,
+# since both sit mid-clause in Tagalog more often than "because"/"so" do in English — the
+# DELIVERY_BREATH_MIN_WORDS / _MIN_TAIL_WORDS gates below are what keep that in check. If the Tagalog
+# starts sounding choppy, drop those two first, not the whole list.
 DELIVERY_BREATH_CONJUNCTIONS = (
     "but", "so", "because", "although", "though", "while", "which",
     "and then", "or", "unless", "whereas",
+    "pero", "kasi", "kaya", "tapos", "kung", "habang", "para",
 )
 # Words that must precede a conjunction before it is worth breathing after, counted from the
 # sentence start or the last existing break. The failure mode of this whole transform is
@@ -591,3 +699,40 @@ TTS_POST_CHANNELS = 2       # 2 = duplicate mono -> stereo (drive both speaker c
 # sox effect chain applied after synthesis: light compression to lift perceived loudness, then
 # peak-normalize to -1 dB. Tune here without touching code (verified against sox 14.4.x).
 TTS_POST_EFFECTS  = ["compand", "0.3,1", "6:-70,-60,-20", "-5", "-90", "0.2", "gain", "-n", "-1"]
+
+# ── Giving Kai a room to speak in ───────────────────────────────────────────────
+# The chain above is LOUDNESS ONLY, and that was the whole of the output path until 2026-08-11: no EQ,
+# no space. Piper writes 22050 Hz mono, sox duplicates it to two identical channels, compresses and
+# peak-normalises. Bone-dry, dead-centre, flat-EQ speech is itself a synthetic cue, independent of
+# which model produced it — a real voice always arrives with a room attached.
+#
+# These two run either side of the loudness chain (see ai/tts._post_process for the order and why),
+# and each is its own constant so loudness, EQ and space revert independently. Empty list = off.
+
+# Everything below ~90 Hz is energy this hardware cannot reproduce: a PAM8403 into a small driver has
+# no output down there, so it only eats the headroom the compand then reacts to, and it is what makes
+# the chassis buzz on plosives. Applied BEFORE the compand for that reason — removing it afterwards
+# would be too late to matter. Mirrors MIC_HIGHPASS_HZ = 80 on the capture side.
+TTS_POST_HIGHPASS = ["highpass", "90"]
+
+# A small room, applied AFTER the compand: compress the dry signal, then add the space, which is the
+# order a person mixing this would use. sox's `reverb` argument order is
+#   reverberance  HF-damping  room-scale  stereo-depth  pre-delay(ms)  wet-gain(dB)
+# so this is 18% reverberance, a 28% room and the wet signal 4 dB down — deliberately subtle. The
+# stronger variant tried alongside it was `30 50 45 100 0 -2`; both are rendered in
+# voice-audition/room-ab/ for comparison.
+#
+# MEASURED before shipping, because a reverb tail is exactly the kind of thing that breaks other
+# contracts here:
+#   * Duration is UNCHANGED — 7.84 s for the test line and 1.27 s for a filler stall under every
+#     chain tried. sox decays the tail into the silence Piper already pads onto every WAV rather than
+#     appending to the file, so FILLER_MAX_STALL_S (1.8) and FILLER_MAX_LINE_S need no re-deriving,
+#     and the jaw window (sized from wav_duration) does not change.
+#   * Trailing silence SHRINKS, 0.13 s -> 0.10 s on the line, because the tail now occupies it. That
+#     is the right direction: it cannot strand the jaw miming into added silence.
+#   * Intelligibility: Whisper transcribed all four chains IDENTICALLY on the same English line, so
+#     the room costs nothing a decoder can detect.
+# What none of that measures is the VENUE. Reverb trades against clarity in ambient noise, and this
+# robot has already lost hands-free once to a loud room (see config/wake.py's ambient adaptation). If
+# Kai gets harder to understand at an event, set this to [] and keep the high-pass.
+TTS_POST_ROOM = ["reverb", "18", "50", "28", "100", "0", "-4"]

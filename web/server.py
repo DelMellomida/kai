@@ -25,9 +25,10 @@ from pathlib import Path
 import cv2
 
 import settings
+from ai import rag
 from ai.wake_phrase import match_wake_phrase
 from app import lifecycle
-from config.tracking import REBOOT_ENABLED, UPLOAD_DIR
+from config.tracking import REBOOT_ENABLED, UPLOAD_DIR, WEB_PUBLISH_INTERVAL
 
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 try:
@@ -71,6 +72,10 @@ class Dashboard:
         # button out entirely rather than show one that always answers 403 — an operator reaching
         # for a recovery control should not have to learn it was never switched on.
         data["reboot_enabled"] = REBOOT_ENABLED
+        # Retrieval failures. RAG fails OPEN by design — a broken index answers exactly as if RAG
+        # did not exist — which means a real regression there is otherwise invisible: it presents
+        # only as answers getting vaguer. A counter is the cheapest way to make it visible over ssh.
+        data.update(rag.status())
         return data
 
     def capture_start(self) -> dict:
@@ -129,7 +134,16 @@ class Dashboard:
         def _params_stream():
             def _gen():
                 while True:
-                    yield f'data: {json.dumps(dash.params_snapshot())}\n\n'
+                    # Through the cache, not straight to params_snapshot(): every open tab has its
+                    # own generator thread on this line, and the build behind it takes the session
+                    # RLock that the audio worker and the session tick need. WEB_PUBLISH_INTERVAL is
+                    # the right max-age because it is the rate the producers actually write at — a
+                    # shorter one would rebuild to get the same dict back. Each client keeps its own
+                    # _PARAMS_POLL_S cadence, so the SSE contract is unchanged; they just share the
+                    # work now. See DashboardState.cached_snapshot.
+                    snap = dash.state.cached_snapshot(
+                        dash.params_snapshot, time.monotonic(), WEB_PUBLISH_INTERVAL)
+                    yield f'data: {json.dumps(snap)}\n\n'
                     time.sleep(_PARAMS_POLL_S)
             return Response(_gen(), mimetype='text/event-stream',
                             headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})

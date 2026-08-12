@@ -223,10 +223,31 @@ class TestLengthScale(_Shaped):
 class TestTagalog(_NoOpeners):
     TL = "Ang programa ng DEVCON ay tumatakbo buong taon para sa mga estudyante sa buong bansa."
 
-    def test_no_breath_is_inserted(self):
-        # The conjunction list is English by design; a Tagalog reply matches nothing and passes
-        # through, which is the intended degradation rather than a gap.
-        self.assertEqual(delivery.shape(self.TL), self.TL)
+    def test_a_tagalog_connective_earns_a_breath(self):
+        # CHANGED 2026-08-11. This used to assert the opposite — that Tagalog matched nothing and
+        # passed through unshaped — which meant the language the room actually speaks got no breaths
+        # at all. The connectives are now in DELIVERY_BREATH_CONJUNCTIONS on a Tagalog speaker's
+        # approval. "para" here has 8 words before it and 6 after, so it clears both gates.
+        out = delivery.shape(self.TL)
+        self.assertIn("taon" + delivery.DELIVERY_PAUSE, out)
+        self.assertNotEqual(out, self.TL)
+
+    def test_at_and_o_are_deliberately_not_breath_words(self):
+        # Both are far too common and too short in Tagalog: a breath before every "at" is a stutter,
+        # not a rhythm. Excluded on purpose — see config/voice.py.
+        for text in ("Ang mga estudyante at ang mga guro ay dumalo sa DEVCON kaninang umaga.",
+                     "Puwede kang sumali sa hackathon o sa workshop kung may oras ka bukas."):
+            with self.subTest(text=text):
+                shaped = delivery.shape(text)
+                self.assertNotIn(f"at{delivery.DELIVERY_PAUSE}", shaped)
+                self.assertNotIn(f" o{delivery.DELIVERY_PAUSE}", shaped)
+
+    def test_breaths_stay_bounded_in_tagalog_too(self):
+        # The over-punctuation failure mode is what makes this transform sound worse than flat, and
+        # the gates are language-independent — one break per sentence, whatever the language.
+        text = ("Nag-aral siya ng coding kasi gusto niya matuto pero mahirap pala talaga ang "
+                "programming kaya sumali siya sa DEVCON para may makatulong sa kanya.")
+        self.assertLessEqual(delivery.shape(text).count(delivery.DELIVERY_PAUSE), 1)
 
     def test_an_opener_may_still_be_added_and_that_is_deliberate(self):
         # Documented, not accidental: "So," / "Okay," open Tagalog sentences idiomatically in PH
@@ -234,7 +255,12 @@ class TestTagalog(_NoOpeners):
         # If this is ever judged wrong by ear, the fix is DELIVERY_OPENER_RATE = 0, not a hack here.
         with patch.object(delivery, "DELIVERY_OPENER_RATE", 100):
             out = delivery.shape(self.TL)
-        self.assertTrue(out.endswith(self.TL), out)
+        self.assertTrue(out.startswith(tuple(delivery.DELIVERY_OPENERS)), out)
+        # The body is the original text plus whatever breath it earned — asserted by stripping the
+        # inserted pause back out, rather than by assuming Tagalog goes through unshaped (it no
+        # longer does; see test_a_tagalog_connective_earns_a_breath).
+        body = out.split(" ", 1)[1].replace(delivery.DELIVERY_PAUSE, "")
+        self.assertEqual(body, self.TL)
         self.assertTrue(any(out.startswith(o + " ") for o in delivery.DELIVERY_OPENERS), out)
 
 
